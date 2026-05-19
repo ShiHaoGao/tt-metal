@@ -10,10 +10,13 @@ include(${PROJECT_SOURCE_DIR}/cmake/helper_functions.cmake)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/programming_examples")
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/profiler)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/compiler_managed_l1_dataflow)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/pipeline_warmup_experiments)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/distributed)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/contributed)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/add_2_integers_in_compute)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/add_2_integers_in_compute_two_dm_read)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/add_2_integers_in_riscv)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/eltwise_binary)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/eltwise_sfpu)
@@ -35,12 +38,15 @@ add_custom_target(
     programming_examples
     DEPENDS
         profiler_examples
+        compiler_managed_l1_dataflow_examples
+        pipeline_warmup_experiments
         ${PROGRAMMING_EXAMPLES_TEST_TARGETS}
 )
 
 install(
     DIRECTORY
         add_2_integers_in_compute
+        add_2_integers_in_compute_two_dm_read
         add_2_integers_in_riscv
         eltwise_binary
         eltwise_sfpu
@@ -69,6 +75,7 @@ install(
 install(
     DIRECTORY
         add_2_integers_in_compute
+        add_2_integers_in_compute_two_dm_read
         add_2_integers_in_riscv
         eltwise_binary
         eltwise_sfpu

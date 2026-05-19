@@ -154,11 +154,14 @@ int main(int argc, char* argv[]) {
 #endif
         uint64_t local_cb_mask = launch_msg->kernel_config.local_cb_mask;
         uint32_t local_cb_mask_low = static_cast<uint32_t>(local_cb_mask & 0xFFFFFFFFULL);
-        setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
+        {
+            DeviceZoneScopedN("CBP_FW_LOCAL_CB_INIT");
+            setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
 #ifdef ARCH_BLACKHOLE
-        uint32_t local_cb_mask_upper = static_cast<uint32_t>(local_cb_mask >> 32);
-        setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 32, local_cb_mask_upper);
+            uint32_t local_cb_mask_upper = static_cast<uint32_t>(local_cb_mask >> 32);
+            setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 32, local_cb_mask_upper);
 #endif
+        }
 
 #if defined(ARCH_WORMHOLE)
         l1_to_ncrisc_iram_copy_wait();
@@ -167,7 +170,10 @@ int main(int argc, char* argv[]) {
         cb_l1_base = (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.remote_cb_offset);
         uint32_t end_cb_index = launch_msg->kernel_config.min_remote_cb_start_index;
         // NOC argument is unused
-        experimental::setup_remote_cb_interfaces<false>(cb_l1_base, end_cb_index, 0, 0, 0, 0);
+        {
+            DeviceZoneScopedN("CBP_FW_REMOTE_CB_INIT");
+            experimental::setup_remote_cb_interfaces<false>(cb_l1_base, end_cb_index, 0, 0, 0, 0);
+        }
         my_relative_x_ = my_logical_x_ - launch_msg->kernel_config.sub_device_origin_x;
         my_relative_y_ = my_logical_y_ - launch_msg->kernel_config.sub_device_origin_y;
 

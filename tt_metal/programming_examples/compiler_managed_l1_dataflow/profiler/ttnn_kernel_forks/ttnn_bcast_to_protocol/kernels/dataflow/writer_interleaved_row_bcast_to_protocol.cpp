@@ -1,0 +1,161 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <stdint.h>
+
+#include "api/dataflow/circular_buffer.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/tensor/noc_traits.h"
+#include "tools/profiler/kernel_profiler.hpp"
+
+#ifndef BENCH_STATIC_PROTOCOL
+#define BENCH_STATIC_PROTOCOL 0
+#endif
+
+#ifndef BENCH_USE_STREAM_REG_CBREGS
+#define BENCH_USE_STREAM_REG_CBREGS 0
+#endif
+
+#ifndef BENCH_PROTOCOL_START_VALUE
+#define BENCH_PROTOCOL_START_VALUE 1
+#endif
+
+#ifndef BENCH_STREAM_REG_START_STREAM_ID
+#define BENCH_STREAM_REG_START_STREAM_ID 3
+#endif
+
+#ifndef BENCH_STREAM_REG_VALUE_MASK
+#define BENCH_STREAM_REG_VALUE_MASK 0x00ffffffu
+#endif
+
+#ifndef BENCH_STREAM_SYNC_REG_INDEX
+#ifdef STREAM_SCRATCH32_REG_INDEX
+#define BENCH_STREAM_SYNC_REG_INDEX STREAM_SCRATCH32_REG_INDEX
+#else
+#define BENCH_STREAM_SYNC_REG_INDEX STREAM_SCRATCH_1_REG_INDEX
+#endif
+#endif
+
+namespace {
+
+constexpr auto kCbDst = tt::CBIndex::c_1;
+constexpr uint32_t kOneTile = 1;
+
+#if BENCH_STATIC_PROTOCOL
+inline void wait_equal_local(volatile tt_l1_ptr uint32_t* sem, uint32_t value) {
+    while (true) {
+        invalidate_l1_cache();
+        if (sem[0] == value) {
+            return;
+        }
+    }
+}
+
+inline void wait_min_reg(volatile tt_reg_ptr uint32_t* reg, uint32_t value) {
+    while (reg[0] < value) {
+    }
+}
+
+inline uint32_t read_stream_sync(uint32_t stream_id) {
+    return NOC_STREAM_READ_REG(stream_id, BENCH_STREAM_SYNC_REG_INDEX) & BENCH_STREAM_REG_VALUE_MASK;
+}
+
+inline void wait_equal_stream(uint32_t stream_id, uint32_t value) {
+    value &= BENCH_STREAM_REG_VALUE_MASK;
+    while (read_stream_sync(stream_id) != value) {
+    }
+}
+
+inline volatile tt_reg_ptr uint32_t* reg_ptr_from_cb(uint32_t cbid, bool received) {
+    return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
+        received ? get_cb_tiles_received_ptr(cbid) : get_cb_tiles_acked_ptr(cbid));
+}
+#endif
+
+}  // namespace
+
+void kernel_main() {
+    uint32_t arg_index = 0;
+    const uint32_t dst_addr = get_arg_val<uint32_t>(arg_index++);
+    uint32_t start_n = get_arg_val<uint32_t>(arg_index++);
+    uint32_t start_c = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t start_t = get_arg_val<uint32_t>(arg_index++);
+    uint32_t start_th = get_arg_val<uint32_t>(arg_index++);
+    uint32_t start_tw = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t num_tiles = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t n_stride = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t c_stride = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t N = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t C = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t Ht = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t Wt = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t start_tile_id = get_arg_val<uint32_t>(arg_index++);
+    (void)start_t;
+    (void)n_stride;
+    (void)c_stride;
+
+    constexpr auto cb_id_dst = get_compile_time_arg_val(0);
+    constexpr auto dst_args = TensorAccessorArgs<1>();
+    const auto dst = TensorAccessor(dst_args, dst_addr);
+
+    uint32_t num_tiles_written = 0;
+
+#if BENCH_STATIC_PROTOCOL
+    const uint32_t dst_ring_addr = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t page_size = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t num_pages = get_arg_val<uint32_t>(arg_index++);
+    const uint32_t protocol_start_sem_addr = get_arg_val<uint32_t>(arg_index++);
+
+    volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbDst, true);
+    volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbDst, false);
+
+#if BENCH_USE_STREAM_REG_CBREGS
+    wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_PROTOCOL_START_VALUE);
+    DeviceZoneScopedN("TBCAST_STATIC_STREAMREG_CBREGS_WRITER");
+#else
+    volatile tt_l1_ptr uint32_t* protocol_start_sem =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(protocol_start_sem_addr);
+    wait_equal_local(protocol_start_sem, BENCH_PROTOCOL_START_VALUE);
+    DeviceZoneScopedN("TBCAST_STATIC_RUNTIME_WRITER");
+#endif
+
+    for (uint32_t n = start_n; n < N && num_tiles_written < num_tiles; ++n, start_c = 0) {
+        for (uint32_t c = start_c; c < C && num_tiles_written < num_tiles; ++c, start_th = 0) {
+            for (uint32_t th = start_th; th < Ht && num_tiles_written < num_tiles; ++th, start_tw = 0) {
+                for (uint32_t tw = start_tw; tw < Wt && num_tiles_written < num_tiles; ++tw, ++num_tiles_written) {
+                    const uint32_t generation = num_tiles_written + 1;
+                    const uint32_t slot = num_tiles_written % num_pages;
+                    wait_min_reg(output_ready_reg, generation);
+
+                    const uint32_t l1_read_addr = dst_ring_addr + slot * page_size;
+                    noc_async_write_tile(start_tile_id + num_tiles_written, dst, l1_read_addr);
+                    noc_async_write_barrier();
+                    output_consumed_reg[0] = generation;
+                }
+            }
+        }
+    }
+#else
+    CircularBuffer cb_dst(kCbDst);
+    Noc noc;
+    const uint32_t dst_tile_bytes = get_tile_size(kCbDst);
+
+    DeviceZoneScopedN("TBCAST_CB_WRITER");
+
+    for (uint32_t n = start_n; n < N && num_tiles_written < num_tiles; ++n, start_c = 0) {
+        for (uint32_t c = start_c; c < C && num_tiles_written < num_tiles; ++c, start_th = 0) {
+            for (uint32_t th = start_th; th < Ht && num_tiles_written < num_tiles; ++th, start_tw = 0) {
+                for (uint32_t tw = start_tw; tw < Wt && num_tiles_written < num_tiles; ++tw, ++num_tiles_written) {
+                    cb_dst.wait_front(kOneTile);
+                    noc.async_write(
+                        cb_dst, dst, dst_tile_bytes, {}, {.page_id = start_tile_id + num_tiles_written});
+                    noc.async_write_barrier();
+                    cb_dst.pop_front(kOneTile);
+                }
+            }
+        }
+    }
+#endif
+}
