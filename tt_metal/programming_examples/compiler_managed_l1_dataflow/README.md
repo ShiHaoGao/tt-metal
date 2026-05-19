@@ -48,11 +48,7 @@ build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/
 tt_metal/programming_examples/compiler_managed_l1_dataflow/docs/ttnn_compiler_managed_l1_dataflow_abi_2026_05_18.md
 ```
 
-TTNN 算子横向总结报告：
-
-```text
-tt_metal/programming_examples/compiler_managed_l1_dataflow/docs/ttnn_operator_family_static_protocol_report_2026_05_18.md
-```
+TTNN 算子横向总结、收益归因、firmware/descriptor 链路和 Level 3 实验计划已经合并到这个主文档中；`docs/` 下不再维护第二份结论文档。
 
 跑覆盖计划：
 
