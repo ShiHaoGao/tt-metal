@@ -11,8 +11,9 @@
 - `static-input-only-cbregs`：input-only 的 per-CB stream-register counter 版本。
 - `static-output-only-cbregs`：output-only 的 per-CB stream-register counter 版本。
 - `static-input-output-cbregs`：input/output 的 per-CB stream-register counter 版本。
+- `static-input-only-cbregs-compiletime` / `static-output-only-cbregs-compiletime` / `static-input-output-cbregs-compiletime`：matmul 专属 compile-time ablation，在对应 input/output 替换范围内把 protocol args 静态化。
 
-`*-cbregs` 模式与现有 static 模式一一对应，用来区分 L1 semaphore cost 和 matmul reuse/compute 行为。
+`*-cbregs` 模式与现有 static 模式一一对应，是 matmul 的 Level B 标准对照；`*-cbregs-compiletime` 只作为 single-core low-K/GEMV-like 上界消融。
 
 ## 当前范围
 
@@ -29,7 +30,7 @@ cmake --build build_Release --target real_matmul_protocol -j8
 ```bash
 TT_METAL_CACHE=/tmp/real_matmul_protocol_smoke \
   ./build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/real_matmul_protocol \
-  --mode=all --M=512 --N=512 --K=64 --repeats=1 --num-pages=2
+  --mode=static-input-output-cbregs --M=64 --N=64 --K=64 --repeats=1 --num-pages=2
 ```
 
 ```bash

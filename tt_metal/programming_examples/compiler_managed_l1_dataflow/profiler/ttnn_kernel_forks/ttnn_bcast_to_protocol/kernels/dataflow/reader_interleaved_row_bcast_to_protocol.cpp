@@ -18,8 +18,28 @@
 #define BENCH_USE_STREAM_REG_CBREGS 0
 #endif
 
+#ifndef BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
+#endif
+
+#ifndef BENCH_SRC_RING_ADDR
+#define BENCH_SRC_RING_ADDR 0
+#endif
+
+#ifndef BENCH_PAGE_SIZE
+#define BENCH_PAGE_SIZE 0
+#endif
+
+#ifndef BENCH_NUM_PAGES
+#define BENCH_NUM_PAGES 1
+#endif
+
+#ifndef BENCH_PROTOCOL_START_SEM_ADDR
+#define BENCH_PROTOCOL_START_SEM_ADDR 0
 #endif
 
 #ifndef BENCH_STREAM_REG_START_STREAM_ID
@@ -97,10 +117,17 @@ void kernel_main() {
     uint32_t num_tiles_read = 0;
 
 #if BENCH_STATIC_PROTOCOL
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    constexpr uint32_t src_ring_addr = BENCH_SRC_RING_ADDR;
+    constexpr uint32_t page_size = BENCH_PAGE_SIZE;
+    constexpr uint32_t num_pages = BENCH_NUM_PAGES;
+    constexpr uint32_t protocol_start_sem_addr = BENCH_PROTOCOL_START_SEM_ADDR;
+#else
     const uint32_t src_ring_addr = get_arg_val<uint32_t>(arg_index++);
     const uint32_t page_size = get_arg_val<uint32_t>(arg_index++);
     const uint32_t num_pages = get_arg_val<uint32_t>(arg_index++);
     const uint32_t protocol_start_sem_addr = get_arg_val<uint32_t>(arg_index++);
+#endif
 
     volatile tt_reg_ptr uint32_t* input_ready_reg = reg_ptr_from_cb(kCbSrc, true);
     volatile tt_reg_ptr uint32_t* input_consumed_reg = reg_ptr_from_cb(kCbSrc, false);
@@ -109,7 +136,11 @@ void kernel_main() {
 
 #if BENCH_USE_STREAM_REG_CBREGS
     set_stream_sync(BENCH_STREAM_REG_START_STREAM_ID, BENCH_PROTOCOL_START_VALUE);
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    DeviceZoneScopedN("TBCAST_STATIC_STREAMREG_CBREGS_COMPILETIME_READER");
+#else
     DeviceZoneScopedN("TBCAST_STATIC_STREAMREG_CBREGS_READER");
+#endif
 #else
     volatile tt_l1_ptr uint32_t* protocol_start_sem =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(protocol_start_sem_addr);

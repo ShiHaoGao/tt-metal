@@ -6,6 +6,37 @@
 
 本文档现在是 `compiler_managed_l1_dataflow/docs` 下唯一主结论文档。原 `ttnn_operator_family_static_protocol_report_2026_05_18.md` 的横向算子报告、direct profiler 证据、收益/负例解释和下一步 family 优先级已经合并到本文档；后续不再维护第二份结论源。
 
+## Mode Taxonomy
+
+本轮收尾把 mode 名称固定下来，避免把 dataflow-only ablation、compute-path control 和下一阶段 Level C 混在一起。
+
+| Mode | 定义 | 验证目标 | 边界 |
+|---|---|---|---|
+| `cb` | TT-Metal runtime-managed CB baseline；host 创建 `CircularBufferConfig`，firmware 初始化 `CBInterface`，kernel 使用 `cb_*`/LLK CB operand ABI。 | baseline。 | 不是 compiler-managed path。 |
+| `static-runtime` | 显式 L1 ring + runtime args + L1 semaphore/counter；保留 correctness synchronization。 | 测量把 FIFO queue 明确化后，相对 CB 的收益或回退。 | L1 sync 状态本身可能比 CB 慢。 |
+| `static-compiletime` | `static-runtime` 的地址/shape/layout/config baked into kernel defines。 | 隔离 runtime args 和 generic config 成本。 | 仍是 L1 semaphore/counter，不代表 compute-path stream-register backend。 |
+| `static-streamreg-scratch` | dataflow-only 单 queue scratch-register ablation。 | 判断 copy 负例是否来自 payload movement 还是同步状态存储。 | 只适用于 copy 这类单 logical queue；不用于 compute-path。 |
+| `static-streamreg-scratch-compiletime` | dataflow-only 单 queue + compile-time config ablation。 | 验证在保留 ready/consumed sync 时，compile-time queue/layout 是否能转正。 | 不推广到 compute operand CB ABI。 |
+| `static-streamreg-cbregs` | **Level B 正式目标**：compute-path per-CB stream-register backend；每个 logical CB 使用自己的 `tiles_received` / `tiles_acked` register，per-core L1 address、work partition 和 shape/config 通过 runtime args 传入。 | 验证在 TT-Metal/LLK CB operand ABI 内替换 queue counter backend，评估真实多核工程路径的收益。 | 仍保留 `CreateCircularBuffer`/CB descriptor/LLK CB operand setup；runtime args 不是当前主要瓶颈。 |
+| `static-streamreg-cbregs-compiletime` | compile-time config ablation / upper bound：在 `static-streamreg-cbregs` 上继续把可 baked 的 queue/layout/config 放进 kernel defines。 | 估计 runtime args/config bake-in 在 TT-Metal/LLK CB ABI 内部还能多省多少。 | 不是 Level B 完成条件；direct TTNN fork 多数只适合 single-core 或 per-core kernel variant。 |
+| `static-input-only-cbregs-compiletime` / `static-output-only-cbregs-compiletime` / `static-input-output-cbregs-compiletime` | `real_matmul_protocol` 专属 compile-time ablation 命名，分别对应 input/output/input+output 三种替换范围。 | 在 matmul reuse 路径里隔离 input queue、output queue 和双端替换的上界效果。 | 当前只在 single-core low-K/GEMV-like 形状上有效，不能 broad promote，也不是全局 Level B 标准。 |
+| `compiler-owned operand/queue descriptor` | Level C：替换 TT-Metal CB/LLK operand ABI，由 compiler descriptor table 提供 operand/queue metadata。 | 判断是否真正绕过 TT-Metal CB 概念。 | 不在本轮实现。 |
+
+## Level 2 Completion Definition
+
+Level B / Level 2 本轮正式定义为：**保留 TT-Metal CB/LLK operand ABI，保留 correctness synchronization，使用 per-CB stream-register counter 替代 compute-path queue counter backend；多核 per-core L1 address、work partition 和 shape/config 默认通过 runtime args 传入。**
+
+本轮只回答一个问题：在 TT-Metal/LLK CB ABI 内部，`static-streamreg-cbregs` 是否能稳定、省得可预测，并足够指导下一步 Level C 的源码级替换。`static-streamreg-cbregs-compiletime` 只回答 runtime args/config bake-in 的上界，不回答 Level C 的问题，即 compiler-owned operand/queue descriptor 能否替换 firmware `CBInterface`、launch `local_cb_mask` 和 LLK 的 CB-derived operand metadata。
+
+Level 2 完成条件：
+
+- Level B 标准 mode `static-streamreg-cbregs` 在 compute-path 正例、TTNN-style fork、KV-cache update fork、modeling harness 和 matmul input/output variants 中有明确覆盖状态。
+- `static-streamreg-scratch-compiletime` 只作为 dataflow-only copy ablation，不作为 compute-path 结论源。
+- `static-streamreg-cbregs-compiletime` 只作为 compile-time ablation / upper bound，不能作为多核工程路径或 Level B 完成条件。
+- 结果按 family/shape 报告，正收益定义仍是 `CB critical - candidate critical > 0`。
+- 负例保留：L1 semaphore static runtime、matmul reuse mixed、真实 op 中收益被 NoC/page table/compute 稀释。
+- 进入 Level 3/Level C 前，必须先有结论说明哪些 family 值得迁移，哪些只作为 shape-specific candidate，哪些不推广。
+
 ## 当前仓库保护状态
 
 当前实验分支是：
@@ -137,7 +168,7 @@ python3 tt_metal/programming_examples/compiler_managed_l1_dataflow/suite/ttnn_st
 
 | 类别 | Direct case | 结果 | 根因 | 当前决策 |
 |---|---|---|---|---|
-| data_movement/layout | `real_copy_protocol` | `static-runtime` -115.52 cycles/work，`static-streamreg-scratch` -4.05 cycles/work | L1 counter/semaphore 同步状态存储成本超过 CB；scratch register 说明 payload 搬运不是主因 | 继续做 tilize/untilize/transpose direct fork，不能从 copy 推广正收益 |
+| data_movement/layout | `real_copy_protocol` | `static-runtime` median -124.38 cycles/work，`static-streamreg-scratch` median -11.66，`static-streamreg-scratch-compiletime` median +20.35 | L1 counter/semaphore 同步状态存储成本超过 CB；scratch register 说明 payload 搬运不是主因；compile-time scratch 说明 correctness sync 保留时仍能去掉 runtime/config 成本 | copy 只证明 compiler-known queue/layout 有收益空间；仍需 tilize/untilize/transpose direct fork 验证真实 layout op |
 | eltwise | `real_tile_add_protocol` | `static-runtime` +450.39 cycles/work，`static-streamreg-cbregs` +451.45 cycles/work | writer/queue path 暴露，static schedule 替代 CB FIFO 动态管理带来大收益 | 推广到 memory-bound/simple elementwise direct forks |
 | eltwise/TTNN | `ttnn_binary_ng_no_bcast_protocol` | `static-runtime` +23.22 cycles/local-tile，speedup 1.0350 | 真实 TTNN reader/writer/compute ABI 中 writer 仍有协议成本，但被真实地址/NoC/compute 稀释 | 作为 TTNN-style 正例，下一步扩展 unary/bcast/SFPU-heavy |
 | eltwise/broadcast TTNN | `ttnn_bcast_to_protocol` row-bcast | 1024/4096/16384 tiles：`static-runtime` +5.03/+1.04/+0.27 cycles/tile；`static-streamreg-cbregs` +11.44/+10.85/+2.74 cycles/tile | critical stage 仍是 writer；static protocol 小幅降低 writer critical cycles，但大 shape 的 runtime 收益接近噪声 | 继续测 binary broadcast/SFPU-heavy，不能直接推广 |
@@ -149,7 +180,7 @@ python3 tt_metal/programming_examples/compiler_managed_l1_dataflow/suite/ttnn_st
 | Family | 当前证据 | 是否可宣称收益 | 结论 | 下一步 |
 |---|---|---|---|---|
 | `eltwise` | direct TTNN no-bcast、bcast_to row-bcast + real tile-add + sweep/pytest coverage | 是，限 memory-bound/simple/exposed broadcast | 稳定小到大收益，取决于真实 op 中协议成本占比 | fork unary、binary broadcast、SFPU-heavy chain |
-| `data_movement_layout` | direct copy 负例 + sweep/pytest coverage | 否 | L1-semaphore static 不如 CB；streamreg scratch 只是证明同步存储成本 | fork tilize/untilize、transpose、slice、concat |
+| `data_movement_layout` | direct copy L1 semaphore 负例 + streamreg compile-time ablation + sweep/pytest coverage | 仅限 dataflow-only copy ablation，不能推广到真实 layout op | L1-semaphore static 不如 CB；runtime scratch 接近但仍负；compile-time scratch 转正，说明 runtime/config 成本可以被 compiler-known queue/layout 去掉 | fork tilize/untilize、transpose、slice、concat |
 | `embedding_kv_cache` | direct paged_update_cache update + sweep/pytest coverage | 是，限 8-user paged update | 真实 TTNN KV update 有小幅稳定 device critical-path 收益 | 修 32-user static scalability，补 cache-read/embedding lookup |
 | `matmul_linear` | direct low-K matmul + sweep/pytest coverage | 否，只有 shape-specific 候选 | 当前 reuse path 混合，不能推广 | GEMV/low-K/multicast/decode-like fork |
 | `normalization_softmax` | sweep/pytest + TTNN workload baseline 计划 | 否 | 需要 direct RMSNorm/softmax fork 才能判断 CB 是否在 critical path | fork RMSNorm/LayerNorm、softmax decode |
@@ -175,7 +206,7 @@ python3 tt_metal/programming_examples/compiler_managed_l1_dataflow/suite/ttnn_st
 
 无收益或回退通常有三类原因：
 
-- 同步状态存储成本更高：`real_copy_protocol` 的 L1 counter/semaphore static-runtime 比 CB 更慢，说明静态协议如果把状态放在 L1 并频繁轮询，成本可能高于原 CB。
+- 同步状态存储成本更高：`real_copy_protocol` 的 L1 counter/semaphore static-runtime 比 CB 更慢，说明静态协议如果把状态放在 L1 并频繁轮询，成本可能高于原 CB；但 `static-streamreg-scratch-compiletime` 转正也说明 correctness sync 本身不是问题，问题是 runtime/config/generic FIFO 成本没有被 compiler 静态化。
 - critical path 不在 CB FIFO：matmul reuse 路径里 compute/reuse/writeback 成本占主导，局部 queue 静态化会被掩盖，甚至因 schedule/layout 改动回退。
 - 真实 op 的其它成本稀释收益：paged KV update 里 page table、NoC read/write、untilize/tilize、writer overwrite 都仍存在，所以收益稳定但只有约 1.03x。
 
@@ -216,10 +247,70 @@ compute-path 的正式规则如下：
 - `static-compiletime`：同样 protocol，但地址和 shape 常量 baked into kernel defines。
 - `static-streamreg-scratch`：dataflow-only scratch-register ablation。
 - `static-streamreg-cbregs`：正式 compute-path stream-register backend，使用 per-CB `tiles_received` / `tiles_acked` registers。
+- `static-streamreg-cbregs-compiletime`：compile-time ablation，在 per-CB registers 上继续 bake queue/layout/config；当前 direct TTNN fork 只用于 single-core 或 per-core kernel variant。
 
-## 执行计划
+## Level 2 Profiler Coverage
 
-新的执行计划按 ABI 依赖顺序推进。关键调整是：**firmware / launch descriptor 替换必须早于 mini-LLK**。如果 firmware 仍通过 `local_cb_mask` 和 `CBInterface` 初始化 TT-Metal CB，那么 kernel 源码层面的 CB-less 只能算局部实验，不能声称已经绕过 TT-Metal CB 概念。
+| Profiler | Level B coverage | Mode | 备注 |
+|---|---|---|---|
+| `real_copy_protocol` | not applicable | `static-streamreg-scratch-compiletime` | dataflow-only 单 queue ablation；不作为 compute-path Level B。 |
+| `real_tile_add_protocol` | done | `static-streamreg-cbregs` | memory-bound compute-path 正例；1x1/2x2 都用 runtime args 传 per-core 参数，compiletime 只作为上界消融。 |
+| `static_protocol_modeling` | done | `static-streamreg-cbregs` | tile-add、eltwise-chain、matmul model 统一归因；`static-streamreg-cbregs-compiletime` 只在显式 ablation run 中使用。 |
+| `ttnn_binary_ng_no_bcast_protocol` | done | `static-streamreg-cbregs` | 保留 TTNN TensorAccessor/reader/writer/compute ABI；single-core 和 multicore 都以 runtime args 路径为主。 |
+| `ttnn_bcast_to_protocol` | done | `static-streamreg-cbregs` | row-broadcast direct fork；收益 shape-dependent，compiletime 只看 single-core upper bound。 |
+| `ttnn_paged_update_cache_protocol` | done | `static-streamreg-cbregs` | 8-user decode-like evidence 是正式 Level B 证据；单用户 compiletime run 只作为 upper-bound ablation。 |
+| `ttnn_binary_ng_row_bcast_protocol` | optional | `static-streamreg-cbregs` | untracked optional fork；作为 binary row-bcast add evidence，不作为 Level 2 必须结论源。 |
+| `real_matmul_protocol` | done, shape-specific | `static-input-only-cbregs` / `static-output-only-cbregs` / `static-input-output-cbregs` | matmul 专属 input/output 范围命名；`*-compiletime` variants 只作为 single-core low-K/GEMV-like 上界消融，不能 broad promote。 |
+
+## Level C 开展原则
+
+Level C 的文档分两层：本节先固定收益假设和 ABI 依赖边界；后文 `Level C Kickoff Plan` 是实际开工顺序。关键调整是：**firmware / launch descriptor 替换必须早于 mini-LLK**。如果 firmware 仍通过 `local_cb_mask` 和 `CBInterface` 初始化 TT-Metal CB，那么 kernel 源码层面的 CB-less 只能算局部实验，不能声称已经绕过 TT-Metal CB 概念。
+
+## Level C 收益猜想
+
+Level C 的收益假设不是“把 runtime args 全部改成 compile-time defines”。Level B 已经说明，runtime args 用来传 per-core L1 address、work partition 和 shape/config 是合理的多核工程路径，当前数据中它不是主要瓶颈。Level C 应验证的是：**当 TT-Metal CB 不再是 host / firmware / LLK operand ABI 的事实来源后，compiler 是否能拿到更低的结构性成本和更大的 L1/schedule 优化空间。**
+
+预期收益来源按优先级排列：
+
+1. **移除 TT-Metal CB descriptor / operand ABI 兼容层。**
+   - 不再由 `CreateCircularBuffer`、`CircularBufferConfig`、`local_cb_mask` 和 firmware `CBInterface` 驱动 operand/queue metadata。
+   - 小 op、短 pipeline、many-CB op 可能从更少的 descriptor materialization、CB slot 遍历和 CB-derived metadata lookup 中受益。
+   - 这部分收益要拆成 host construction、dispatch payload、firmware init 和 kernel steady-state，而不是只看 end-to-end latency。
+
+2. **减少 generic CB/FIFO steady-state 路径。**
+   - Level B 已经绕过一部分 `cb_wait/reserve/push/pop`，但仍保留 CB descriptor 和 LLK CB operand setup。
+   - Level C 如果让 reader/writer/compute 直接读 compiler-owned descriptor，可以减少泛化 pointer/counter 维护、CB id 到 operand metadata 的适配，以及不必要的 queue capability checks。
+   - 预期首先体现在 memory-bound / simple elementwise 和 writer-bound 小 op 上。
+
+3. **释放 L1 allocation、lifetime 和 bank placement。**
+   - Level B 仍在 TT-Metal CB ABI 内部迁就 slot/page/layout 结构。
+   - Level C 可以让 compiler 全局规划 L1 buffer 复用、queue materialization、bank conflict、tile/page layout、producer/consumer lifetime。
+   - 这可能比“少几次 runtime arg load”更重要，尤其是 layout、broadcast、KV-cache update 和 decode helper kernels。
+
+4. **跨 stage 的 static schedule / queue-depth 优化。**
+   - compiler-owned queue descriptor 可以按 shape 选择 static schedule、stream-register counter、L1 counter fallback 或 legacy CB fallback。
+   - 可以把 reader prefetch、compute operand lifetime、writer flush 顺序和 queue depth 作为 lowering 决策，而不是手写 program factory 的固定模式。
+
+5. **减少 host/program-factory/firmware launch 的结构性开销。**
+   - 对大 GEMM 这通常不是主因；对 decode step、小 batch、小 tensor、many-op graphs 可能可见。
+   - Level C 目标是 compiler-generated descriptor table，而不是每个 op 手写 CB/TensorAccessor/program factory。
+
+按当前 Level B 数据，Level C 首批收益假设如下：
+
+| Family / path | Level C 预期 | 原因 |
+|---|---|---|
+| memory-bound / simple elementwise | 最可能稳定收益。 | Level B 已经有强正例，writer/queue path 暴露。 |
+| TTNN no-bcast / simple binary | 小而稳定的真实收益，适合作为 first source-change proof。 | 保留真实 TTNN reader/writer/compute ABI 时仍有约 `19 cycles/tile`。 |
+| KV-cache update / decode helper | 小幅 shape-specific 收益，适合作为真实 workload proof。 | 真实 `paged_update_cache` 中 CB/protocol cost 触到 critical path，但被 page table、untilize/pack、NoC 稀释。 |
+| broadcast / layout / transpose | 作为第二批候选。 | writer-bound 小正例存在，但接近噪声区间，必须按 shape 和 stage 判断。 |
+| matmul reuse | 不作为首批收益目标。 | reuse/compute/writeback 掩盖 queue-only 收益，Level B mixed。 |
+| pure copy L1 semaphore static-runtime | 作为负例保留。 | 说明错误的 sync storage/backend 可能比 TT-Metal CB 更慢。 |
+
+因此 Level C 的首要 thesis 是：**收益来自 compiler 拥有 operand descriptor、queue state、L1 lifetime 和 schedule，而不是来自把 per-core 参数全部编译期常量化。**
+
+## Level C ABI 依赖路线图
+
+下表是 Level C 的 ABI dependency map 和设计约束，不是另一套并行执行计划；实际开工顺序以后文 `Level C Kickoff Plan` 为准。
 
 | Phase | 目标 | 关键产物 | 当前状态 |
 |---|---|---|---|
@@ -229,7 +320,7 @@ compute-path 的正式规则如下：
 | Phase 3: Firmware descriptor loader | firmware 加载 compiler descriptor table，不再走 TT-Metal CB 初始化路径。 | `compiler_cb_interface` 或 `operand_view_table` loader；跳过 `setup_local_cb_read_write_interfaces` 的实验路径。 | 尚未进入；这是判断“是否真正绕过 TT-Metal CB”的边界。 |
 | Phase 4: Kernel dataflow CompilerCB backend | kernel 不调用 `cb_*`，由 compiler 生成 queue acquire/release、NoC、L1 pointer、sync。 | `compiler_cb_wait/acquire/release` 或直接展开的 generated code。 | 现有 static protocol fork 是局部原型。 |
 | Phase 5: LLK-compatible OperandView backend | 继续复用 LLK，但 LLK 看到的是 compiler-owned operand metadata，不是 TT-Metal CB state。 | `OperandView -> LLK operand setup` 兼容层。 | 尚未进入；这是从 CB descriptor 解耦 compute 的主路径。 |
-| Phase 6: Operator-family migration | 按 family 迁移真实 op，建立 backend selection policy。 | elementwise、layout、KV cache、softmax、reduction、matmul/CCL 的 direct forks。 | Phase 3 coverage 已给出优先级。 |
+| Phase 6: Operator-family migration | 按 family 迁移真实 op，建立 backend selection policy。 | elementwise、layout、KV cache、softmax、reduction、matmul/CCL 的 direct forks。 | Level B operator-family evidence 已给出优先级。 |
 | Phase 7: mini-LLK / raw Tensix backend | 对少数核心 op 绕过 LLK，直接生成 Tensix 指令/MOP/config。 | raw pack/unpack/math codegen；Tensix instruction schedule。 | 只应在 Phase 3/5 稳定后推进。 |
 | Phase 8: Full compiler path | 高层 op 直接 lowering 到 compiler-managed L1 dataflow，不依赖 TTNN program factory。 | end-to-end compiler pipeline、validation suite、性能报告。 | 长期目标。 |
 
@@ -311,8 +402,8 @@ tt_metal/jit_build/genfiles.cpp
 
 这一层要先理解的关键点：
 
-- Level 3 不只是“不调用 cb API”，还要让 format/tile/operand metadata 不再由 TT-Metal CB descriptor 派生。
-- raw-address unpack/pack 是可行性证据，但现有 wrapper 不能直接作为 Level 3 证明。
+- Level C / Level 3 不只是“不调用 cb API”，还要让 format/tile/operand metadata 不再由 TT-Metal CB descriptor 派生。
+- raw-address unpack/pack 是可行性证据，但现有 wrapper 不能直接作为 Level C / Level 3 证明。
 - mini-LLK 之前必须先把 compiler-owned `OperandViewDescriptor` 打通，否则收益归因会混在 LLK 重写里。
 
 ### 现有实验目录定位
@@ -334,6 +425,8 @@ tt_metal/programming_examples/compiler_managed_l1_dataflow/suite
 - `real_matmul_protocol`：matmul reuse mixed/负例。
 
 这些实验继续作为 Phase 0 baseline；下一步不再扩大 broad coverage，而是把这些证据转成 compiler descriptor 和 firmware launch ABI 原型。
+
+下面 Phase 1-7 是设计约束说明，不是新的执行顺序；执行顺序见 `Level C Kickoff Plan`。
 
 ### Phase 1: descriptor schema
 
@@ -443,6 +536,23 @@ backend 变体：
 - 直接绕过 LLK 会把“CB 替换收益”和“LLK 重写收益/风险”混在一起。
 - 先做 LLK-compatible backend 可以证明 compiler-managed CB ABI 是否足够表达真实 op。
 
+### Phase 6: operator-family migration policy
+
+这一阶段不在 descriptor / firmware / `OperandView` bring-up 前启动。它只在 first profiler fork 能稳定区分 legacy CB、Level B `static-streamreg-cbregs`、compiler descriptor、firmware skip-CB-init 和 `OperandView` 后开始。
+
+目标：
+
+- 用 Level B family 结论决定迁移顺序，而不是按 op 名单全量铺开。
+- 首批只迁移 memory-bound / simple elementwise 和一个 KV-cache update / decode helper proof。
+- broadcast、layout、transpose 放在第二批；matmul reuse 只保留 low-K / GEMV-like / decode-like shape-specific candidate。
+- 每个 family 都保留 legacy CB fallback，并输出 backend selection policy。
+
+验收标准：
+
+- 每个迁移 family 都有同 shape 的 `cb`、`static-streamreg-cbregs` 和 Level C mode device-profiler 对比。
+- 能说明收益来自 descriptor/firmware/operand view、queue backend、L1 lifetime，还是其它 stage 稀释。
+- 如果某 family 只有噪声区间或 mixed 结果，文档必须记录为负例或 shape-specific candidate，不能 broad promote。
+
 ### Phase 7: mini-LLK / raw Tensix backend
 
 这一阶段放在 firmware 和 `OperandView` 稳定之后。
@@ -476,13 +586,68 @@ python3 tt_metal/programming_examples/compiler_managed_l1_dataflow/suite/ttnn_st
 
 | Case | 结论 | 关键数字 |
 |---|---|---|
-| `real_copy_protocol` | L1 semaphore static runtime 是负例；scratch-register sync 几乎追平 CB。主因更像同步状态存储/协议成本，不是 payload movement。 | `static-runtime` median `-115.52 cycles/work`；`static-compiletime` `-65.01`；`static-streamreg-scratch` `-4.05`。 |
+| `real_copy_protocol` | L1 semaphore static runtime 是负例；runtime scratch 仍接近但慢于 CB；scratch-register + compile-time queue/layout 转正。主因不是 payload movement，而是同步状态存储和 runtime/config/generic FIFO 成本的组合。 | 本轮 `/tmp/real_copy_protocol_compiletime_ablation_2026_05_19`：`static-runtime` median `-124.38 cycles/work`；`static-compiletime` `-64.68`；`static-streamreg-scratch` `-11.66`；`static-streamreg-scratch-compiletime` `+20.35`。 |
 | `real_tile_add_protocol` | static schedule 替代 CB FIFO 有大收益；cbregs 保留收益但相对 runtime 只有极小差异。 | `static-runtime` median `+450.39 cycles/work`；`static-streamreg-cbregs` `+451.45`。 |
 | `real_matmul_protocol` | mixed / shape-specific；不能 broad promote。 | 本轮 sweep `4` 个正向、`5` 个负向。 |
 | `ttnn_binary_ng_no_bcast_protocol` | TTNN-style 正例对照；static protocol 能穿过真实 TTNN 风格 ABI，但收益远小于 standalone tile add。 | 本轮复跑 `static-runtime` median `+23.22 cycles/work`；`static-streamreg-cbregs` `+21.40`。 |
 | `ttnn_paged_update_cache_protocol` | 真实 `paged_update_cache` C++ factory/kernel fork 正例；KV-cache update 中 CB FIFO 动态管理会影响 device critical path，但收益幅度是 TTNN-style 小幅稳定收益。 | 本轮复跑 8-user decode-like 真实形状 `+313` 到 `+535 cycles`，median speedup 约 `1.032x`；32-user static path 仍是 fork scalability 待修项。 |
 
-结论一句话：**stream-register 不是万能收益来源；per-CB stream-register 是正确 ABI 控制面，但真正的大收益来自 static ring/schedule 消除 CB FIFO 动态管理，并且只在 protocol cost 暴露的路径上明显。**
+Level B 主线 device-profiler 证据来自 `static-streamreg-cbregs` 复跑和前置 direct sweeps。本轮主线输出记录在：
+
+```text
+/tmp/levelb_cbregs_completion_2026_05_19
+```
+
+该目录每个 profiler 都保留 `host_results.csv`、`host_summary.csv`、`zone_summary.csv`、`critical_stage_summary.csv`、`device_mode_comparison.csv` 和 `host_mode_comparison.csv`，并在 `attribution/` 下生成 `level_b_summary.csv`、`compiletime_ablation_summary.csv`、`root_cause_report.md`。
+
+| Profiler | Level B case | CB critical stage | Level B critical stage | Saved cycles | Saved cycles/local work | Speedup |
+|---|---|---|---|---:|---:|---:|
+| `real_tile_add_protocol` | `tiles=256 pages=2` | writer | writer | 123118 | 480.93 / tile | 1.770x |
+| `real_tile_add_protocol` | `tiles=1024 pages=2` | writer | writer | 457144 | 446.43 / tile | 1.680x |
+| `real_tile_add_protocol` | `tiles=4096 pages=2` | writer | writer | 1824931 | 445.54 / tile | 1.678x |
+| `ttnn_binary_ng_no_bcast_protocol` | `tiles=1024 pages=2` | writer | writer | 20057 | 19.59 / tile | 1.029x |
+| `ttnn_binary_ng_no_bcast_protocol` | `tiles=4096 pages=2` | writer | writer | 78095 | 19.07 / tile | 1.029x |
+| `ttnn_bcast_to_protocol` | `tiles=1024 width_tiles=8 pages=2` | writer | writer | 7821 | 7.64 / tile | 1.014x |
+| `ttnn_bcast_to_protocol` | `tiles=4096 width_tiles=8 pages=2` | writer | writer | 25400 | 6.20 / tile | 1.011x |
+| `ttnn_bcast_to_protocol` | `tiles=16384 width_tiles=8 pages=2` | writer | writer | 92188 | 5.63 / tile | 1.010x |
+| `ttnn_paged_update_cache_protocol` | `users=8 kv_heads=8 head_dim=128 block=64/128 seq=2048` | compute-input-untilize | compute-pack | 190 to 330 | 23.75 to 41.25 / user | 1.016x to 1.027x |
+
+主线结论：
+
+- `real_tile_add_protocol` 是强正例：Level B `static-streamreg-cbregs` 稳定节省约 `445-481 cycles/tile`。
+- `ttnn_binary_ng_no_bcast_protocol` 是真实 TTNN-style 正例：收益稳定但被真实 reader/writer/compute ABI 稀释到约 `19 cycles/tile`。
+- `ttnn_bcast_to_protocol` 是小幅 writer-bound 正例：约 `5.6-7.6 cycles/tile`，接近噪声边界，不能单独推广到所有 broadcast/SFPU-heavy。
+- `ttnn_paged_update_cache_protocol` 是真实 KV update 小幅正例：8-user decode-like shapes 仍为正，但本轮幅度约 `190-330 cycles/case`，小于旧跑；结论应写成 shape-specific promote。
+- host enqueue/finish 方向在多个短 case 中与 device delta 不一致，因此 Level B 和 Level C gate 只以 device critical stage 为准。
+
+compile-time 上界消融输出记录在：
+
+```text
+/tmp/level2_completion_2026_05_19
+```
+
+该目录每个 profiler 都保留 `host_results.csv`、`host_summary.csv`、`zone_summary.csv`、`critical_stage_summary.csv`、`device_mode_comparison.csv` 和 `host_mode_comparison.csv`。旧表中的 2026-05-18 数字仍是 Level A/B 前置 evidence；下表只记录本轮新增 `*-compiletime` ablation 的 compact core-shape 结果，不能替代 Level B 主线 `static-streamreg-cbregs` 结论。
+
+| Profiler | Compile-time ablation case | CB critical stage | Ablation critical stage | Saved cycles | Saved cycles/local work | Speedup |
+|---|---|---|---|---:|---:|---:|
+| `real_tile_add_protocol` | `tiles=256 pages=2` | writer | writer | 132656 | 518.19 / tile | 1.883x |
+| `real_tile_add_protocol` | `tiles=1024 pages=2` | writer | writer | 489717 | 478.24 / tile | 1.765x |
+| `ttnn_binary_ng_no_bcast_protocol` | `tiles=1024 pages=2` | writer | writer | 34085 | 33.29 / tile | 1.051x |
+| `ttnn_binary_ng_no_bcast_protocol` | `tiles=4096 pages=2` | writer | writer | 133395 | 32.57 / tile | 1.050x |
+| `ttnn_bcast_to_protocol` | `tiles=1024 width_tiles=8 pages=2` | writer | writer | 21479 | 20.98 / tile | 1.038x |
+| `ttnn_bcast_to_protocol` | `tiles=4096 width_tiles=8 pages=2` | writer | writer | 87124 | 21.27 / tile | 1.039x |
+| `ttnn_paged_update_cache_protocol` | `users=1 kv_heads=1 head_dim=32 block=32 seq=128 idx=0 pages=2` | compute-input-untilize | compute-pack | 726 | 726 / user | 1.433x |
+
+结论一句话：**Level B 可以用 `static-streamreg-cbregs` 作为主线完成；stream-register 不是万能收益来源，per-CB stream-register 是正确 ABI 控制面，真正的大收益来自 static ring/schedule 消除 CB FIFO 动态管理，并且只在 protocol cost 暴露的路径上明显。compile-time bake-in 有上界价值，但不是多核工程路径的前置条件。**
+
+## Level B Completion And Level C Gate
+
+当前目录可以宣称完成 Level B 的核心实验闭环，但结论必须按 family/shape 限定：
+
+- 可以进入 Level C 的首批对象：memory-bound / simple elementwise，以及 KV-cache update 这类 writer/queue 或 compute-input/output protocol cost 暴露的路径。
+- 可以作为第二批候选：broadcast 和 layout/transpose 弱正例；它们需要按 shape 和 critical stage 继续分开判断。
+- 暂不进入 Level C 首批：matmul reuse、pure copy L1 semaphore static runtime、SFPU-heavy 噪声区间路径。
+- Level C 修改源码时应优先替换 compiler/firmware/launch descriptor 中的 TT-Metal CB dependency，而不是追求把 runtime args 全部 bake 成 compile-time defines。
 
 ## Phase 0/1 Microbenchmark
 
@@ -517,7 +682,7 @@ Phase 1：显式 L1 ring + semaphore 的 DRAM traffic。
 - compile-time static variant 比 runtime-address variant 再省一点。
 - 这只验证 Phase 0/1 边界，不能直接推广为 TTNN op speedup。
 
-## Production-Shaped Copy 负例
+## Production-Shaped Copy: Runtime 负例与 Compile-Time 转正
 
 `real_copy_protocol` 路径：
 
@@ -525,33 +690,39 @@ Phase 1：显式 L1 ring + semaphore 的 DRAM traffic。
 DRAM -> reader -> L1 staging ring -> writer -> DRAM
 ```
 
-关键结果：
+关键结果来自 `/tmp/real_copy_protocol_compiletime_ablation_2026_05_19`，所有模式 `max_abs_error=0`。这里的 delta 是 `CB critical - static critical`，正数表示 static 减少 cycles。
 
 | Tiles | Pages | Grid | Static mode | CB critical | Static critical | Saved cycles/local tile | Speedup |
 |---:|---:|:---:|---|---:|---:|---:|---:|
-| 256 | 2 | 1x1 | static-runtime | 143023 | 171825 | -112.5 | 0.832x |
-| 1024 | 2 | 1x1 | static-runtime | 571427 | 691448 | -117.2 | 0.826x |
-| 4096 | 2 | 1x1 | static-runtime | 2284966 | 2769279 | -118.2 | 0.825x |
-| 16384 | 2 | 1x1 | static-runtime | 9135148 | 11129001 | -121.7 | 0.821x |
-| 256 | 2 | 1x1 | static-compiletime | 143023 | 160326 | -67.6 | 0.892x |
-| 1024 | 2 | 1x1 | static-compiletime | 571427 | 639651 | -66.6 | 0.893x |
+| 256 | 2 | 1x1 | static-runtime | 144021 | 171908 | -108.93 | 0.838x |
+| 1024 | 2 | 1x1 | static-runtime | 573508 | 699254 | -122.80 | 0.820x |
+| 4096 | 2 | 1x1 | static-runtime | 2293250 | 2809192 | -125.96 | 0.816x |
+| 16384 | 2 | 1x1 | static-runtime | 9171088 | 11248931 | -126.82 | 0.815x |
+| 256 | 2 | 1x1 | static-compiletime | 144021 | 160429 | -64.09 | 0.898x |
+| 1024 | 2 | 1x1 | static-compiletime | 573508 | 639870 | -64.81 | 0.896x |
+| 4096 | 2 | 1x1 | static-compiletime | 2293250 | 2558109 | -64.66 | 0.896x |
+| 16384 | 2 | 1x1 | static-compiletime | 9171088 | 10230947 | -64.69 | 0.896x |
 
 stream-register scratch follow-up：
 
 | Tiles | Pages | Grid | Static mode | CB critical | Static critical | Saved cycles/local tile | Speedup |
 |---:|---:|:---:|---|---:|---:|---:|---:|
-| 256 | 2 | 1x1 | static-streamreg-scratch | 143421 | 144745 | -5.2 | 0.991x |
-| 1024 | 2 | 1x1 | static-streamreg-scratch | 573299 | 576306 | -2.9 | 0.995x |
-| 4096 | 2 | 1x1 | static-streamreg-scratch | 2294333 | 2303130 | -2.1 | 0.996x |
-| 16384 | 2 | 1x1 | static-streamreg-scratch | 9184229 | 9336224 | -9.3 | 0.984x |
-| 4096 | 2 | 2x2 | static-streamreg-scratch | 575795 | 576461 | -0.7 | 0.999x |
+| 256 | 2 | 1x1 | static-streamreg-scratch | 144021 | 145423 | -5.48 | 0.990x |
+| 1024 | 2 | 1x1 | static-streamreg-scratch | 573508 | 584926 | -11.15 | 0.980x |
+| 4096 | 2 | 1x1 | static-streamreg-scratch | 2293250 | 2343065 | -12.16 | 0.979x |
+| 16384 | 2 | 1x1 | static-streamreg-scratch | 9171088 | 9376476 | -12.54 | 0.978x |
+| 256 | 2 | 1x1 | static-streamreg-scratch-compiletime | 144021 | 138498 | +21.57 | 1.040x |
+| 1024 | 2 | 1x1 | static-streamreg-scratch-compiletime | 573508 | 552851 | +20.17 | 1.037x |
+| 4096 | 2 | 1x1 | static-streamreg-scratch-compiletime | 2293250 | 2210127 | +20.29 | 1.038x |
+| 16384 | 2 | 1x1 | static-streamreg-scratch-compiletime | 9171088 | 8836642 | +20.41 | 1.038x |
 
 解释：
 
-- pure copy 不适合作为 compiler-managed L1 的证明点。
-- L1 semaphore static runtime 明显慢于 CB；compile-time 地址常量只能缓解一部分。
-- scratch-register sync 把差距缩小到近似 noise floor，说明同步状态存储/协议成本是核心负例原因。
-- 下一步 data movement/layout 应看 tilize/untilize、transpose、slice、concat 这类可能受 lifetime/layout freedom 影响的路径，而不是继续只看 pure copy。
+- pure copy 不适合作为真实 layout op 收益的唯一证明点，因为它没有 tilize/untilize/transpose/slice/concat 的 layout freedom。
+- L1 semaphore static runtime 明显慢于 CB；compile-time 地址常量只能把损失收敛到约 `-65 cycles/local tile`，说明 L1 semaphore/generic FIFO 同步仍是主要负担。
+- runtime `static-streamreg-scratch` 把 L1 semaphore storage 换成 stream scratch register 后仍为 `-5` 到 `-13 cycles/local tile`，说明 CB baseline 本身已经是 stream-register backed counter，scratch 不是天然更快。
+- `static-streamreg-scratch-compiletime` 保留 ready/consumed/start 同步但移除 runtime args 和动态 layout 配置后稳定转正，约 `+20 cycles/local tile`。这支持用户提出的修正：correctness synchronization 不应减少，但 runtime/config/generic FIFO 成本应该由 compiler 静态化。
+- 下一步 data movement/layout 应看 tilize/untilize、transpose、slice、concat 这类可能受 lifetime/layout freedom 影响的路径，同时保留 `static-streamreg-scratch-compiletime` 作为 dataflow-only ablation。
 
 ## Memory-Bound Tile Pipeline 正例
 
@@ -751,23 +922,29 @@ Phase 3 结论：
 - compute-path stream-register 变体如果没有 per-CB `get_cb_tiles_received_ptr(cbid)` / `get_cb_tiles_acked_ptr(cbid)`，直接判定为无效对比。
 - static backend 如果靠破坏 overlap 才赢，直接拒绝；`static-serialized` 已经证明 pipeline overlap 是必要条件。
 
-## 下一步顺序
+## Level C Kickoff Plan
 
-下一步不再是继续扩大 broad Phase 3 survey，而是把实验结果转化为 compiler ABI 和 firmware launch 原型。
+Level C 从现在开始不再扩大 broad operator-family survey，而是把 Level B 证据转化为 compiler ABI 和 firmware launch 原型。首个 proof point 固定为 **single-core simple elementwise / tile-add style path**，原因是它在 Level B 中收益最稳定、critical stage 清楚、正确性容易验证。KV-cache update 作为第二个真实 workload proof，不作为第一步 firmware/descriptor bring-up 的阻塞项。
 
-### Step 0: 保护分支并固定文档入口
+Level C 的修改原则：
+
+- 所有改动默认放在 experimental path / flag / sentinel 下，legacy TT-Metal CB path 必须保持可运行。
+- 第一目标是证明“不依赖 TT-Metal CB descriptor / `CBInterface` / CB-derived LLK operand metadata”，不是追求最高 speedup。
+- runtime args 可以继续传 per-core L1 address、work partition 和 descriptor table offset；不把 compile-time bake-in 作为目标。
+- 每个 milestone 都必须能和 Level B 的 `cb`、`static-runtime`、`static-streamreg-cbregs` 做同 shape device-profiler 对比。
+
+### Step 0: 保护分支并冻结 Level B baseline
 
 目标：
 
-- 当前实验状态先本地 commit、rebase 到 `upstream/main`。
-- 远端 push 到 fork；如果 SSH host key 未信任，先修 `known_hosts`。
-- `docs/` 只保留本文档作为唯一结论入口。
+- 当前 Level B 状态先本地 commit，保留 `/tmp/levelb_cbregs_completion_2026_05_19` 作为 baseline artifact。
+- README 和本文档都指向 `static-streamreg-cbregs` 作为 Level B 主线。
+- 在新分支上开始 Level C，避免和 Level B profiler fork 的收尾修改混在一起。
 
 验收：
 
-- `git status` clean。
-- `git log` 显示 WIP commit 在 `upstream/main` 之后。
-- `README.md` 指向本文档，不再指向独立 operator-family report。
+- `git diff --check` 和 Level B smoke 通过。
+- 新分支的第一条 commit 只包含 Level B 文档/runner 收敛，不包含 Level C 源码改造。
 
 ### Step 1: 固化 descriptor schema
 
@@ -783,11 +960,17 @@ tt_metal/programming_examples/compiler_managed_l1_dataflow/include   # 新增 ex
 - 在 prototype header 中定义 `TensorLayoutDescriptor`、`CompilerCBDescriptor`、`OperandViewDescriptor`、`QueueSyncDescriptor`。
 - 字段只表达 compiler-owned L1 storage、queue sync、operand view、format/tile metadata。
 - 不出现 TT-Metal `CBIndex`、`CircularBufferConfig`、`TensorAccessorArgs` 作为 IR 语义。
+- descriptor schema 明确区分：
+  - L1 storage/lifetime：base、size、bank policy、lifetime。
+  - queue/sync：capacity、producer/consumer、sync kind、counter/register binding。
+  - operand view：format、tile shape、page size、stride、pack/unpack role。
+  - tensor layout：global tensor shape、page layout、shard mapping、NoC address policy。
 
 验收：
 
 - header 可被 host 和 kernel-side experimental code include。
 - 文档中 descriptor 字段和 header 保持一致。
+- 不能只是把 `CircularBufferConfig` 字段原样改名；必须能表达 non-CB L1 storage 和 operand view。
 
 ### Step 2: host-side descriptor table 原型
 
@@ -801,15 +984,17 @@ tt_metal/hw/inc/hostdev/dev_msgs.h                 # 只在需要 launch flag/of
 
 目标：
 
-- 选择单 core unary/binary elementwise 作为第一条 host path。
+- 选择 single-core tile-add / binary elementwise 作为第一条 host path。
 - 不调用 `CreateCircularBuffer` / `CircularBufferConfig` / `TensorAccessorArgs`。
 - compiler-side helper 生成 per-core L1 allocation 和 operand views。
 - dispatch 把 compiler descriptor table side-load 到每个 core 可见的 kernel config/L1 区。
+- runtime args 只传 descriptor table offset、per-core work range、必要的 tensor base addresses；不传 TT-Metal CB ids。
 
 验收：
 
 - `local_cb_mask=0` 或 descriptor-only sentinel 时，host 仍能启动 experimental kernel。
 - legacy TT-Metal CB examples 不受影响。
+- grep host experimental path 不出现 `CreateCircularBuffer`、`CircularBufferConfig`、`TensorAccessorArgs`。
 
 ### Step 3: firmware experimental mode
 
@@ -828,55 +1013,75 @@ tt_metal/hw/inc/internal
 - 在 compiler-managed mode 下跳过 `setup_local_cb_read_write_interfaces` 和 `setup_remote_cb_interfaces`。
 - 加载 compiler descriptor table，初始化 compiler-owned operand view / queue state。
 - legacy mode 保持原 CB init 路径。
+- firmware 不再以 `local_cb_mask` 决定 compiler-managed operand/queue metadata；`local_cb_mask` 只允许作为 legacy fallback 或 disabled sentinel。
 
 验收：
 
 - firmware profiler 中 compiler mode 下 `CBP_FW_LOCAL_CB_INIT` / `CBP_FW_REMOTE_CB_INIT` 为空或不执行有效 work。
 - legacy CB target 仍能跑。
 - experimental target 不依赖 `local_cb_mask` 驱动 `CBInterface[]` 初始化。
+- 这是 Level C 的第一条硬边界：如果 firmware 仍 materialize `CBInterface[]` 作为事实来源，只能算 Level B+，不能算 Level C。
 
-### Step 4: no-`cb_*` raw-L1 tile copy
+### Step 4: no-`cb_*` CompilerCB kernel backend
 
 修改范围：
 
 ```text
-tt_metal/programming_examples/compiler_managed_l1_dataflow/level3_raw_l1_tile_copy
-tt_metal/tt-llk/tt_llk_blackhole/llk_lib/experimental       # 只新增 raw-address wrapper 时才改
-tt_metal/hw/ckernels/blackhole/metal/llk_api/experimental   # 只新增 raw-address API 时才改
+tt_metal/programming_examples/compiler_managed_l1_dataflow/level_c
+tt_metal/programming_examples/compiler_managed_l1_dataflow/include
 ```
 
 目标：
 
-- 单 core，一个或少量 tile。
-- reader 写固定 L1 input staging。
-- compute 使用 raw L1 address unpack、datacopy、raw L1 pack。
-- writer 从固定 L1 output staging 写回 DRAM。
-- kernel 中禁止 `cb_reserve_back`、`cb_wait_front`、`cb_push_back`、`cb_pop_front`、`get_local_cb_interface`、`copy_tile`、`pack_tile`。
+- single-core tile-add / binary elementwise。
+- reader/writer/compute 从 compiler descriptor 获取 L1 base、page size、tile count、sync binding。
+- kernel 中禁止 `cb_reserve_back`、`cb_wait_front`、`cb_push_back`、`cb_pop_front`、`get_read_ptr`、`get_write_ptr`、`get_tile_size`。
+- compute 先允许继续走 LLK-compatible path，但 operand metadata 的事实来源必须是 compiler descriptor，不是 TT-Metal CB。
 
 验收：
 
 - 输出正确。
 - grep experimental kernel 不出现 TT-Metal CB API。
-- raw-address helper 不通过 public wrapper 从 `cbid` 反查地址。
+- profiler 能产生四条对比：legacy `cb`、Level B `static-streamreg-cbregs`、compiler descriptor + legacy LLK-compatible path、compiler descriptor + firmware skip-CB-init。
 
-### Step 5: binary/unary op 扩展
+### Step 5: LLK-compatible OperandView
 
 目标：
 
-- 从 raw-L1 copy 扩展到 binary add 或 unary SFPU。
-- 验证 descriptor 可以表达两个 input operand 和一个 output operand。
-- 仍然不碰 matmul。
+- 让 `pack_tile`、`copy_tile`、`binary_tiles_init`、`matmul_tiles_init` 的 operand metadata 来自 `OperandViewDescriptor`。
+- 优先实现 binary add 所需的两个 input operand 和一个 output operand。
+- 保留 LLK 硬件细节处理，先不重写 mini-LLK。
 
 验收：
 
 - 正确性通过。
-- profiler 能分离 legacy CB、kernel-only no-`cb_*`、firmware skip-CB-init、compiler descriptor + raw-L1。
+- profiler 能区分 descriptor 替换收益和 LLK 重写收益；本阶段不允许把两者混成一个数字。
+- `get_local_cb_interface(cbid)` 不再是 operand format/page/ptr metadata 的事实来源。
 
-### Step 6: mini-LLK / raw Tensix backend
+### Step 6: Level C first profiler fork
 
 目标：
 
-- 在 Phase 3/5 稳定后，对单个 microkernel 直接生成或调用 raw Tensix instruction / MOP / config sequence。
+- 建立 `level_c_tile_add_protocol` 或等价 target。
+- 同 shape 比较：
+  - `cb`
+  - `static-runtime`
+  - `static-streamreg-cbregs`
+  - `compiler-descriptor-fw-cb-init-skip`
+  - `compiler-descriptor-operandview`
+- 输出 host/firmware/kernel steady-state 分层 profiler 数据。
+
+验收：
+
+- 正确性 `max_abs_error=0`。
+- device critical stage 和 saved cycles/work 可与 `/tmp/levelb_cbregs_completion_2026_05_19` 对照。
+- 如果收益不超过 Level B，也要记录为有效结论：Level C 的价值可能在 ABI/lifetime/schedule，而不是单 kernel steady-state。
+
+### Step 7: mini-LLK / raw Tensix backend
+
+目标：
+
+- 只在 Step 3/5/6 稳定后，对单个 microkernel 直接生成或调用 raw Tensix instruction / MOP / config sequence。
 - 优先 unary/binary elementwise 或 copy/layout microkernel。
 - 不以完整 TTNN op 覆盖为第一目标。
 
@@ -884,8 +1089,9 @@ tt_metal/hw/ckernels/blackhole/metal/llk_api/experimental   # 只新增 raw-addr
 
 - raw Tensix microkernel 正确。
 - 性能归因能区分 CB/firmware/descriptor 替换收益和 LLK 重写收益。
+- 如果 raw Tensix 结果无法归因，不作为 Level C thesis proof。
 
-### Step 7: operator-family migration
+### Step 8: operator-family migration
 
 目标顺序：
 

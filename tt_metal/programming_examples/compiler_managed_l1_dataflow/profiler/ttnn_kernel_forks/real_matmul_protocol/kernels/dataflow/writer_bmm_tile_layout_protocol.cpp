@@ -21,6 +21,10 @@
 #define BENCH_USE_STREAM_REG_CBREGS 0
 #endif
 
+#ifndef BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
 #endif
@@ -45,7 +49,14 @@ namespace {
 
 constexpr uint32_t kCbOut = tt::CBIndex::c_16;
 
-#if BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS
+#if BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
+    BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_OUTPUT_CBREGS_COMPILETIME"
+#elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_ONLY_CBREGS_COMPILETIME"
+#elif BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define RMP_MODE_PREFIX "RMP_REUSE_STATIC_OUTPUT_ONLY_CBREGS_COMPILETIME"
+#elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS
 #define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_OUTPUT_CBREGS"
 #elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS
 #define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_ONLY_CBREGS"
@@ -124,6 +135,17 @@ void kernel_main() {
     const auto s = TensorAccessor(s_args, out_tensor_addr);
 
 #if BENCH_STATIC_OUTPUT_PROTOCOL
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    constexpr uint32_t out_ring_addr = BENCH_OUT_RING_ADDR;
+    constexpr uint32_t out_slot_bytes = BENCH_OUT_SLOT_BYTES;
+    constexpr uint32_t out_num_pages = BENCH_OUT_NUM_PAGES;
+#if BENCH_STATIC_INPUT_PROTOCOL && !BENCH_USE_STREAM_REG_CBREGS
+    constexpr uint32_t protocol_start_sem_addr = BENCH_PROTOCOL_START_SEM_ADDR;
+
+    volatile tt_l1_ptr uint32_t* protocol_start_sem =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(protocol_start_sem_addr);
+#endif
+#else
     const uint32_t out_ring_addr = get_arg_val<uint32_t>(13);
     const uint32_t out_slot_bytes = get_arg_val<uint32_t>(14);
     const uint32_t out_num_pages = get_arg_val<uint32_t>(15);
@@ -132,6 +154,7 @@ void kernel_main() {
 
     volatile tt_l1_ptr uint32_t* protocol_start_sem =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(protocol_start_sem_addr);
+#endif
 #endif
     volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbOut, true);
     volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbOut, false);

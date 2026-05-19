@@ -83,6 +83,18 @@
 #endif
 #endif
 
+#ifndef BENCH_MODE_NAME
+#if BENCH_USE_COMPILE_TIME_ARGS && BENCH_USE_STREAM_REG_SYNC
+#define BENCH_MODE_NAME "STATIC_STREAMREG_SCRATCH_COMPILETIME"
+#elif BENCH_USE_COMPILE_TIME_ARGS
+#define BENCH_MODE_NAME "STATIC_COMPILETIME"
+#elif BENCH_USE_STREAM_REG_SYNC
+#define BENCH_MODE_NAME "STATIC_STREAMREG_SCRATCH"
+#else
+#define BENCH_MODE_NAME "STATIC_RUNTIME"
+#endif
+#endif
+
 namespace {
 
 constexpr uint32_t kCbIn = tt::CBIndex::c_0;
@@ -170,13 +182,7 @@ void kernel_main() {
     wait_equal_local(start_sem, BENCH_START_VALUE);
 #endif
 
-#if BENCH_USE_COMPILE_TIME_ARGS
-    DeviceZoneScopedN("RTCOPY_STATIC_COMPILETIME_WRITER");
-#elif BENCH_USE_STREAM_REG_SYNC
-    DeviceZoneScopedN("RTCOPY_STATIC_STREAMREG_SCRATCH_WRITER");
-#else
-    DeviceZoneScopedN("RTCOPY_STATIC_RUNTIME_WRITER");
-#endif
+    DeviceZoneScopedN("RTCOPY_" BENCH_MODE_NAME "_WRITER");
     for (uint32_t i = 0; i < iterations; ++i) {
         const uint32_t generation = i + 1;
 #if BENCH_USE_STREAM_REG_SYNC

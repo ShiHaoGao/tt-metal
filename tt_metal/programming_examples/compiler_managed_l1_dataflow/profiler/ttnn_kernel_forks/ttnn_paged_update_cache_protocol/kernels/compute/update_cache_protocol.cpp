@@ -28,8 +28,44 @@
 #define BENCH_USE_STREAM_REG_CBREGS 0
 #endif
 
+#ifndef BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
+#endif
+
+#ifndef BENCH_CACHE_RING_ADDR
+#define BENCH_CACHE_RING_ADDR 0
+#endif
+
+#ifndef BENCH_INTERMED_RING_ADDR
+#define BENCH_INTERMED_RING_ADDR 0
+#endif
+
+#ifndef BENCH_INPUT_UNTILIZED_ADDR
+#define BENCH_INPUT_UNTILIZED_ADDR 0
+#endif
+
+#ifndef BENCH_OUTPUT_RING_ADDR
+#define BENCH_OUTPUT_RING_ADDR 0
+#endif
+
+#ifndef BENCH_INPUT_TILES_ADDR
+#define BENCH_INPUT_TILES_ADDR 0
+#endif
+
+#ifndef BENCH_PAGE_SIZE
+#define BENCH_PAGE_SIZE 0
+#endif
+
+#ifndef BENCH_NUM_PAGES
+#define BENCH_NUM_PAGES 1
+#endif
+
+#ifndef BENCH_PROTOCOL_START_SEM_ADDR
+#define BENCH_PROTOCOL_START_SEM_ADDR 0
 #endif
 
 #ifndef BENCH_STREAM_REG_START_STREAM_ID
@@ -140,6 +176,16 @@ void kernel_main() {
     compute_kernel_hw_startup(in_cb, untilized_in_cb);
 
 #if BENCH_STATIC_PROTOCOL
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    constexpr uint32_t cache_ring_addr = BENCH_CACHE_RING_ADDR;
+    constexpr uint32_t intermed_ring_addr = BENCH_INTERMED_RING_ADDR;
+    constexpr uint32_t input_untilized_addr = BENCH_INPUT_UNTILIZED_ADDR;
+    constexpr uint32_t output_ring_addr = BENCH_OUTPUT_RING_ADDR;
+    constexpr uint32_t page_size = BENCH_PAGE_SIZE;
+    constexpr uint32_t num_pages = BENCH_NUM_PAGES;
+    constexpr uint32_t protocol_start_sem_addr = BENCH_PROTOCOL_START_SEM_ADDR;
+    constexpr uint32_t input_tiles_addr = BENCH_INPUT_TILES_ADDR;
+#else
     const uint32_t cache_ring_addr = get_arg_val<uint32_t>(0);
     const uint32_t intermed_ring_addr = get_arg_val<uint32_t>(1);
     const uint32_t input_untilized_addr = get_arg_val<uint32_t>(2);
@@ -148,6 +194,7 @@ void kernel_main() {
     const uint32_t num_pages = get_arg_val<uint32_t>(5);
     const uint32_t protocol_start_sem_addr = get_arg_val<uint32_t>(6);
     const uint32_t input_tiles_addr = get_arg_val<uint32_t>(7);
+#endif
 
     volatile tt_reg_ptr uint32_t* cache_ready_reg = reg_ptr_from_cb(cache_cb, true);
     volatile tt_reg_ptr uint32_t* cache_consumed_reg = reg_ptr_from_cb(cache_cb, false);
@@ -167,7 +214,15 @@ void kernel_main() {
     wait_equal_local(protocol_start_sem, BENCH_PROTOCOL_START_VALUE);
 #endif
 
-#if BENCH_USE_STREAM_REG_CBREGS
+#if BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#if defined(TRISC_UNPACK)
+    DeviceZoneScopedN("TPUC_STATIC_STREAMREG_CBREGS_COMPILETIME_COMPUTE_UNPACK");
+#elif defined(TRISC_MATH)
+    DeviceZoneScopedN("TPUC_STATIC_STREAMREG_CBREGS_COMPILETIME_COMPUTE_MATH");
+#elif defined(TRISC_PACK)
+    DeviceZoneScopedN("TPUC_STATIC_STREAMREG_CBREGS_COMPILETIME_COMPUTE_PACK");
+#endif
+#elif BENCH_USE_STREAM_REG_CBREGS
 #if defined(TRISC_UNPACK)
     DeviceZoneScopedN("TPUC_STATIC_STREAMREG_CBREGS_COMPUTE_UNPACK");
 #elif defined(TRISC_MATH)

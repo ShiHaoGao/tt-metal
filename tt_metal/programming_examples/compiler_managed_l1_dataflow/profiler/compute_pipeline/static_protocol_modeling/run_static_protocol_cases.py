@@ -216,7 +216,22 @@ def cases_for_case_set(case_set):
 
 def modes_for_selection(mode):
     if mode == "all":
-        return ["cb", "static-runtime", "static-compiletime", "static-serialized", "static-streamreg-cbregs"]
+        return [
+            "cb",
+            "static-runtime",
+            "static-compiletime",
+            "static-serialized",
+            "static-streamreg-cbregs",
+        ]
+    if mode == "all-with-ablation":
+        return [
+            "cb",
+            "static-runtime",
+            "static-compiletime",
+            "static-serialized",
+            "static-streamreg-cbregs",
+            "static-streamreg-cbregs-compiletime",
+        ]
     return [mode]
 
 
@@ -340,6 +355,7 @@ def build_critical_comparison(critical_rows):
         compiletime = modes.get("static-compiletime")
         serialized = modes.get("static-serialized")
         cbregs = modes.get("static-streamreg-cbregs")
+        compiletime_ablation = modes.get("static-streamreg-cbregs-compiletime")
         local_output_tiles = max(1, int_field(cb, "local_output_tiles"))
         local_input_tile_pairs = max(1, int_field(cb, "local_input_tile_pairs"))
         delta = float_field(cb, "critical_cycles") - float_field(runtime, "critical_cycles")
@@ -378,6 +394,25 @@ def build_critical_comparison(critical_rows):
             row["delta_cbregs_runtime_cycles"] = cbregs_cycles - float_field(runtime, "critical_cycles")
             row["static_streamreg_cbregs_speedup"] = (
                 float_field(cb, "critical_cycles") / cbregs_cycles if cbregs_cycles else 0.0
+            )
+        if compiletime_ablation is not None:
+            compiletime_ablation_cycles = float_field(compiletime_ablation, "critical_cycles")
+            row["compiletime_ablation_critical_cycles"] = compiletime_ablation_cycles
+            row["delta_cb_compiletime_ablation_cycles"] = float_field(cb, "critical_cycles") - compiletime_ablation_cycles
+            row["delta_static_runtime_compiletime_ablation_cycles"] = (
+                float_field(runtime, "critical_cycles") - compiletime_ablation_cycles
+            )
+            row["delta_compiletime_ablation_runtime_cycles"] = (
+                compiletime_ablation_cycles - float_field(runtime, "critical_cycles")
+            )
+            if cbregs is not None:
+                row["delta_static_streamreg_cbregs_compiletime_ablation_cycles"] = (
+                    float_field(cbregs, "critical_cycles") - compiletime_ablation_cycles
+                )
+            row["compiletime_ablation_speedup"] = (
+                float_field(cb, "critical_cycles") / compiletime_ablation_cycles
+                if compiletime_ablation_cycles
+                else 0.0
             )
         rows.append(row)
     return rows

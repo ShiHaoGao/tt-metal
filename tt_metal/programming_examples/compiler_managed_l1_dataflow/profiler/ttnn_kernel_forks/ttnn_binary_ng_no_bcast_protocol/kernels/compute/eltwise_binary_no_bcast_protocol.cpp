@@ -23,8 +23,36 @@
 #define BENCH_USE_STREAM_REG_CBREGS 0
 #endif
 
+#ifndef BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
+#endif
+
+#ifndef BENCH_SRC0_RING_ADDR
+#define BENCH_SRC0_RING_ADDR 0
+#endif
+
+#ifndef BENCH_SRC1_RING_ADDR
+#define BENCH_SRC1_RING_ADDR 0
+#endif
+
+#ifndef BENCH_DST_RING_ADDR
+#define BENCH_DST_RING_ADDR 0
+#endif
+
+#ifndef BENCH_PAGE_SIZE
+#define BENCH_PAGE_SIZE 0
+#endif
+
+#ifndef BENCH_NUM_PAGES
+#define BENCH_NUM_PAGES 1
+#endif
+
+#ifndef BENCH_PROTOCOL_START_SEM_ADDR
+#define BENCH_PROTOCOL_START_SEM_ADDR 0
 #endif
 
 #ifndef BENCH_STREAM_REG_START_STREAM_ID
@@ -185,12 +213,21 @@ void kernel_main() {
 #endif
 
 #if BENCH_STATIC_PROTOCOL
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    constexpr uint32_t src0_ring_addr = BENCH_SRC0_RING_ADDR;
+    constexpr uint32_t src1_ring_addr = BENCH_SRC1_RING_ADDR;
+    constexpr uint32_t dst_ring_addr = BENCH_DST_RING_ADDR;
+    constexpr uint32_t page_size = BENCH_PAGE_SIZE;
+    constexpr uint32_t num_pages = BENCH_NUM_PAGES;
+    constexpr uint32_t protocol_start_sem_addr = BENCH_PROTOCOL_START_SEM_ADDR;
+#else
     const uint32_t src0_ring_addr = get_arg_val<uint32_t>(1);
     const uint32_t src1_ring_addr = get_arg_val<uint32_t>(2);
     const uint32_t dst_ring_addr = get_arg_val<uint32_t>(3);
     const uint32_t page_size = get_arg_val<uint32_t>(4);
     const uint32_t num_pages = get_arg_val<uint32_t>(5);
     const uint32_t protocol_start_sem_addr = get_arg_val<uint32_t>(6);
+#endif
 
 #if BENCH_USE_STREAM_REG_SYNC
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_PROTOCOL_START_VALUE);
@@ -210,7 +247,15 @@ void kernel_main() {
 #endif
 #endif
 
-#if BENCH_USE_STREAM_REG_SYNC
+#if BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#if defined(TRISC_UNPACK)
+    DeviceZoneScopedN("TBNG_STATIC_STREAMREG_CBREGS_COMPILETIME_COMPUTE_UNPACK");
+#elif defined(TRISC_MATH)
+    DeviceZoneScopedN("TBNG_STATIC_STREAMREG_CBREGS_COMPILETIME_COMPUTE_MATH");
+#elif defined(TRISC_PACK)
+    DeviceZoneScopedN("TBNG_STATIC_STREAMREG_CBREGS_COMPILETIME_COMPUTE_PACK");
+#endif
+#elif BENCH_USE_STREAM_REG_SYNC
 #if defined(TRISC_UNPACK)
     DeviceZoneScopedN("TBNG_STATIC_STREAMREG_COMPUTE_UNPACK");
 #elif defined(TRISC_MATH)

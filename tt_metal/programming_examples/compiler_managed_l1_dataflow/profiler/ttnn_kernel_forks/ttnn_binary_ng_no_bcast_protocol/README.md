@@ -10,7 +10,8 @@
 
 - `cb`：保留正常 TTNN circular-buffer FIFO calls。
 - `static-runtime`：保留 LLK/compute API 所需的 CB descriptor view，但绕过 `reserve/push/wait/pop`，改用 compiler-managed L1 rings 和 generation counters。
-- `static-streamreg-cbregs`：保留同样 TTNN reader/writer/compute ABI 和 TensorAccessor shape，但 generation counters 使用 per-CB `tiles_received` / `tiles_acked` stream registers。
+- `static-streamreg-cbregs`：Level B 标准模式，保留同样 TTNN reader/writer/compute ABI 和 TensorAccessor shape，但 generation counters 使用 per-CB `tiles_received` / `tiles_acked` stream registers。
+- `static-streamreg-cbregs-compiletime`：compile-time config ablation / upper bound，只把可 baked 的 queue/layout/config 字段转成 kernel defines；TTNN TensorAccessor/reader/writer/compute ABI 保持不变。
 
 旧 `static-streamreg` 已禁用，不是有效 compute-path baseline。
 

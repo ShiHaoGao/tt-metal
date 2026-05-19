@@ -63,6 +63,7 @@ enum class Mode : uint32_t {
     StaticRuntime = 1,
     StaticStreamReg = 2,
     StaticStreamRegCbRegs = 3,
+    StaticStreamRegCbRegsCompileTime = 4,
 };
 
 struct Options {
@@ -119,6 +120,7 @@ const char* mode_name(Mode mode) {
         case Mode::StaticRuntime: return "static-runtime";
         case Mode::StaticStreamReg: return "static-streamreg";
         case Mode::StaticStreamRegCbRegs: return "static-streamreg-cbregs";
+        case Mode::StaticStreamRegCbRegsCompileTime: return "static-streamreg-cbregs-compiletime";
     }
     return "unknown";
 }
@@ -136,35 +138,47 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     if (mode == "static-streamreg-cbregs") {
         return Mode::StaticStreamRegCbRegs;
     }
+    if (mode == "static-streamreg-cbregs-compiletime") {
+        return Mode::StaticStreamRegCbRegsCompileTime;
+    }
     return std::nullopt;
 }
 
 std::vector<Mode> modes_to_run(const std::string& mode) {
     if (mode == "all") {
-        return {Mode::Cb, Mode::StaticRuntime, Mode::StaticStreamRegCbRegs};
+        return {Mode::Cb, Mode::StaticRuntime, Mode::StaticStreamRegCbRegs, Mode::StaticStreamRegCbRegsCompileTime};
     }
     auto parsed = parse_mode(mode);
     if (!parsed.has_value()) {
         throw std::invalid_argument(
-            "Unknown --mode. Valid values are all, cb, static-runtime, static-streamreg-cbregs, static. "
+            "Unknown --mode. Valid values are all, cb, static-runtime, static-streamreg-cbregs, "
+            "static-streamreg-cbregs-compiletime, static. "
             "The old static-streamreg compute mode is disabled.");
     }
     return {*parsed};
 }
 
 bool is_static_mode(Mode mode) {
-    return mode == Mode::StaticRuntime || mode == Mode::StaticStreamReg || mode == Mode::StaticStreamRegCbRegs;
+    return mode == Mode::StaticRuntime || mode == Mode::StaticStreamReg || mode == Mode::StaticStreamRegCbRegs ||
+           mode == Mode::StaticStreamRegCbRegsCompileTime;
 }
 
 bool uses_stream_reg_sync(Mode mode) { return mode == Mode::StaticStreamReg; }
 
-bool uses_stream_reg_cbregs(Mode mode) { return mode == Mode::StaticStreamRegCbRegs; }
+bool uses_stream_reg_cbregs(Mode mode) {
+    return mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime;
+}
+
+bool uses_compile_time_protocol_args(Mode mode) {
+    return mode == Mode::StaticStreamRegCbRegsCompileTime;
+}
 
 bool uses_stream_reg_start_gate(Mode mode) { return uses_stream_reg_sync(mode) || uses_stream_reg_cbregs(mode); }
 
 void print_usage(const char* argv0) {
     fmt::print(
-        "Usage: {} [--mode=all|cb|static-runtime|static-streamreg-cbregs] "
+        "Usage: {} [--mode=all|cb|static-runtime|static-streamreg-cbregs|"
+        "static-streamreg-cbregs-compiletime] "
         "[--tiles=N] [--width-tiles=N] [--num-pages=N] [--repeats=N] "
         "[--device-id=N] [--core-x=N] [--core-y=N] [--core-grid-x=N] [--core-grid-y=N]\n",
         argv0);
@@ -330,27 +344,57 @@ std::vector<bfloat16> make_input(uint32_t tiles) {
     return data;
 }
 
-std::map<std::string, std::string> protocol_defines(Mode mode, uint32_t protocol_start_value) {
+std::map<std::string, std::string> protocol_defines(
+    Mode mode,
+    uint32_t protocol_start_value,
+    uint32_t src_ring_addr,
+    uint32_t dst_ring_addr,
+    uint32_t protocol_start_addr,
+    const Options& options) {
     return {
         {"BENCH_STATIC_PROTOCOL", is_static_mode(mode) ? "1" : "0"},
         {"BENCH_USE_STREAM_REG_SYNC", uses_stream_reg_sync(mode) ? "1" : "0"},
         {"BENCH_USE_STREAM_REG_CBREGS", uses_stream_reg_cbregs(mode) ? "1" : "0"},
+        {"BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS", uses_compile_time_protocol_args(mode) ? "1" : "0"},
         {"BENCH_PROTOCOL_START_VALUE", std::to_string(protocol_start_value)},
+        {"BENCH_SRC_RING_ADDR", std::to_string(src_ring_addr)},
+        {"BENCH_DST_RING_ADDR", std::to_string(dst_ring_addr)},
+        {"BENCH_PAGE_SIZE", std::to_string(kTileSizeBytes)},
+        {"BENCH_NUM_PAGES", std::to_string(options.num_pages)},
+        {"BENCH_PROTOCOL_START_SEM_ADDR", std::to_string(protocol_start_addr)},
         {"BENCH_STREAM_REG_START_STREAM_ID", std::to_string(kStreamRegStartStreamId)},
         {"BENCH_STREAM_REG_VALUE_MASK", std::to_string(kStreamRegCounterMask)},
     };
 }
 
-std::map<std::string, std::string> reader_defines(Mode mode, uint32_t protocol_start_value) {
-    return protocol_defines(mode, protocol_start_value);
+std::map<std::string, std::string> reader_defines(
+    Mode mode,
+    uint32_t protocol_start_value,
+    uint32_t src_ring_addr,
+    uint32_t dst_ring_addr,
+    uint32_t protocol_start_addr,
+    const Options& options) {
+    return protocol_defines(mode, protocol_start_value, src_ring_addr, dst_ring_addr, protocol_start_addr, options);
 }
 
-std::map<std::string, std::string> writer_defines(Mode mode, uint32_t protocol_start_value) {
-    return protocol_defines(mode, protocol_start_value);
+std::map<std::string, std::string> writer_defines(
+    Mode mode,
+    uint32_t protocol_start_value,
+    uint32_t src_ring_addr,
+    uint32_t dst_ring_addr,
+    uint32_t protocol_start_addr,
+    const Options& options) {
+    return protocol_defines(mode, protocol_start_value, src_ring_addr, dst_ring_addr, protocol_start_addr, options);
 }
 
-std::map<std::string, std::string> compute_defines(Mode mode, uint32_t protocol_start_value) {
-    return protocol_defines(mode, protocol_start_value);
+std::map<std::string, std::string> compute_defines(
+    Mode mode,
+    uint32_t protocol_start_value,
+    uint32_t src_ring_addr,
+    uint32_t dst_ring_addr,
+    uint32_t protocol_start_addr,
+    const Options& options) {
+    return protocol_defines(mode, protocol_start_value, src_ring_addr, dst_ring_addr, protocol_start_addr, options);
 }
 
 void create_circular_buffers(
@@ -474,6 +518,9 @@ RunResult run_one(
     if (core_work.empty()) {
         throw std::invalid_argument("No active cores were selected");
     }
+    if (uses_compile_time_protocol_args(mode) && core_work.size() != 1) {
+        throw std::invalid_argument("static-streamreg-cbregs-compiletime mode currently supports only one active core");
+    }
     if (uses_stream_reg_sync(mode)) {
         throw std::invalid_argument(
             "static-streamreg is disabled for ttnn_bcast_to_protocol: the old idle-stream scratch-register "
@@ -526,9 +573,42 @@ RunResult run_one(
     std::vector<uint32_t> compute_compile_time_args = {static_cast<uint32_t>(CBIndex::c_0), static_cast<uint32_t>(CBIndex::c_1)};
     const uint32_t protocol_start_value = 0x5a5a0000u ^ options.tiles ^ (options.num_pages << 8) ^
                                           (repeat * 0x00010001u) ^ dst_dram_addr;
-    auto reader_kernel_defines = reader_defines(mode, protocol_start_value);
-    auto writer_kernel_defines = writer_defines(mode, protocol_start_value);
-    auto compute_kernel_defines = compute_defines(mode, protocol_start_value);
+    const auto first_static_addrs = [&]() {
+        struct Addresses {
+            uint32_t src_ring_addr;
+            uint32_t dst_ring_addr;
+            uint32_t protocol_start_addr;
+        };
+        if (!is_static_mode(mode)) {
+            return Addresses{};
+        }
+        const auto& work = core_work.front();
+        return Addresses{
+            .src_ring_addr = core_local_l1_address(work.src_ring_buffer, work.core),
+            .dst_ring_addr = core_local_l1_address(work.dst_ring_buffer, work.core),
+            .protocol_start_addr = core_local_l1_address(work.protocol_start_buffer, work.core)};
+    }();
+    auto reader_kernel_defines = reader_defines(
+        mode,
+        protocol_start_value,
+        first_static_addrs.src_ring_addr,
+        first_static_addrs.dst_ring_addr,
+        first_static_addrs.protocol_start_addr,
+        options);
+    auto writer_kernel_defines = writer_defines(
+        mode,
+        protocol_start_value,
+        first_static_addrs.src_ring_addr,
+        first_static_addrs.dst_ring_addr,
+        first_static_addrs.protocol_start_addr,
+        options);
+    auto compute_kernel_defines = compute_defines(
+        mode,
+        protocol_start_value,
+        first_static_addrs.src_ring_addr,
+        first_static_addrs.dst_ring_addr,
+        first_static_addrs.protocol_start_addr,
+        options);
 
     KernelHandle reader_kernel = CreateKernel(
         program,
@@ -568,11 +648,13 @@ RunResult run_one(
             const uint32_t dst_ring_addr = core_local_l1_address(work.dst_ring_buffer, work.core);
             const uint32_t protocol_start_addr = core_local_l1_address(work.protocol_start_buffer, work.core);
 
-            reader_args.insert(reader_args.end(), {src_ring_addr, kTileSizeBytes, options.num_pages, protocol_start_addr});
-            writer_args.insert(writer_args.end(), {dst_ring_addr, kTileSizeBytes, options.num_pages, protocol_start_addr});
-            compute_args.insert(
-                compute_args.end(),
-                {src_ring_addr, dst_ring_addr, kTileSizeBytes, options.num_pages, protocol_start_addr});
+            if (!uses_compile_time_protocol_args(mode)) {
+                reader_args.insert(reader_args.end(), {src_ring_addr, kTileSizeBytes, options.num_pages, protocol_start_addr});
+                writer_args.insert(writer_args.end(), {dst_ring_addr, kTileSizeBytes, options.num_pages, protocol_start_addr});
+                compute_args.insert(
+                    compute_args.end(),
+                    {src_ring_addr, dst_ring_addr, kTileSizeBytes, options.num_pages, protocol_start_addr});
+            }
         }
 
         SetRuntimeArgs(program, reader_kernel, work.core, reader_args);

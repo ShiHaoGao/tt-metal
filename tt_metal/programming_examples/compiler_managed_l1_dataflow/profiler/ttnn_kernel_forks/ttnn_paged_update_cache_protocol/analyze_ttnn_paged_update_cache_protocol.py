@@ -15,6 +15,7 @@ MODE_LABELS = {
     "CB": "cb",
     "STATIC_RUNTIME": "static-runtime",
     "STATIC_STREAMREG_CBREGS": "static-streamreg-cbregs",
+    "STATIC_STREAMREG_CBREGS_COMPILETIME": "static-streamreg-cbregs-compiletime",
 }
 
 STAGE_LABELS = {
@@ -27,7 +28,7 @@ STAGE_LABELS = {
 }
 
 ZONE_RE = re.compile(
-    r"^TPUC_(?P<mode>CB|STATIC_RUNTIME|STATIC_STREAMREG_CBREGS)_"
+    r"^TPUC_(?P<mode>CB|STATIC_RUNTIME|STATIC_STREAMREG_CBREGS|STATIC_STREAMREG_CBREGS_COMPILETIME)_"
     r"(?P<stage>READER|WRITER|COMPUTE_INPUT_UNTILIZE|COMPUTE_UNPACK|COMPUTE_MATH|COMPUTE_PACK)$"
 )
 CASE_RE = re.compile(

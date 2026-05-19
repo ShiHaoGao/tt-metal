@@ -73,7 +73,7 @@ PHASES = (
         title="Data-movement only, no CB",
         goal="Validate raw L1 staging plus NoC traffic and semaphore synchronization without TT-Metal CB FIFO semantics.",
         representative_tasks=("cb_protocol_overhead_dram", "real_copy"),
-        exit_criteria="DRAM traffic is correct and static runtime/compile-time address modes are stable against dram-cb.",
+        exit_criteria="DRAM traffic is correct and static-runtime / stream-register modes are stable against dram-cb.",
         current_status=(
             "Direct microbenchmark and production-shaped copy fork both run; L1-semaphore copy is negative, "
             "while dataflow-only scratch-register sync nearly matches CB. Compute-path stream-register work "
@@ -121,9 +121,9 @@ FAMILY_DECISIONS = {
         "next_direct_experiment": "Sweep page size, CB count, and RISC count after firmware/runtime changes.",
     },
     "data_movement_layout": {
-        "phase_state": "phase1 direct microbenchmark and copy fork available; L1-semaphore copy is negative, stream-register copy is near-CB",
-        "current_decision": "High-priority Phase 1 target for dataflow-only protocols. Keep CB and static-runtime as required baselines; direct stream-register sync from TRISC is disabled until it passes compute-path smoke validation.",
-        "next_direct_experiment": "Add tilize/untilize or transpose fork with CB, L1-semaphore static, and stream-register static modes.",
+        "phase_state": "phase1 direct copy fork available; transpose_wh and slice_tile direct forks are weak positive; L1-semaphore copy is negative, stream-register copy is near-CB",
+        "current_decision": "Layout/data-movement must be judged op-by-op. transpose_wh and slice_tile have writer-critical weak wins, while copy cannot be promoted.",
+        "next_direct_experiment": "Pause before Level C; later add tilize/untilize/concat and multi-core sharded slice with device profiler critical-stage checks.",
     },
     "eltwise": {
         "phase_state": "phase2 positive, phase3 direct positive",
@@ -153,13 +153,13 @@ FAMILY_DECISIONS = {
     "embedding_kv_cache": {
         "phase_state": (
             "phase3 direct positive for paged_update_cache 8-user decode-like shapes; "
-            "cache-read and 32-user scalability are still open"
+            "embedding lookup is positive; KV cache load-slice/cache-read is near noise; 32-user scalability is still open"
         ),
         "current_decision": (
-            "Promote paged_update_cache decode-like update as a shape-specific positive case. "
-            "Do not generalize to all embedding/cache ops until cache-read and wider-user paths are profiled."
+            "Promote paged_update_cache decode-like update and single-core embedding lookup as shape-specific positive cases. "
+            "Do not generalize to all embedding/cache ops; load-slice read is reader-critical and near noise in the current single-core fork."
         ),
-        "next_direct_experiment": "Fix 32-user/static layout scalability, then fork paged cache read and embedding lookup.",
+        "next_direct_experiment": "Pause before Level C; later fix 32-user/static layout scalability and add multi-core sharded cache-read/padded/chunked embedding forks.",
     },
     "ccl": {
         "phase_state": "phase3 single-card sweep produced no applicable vectors; multi-device run required",
@@ -224,12 +224,21 @@ FAMILIES = (
         priority="high",
         bottleneck_hypothesis="Often DRAM/NoC/protocol bound; layout conversion can hide protocol behind address math.",
         static_coverage=(
-            "direct no-CB DRAM microbenchmark plus copy fork; L1-semaphore copy is negative and "
-            "dataflow-only scratch-register copy is near-CB, so next dataflow forks should target "
-            "transpose, tilize, untilize, slice, concat; compute-path streamreg must be per-CB cbregs"
+            "direct no-CB DRAM microbenchmark plus copy fork; transpose_wh and slice_tile are weak positive; "
+            "L1-semaphore copy is negative and dataflow-only scratch-register copy is near-CB, so future "
+            "dataflow forks should target tilize, untilize, concat, and multi-core sharded slice; "
+            "compute-path streamreg must be per-CB cbregs"
         ),
         shape_classes=("small", "medium", "large", "interleaved", "sharded"),
-        profiler_tasks=("cb_protocol_overhead_dram", "real_copy", "real_copy_multicore", "real_tile_add", "static_protocol_modeling_memory_bound"),
+        profiler_tasks=(
+            "cb_protocol_overhead_dram",
+            "real_copy",
+            "real_copy_multicore",
+            "real_tile_add",
+            "static_protocol_modeling_memory_bound",
+            "ttnn_transpose_wh",
+            "ttnn_slice_tile",
+        ),
         sweep_modules=(
             "data_movement.copy.copy",
             "data_movement.transpose.transpose_interleaved",
@@ -349,11 +358,11 @@ FAMILIES = (
         priority="high",
         bottleneck_hypothesis="Lookup/cache update paths are memory and latency exposed; protocol may matter for small token steps.",
         static_coverage=(
-            "direct TTNN paged_update_cache update fork exists; "
-            "embedding lookup and cache read remain coverage/baseline only"
+            "direct TTNN paged_update_cache update and embedding lookup forks are positive; "
+            "KV cache load-slice/cache-read fork is reader-critical and near noise"
         ),
         shape_classes=("decode token", "paged cache", "embedding lookup", "cache fill"),
-        profiler_tasks=("ttnn_paged_update_cache", "static_protocol_modeling_memory_bound"),
+        profiler_tasks=("ttnn_paged_update_cache", "ttnn_embedding_lookup", "ttnn_kv_cache_load_slice", "static_protocol_modeling_memory_bound"),
         sweep_modules=(
             "embedding.embedding",
             "embedding_bw.embedding_bw",
@@ -677,8 +686,14 @@ def build_task(args):
         "real_matmul_protocol",
         "static_protocol_modeling",
         "ttnn_binary_ng_no_bcast_protocol",
+        "ttnn_binary_ng_sfpu_no_bcast_protocol",
+        "ttnn_binary_ng_row_bcast_protocol",
         "ttnn_bcast_to_protocol",
         "ttnn_paged_update_cache_protocol",
+        "ttnn_transpose_wh_protocol",
+        "ttnn_embedding_lookup_protocol",
+        "ttnn_slice_tile_protocol",
+        "ttnn_kv_cache_load_slice_protocol",
     ]
     out_dir = task_dir(args, "build_static_protocol_profilers")
     return TaskRun(
@@ -775,6 +790,7 @@ def static_protocol_tasks(args):
                 "static-runtime",
                 "static-compiletime",
                 "static-streamreg-scratch",
+                "static-streamreg-scratch-compiletime",
                 "--device-id",
                 device,
             ),
@@ -804,12 +820,12 @@ def static_protocol_tasks(args):
                     "2",
                     "--repeats",
                     repeats,
-                "--modes",
-                "cb",
-                "static-runtime",
-                "static-streamreg-scratch",
-                "--core-grid-x",
-                "2",
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-scratch",
+                    "--core-grid-x",
+                    "2",
                     "--core-grid-y",
                     "2",
                     "--device-id",
@@ -902,7 +918,6 @@ def static_protocol_tasks(args):
                 "--modes",
                 "cb",
                 "static-runtime",
-                "static-compiletime",
                 "static-streamreg-cbregs",
                 "--device-id",
                 device,
@@ -933,12 +948,12 @@ def static_protocol_tasks(args):
                     "2",
                     "--repeats",
                     repeats,
-                "--modes",
-                "cb",
-                "static-runtime",
-                "static-streamreg-cbregs",
-                "--core-grid-x",
-                "2",
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "--core-grid-x",
+                    "2",
                     "--core-grid-y",
                     "2",
                     "--device-id",
@@ -983,6 +998,38 @@ def static_protocol_tasks(args):
         )
     )
 
+    out_dir = task_dir(args, "ttnn_binary_ng_sfpu_no_bcast")
+    tasks.append(
+        TaskRun(
+            name="ttnn_binary_ng_sfpu_no_bcast",
+            family="eltwise",
+            phase="phase3",
+            kind="static_profiler",
+            command=py_command(
+                PROFILER_DIR
+                / "ttnn_kernel_forks/ttnn_binary_ng_sfpu_no_bcast_protocol/run_ttnn_binary_ng_sfpu_no_bcast_protocol_cases.py",
+                "--out-dir",
+                out_dir,
+                "--tiles",
+                *binary_tiles,
+                "--num-pages",
+                "2",
+                "--repeats",
+                repeats,
+                "--modes",
+                "cb",
+                "static-runtime",
+                "static-streamreg-cbregs",
+                "--device-id",
+                device,
+            ),
+            out_dir=out_dir,
+            log_path=out_dir / "suite.log",
+            summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
+            notes="Real TTNN binary-ng SFPU no-broadcast div fork; tests whether simple eltwise gains survive compute-heavy SFPU.",
+        )
+    )
+
     if args.tier in {"core", "full"}:
         out_dir = task_dir(args, "ttnn_bcast_to_row")
         bcast_tiles = ["1024"] if args.tier == "smoke" else ["1024", "4096", "16384"]
@@ -1018,6 +1065,41 @@ def static_protocol_tasks(args):
             )
         )
 
+        out_dir = task_dir(args, "ttnn_binary_ng_row_bcast")
+        tasks.append(
+            TaskRun(
+                name="ttnn_binary_ng_row_bcast",
+                family="eltwise",
+                phase="phase3",
+                kind="static_profiler",
+                command=py_command(
+                    PROFILER_DIR / "ttnn_kernel_forks/ttnn_binary_ng_row_bcast_protocol/run_ttnn_binary_ng_row_bcast_protocol_cases.py",
+                    "--out-dir",
+                    out_dir,
+                    "--ops",
+                    "add",
+                    "--tiles",
+                    *bcast_tiles,
+                    "--width-tiles",
+                    "8",
+                    "--num-pages",
+                    "2",
+                    "--repeats",
+                    repeats,
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "--device-id",
+                    device,
+                ),
+                out_dir=out_dir,
+                log_path=out_dir / "suite.log",
+                summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
+                notes="Real TTNN binary_ng row-broadcast fork; reader-side software row-bcast add path.",
+            )
+        )
+
         out_dir = task_dir(args, "ttnn_binary_ng_no_bcast_multicore")
         tasks.append(
             TaskRun(
@@ -1036,12 +1118,12 @@ def static_protocol_tasks(args):
                     "2",
                     "--repeats",
                     repeats,
-                "--modes",
-                "cb",
-                "static-runtime",
-                "static-streamreg-cbregs",
-                "--core-grid-x",
-                "2",
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "--core-grid-x",
+                    "2",
                     "--core-grid-y",
                     "2",
                     "--device-id",
@@ -1051,6 +1133,74 @@ def static_protocol_tasks(args):
                 log_path=out_dir / "suite.log",
                 summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
                 notes="Multi-core TTNN binary-ng no-broadcast check.",
+            )
+        )
+
+        out_dir = task_dir(args, "ttnn_transpose_wh")
+        transpose_shapes = ["8x8"] if args.tier == "smoke" else ["8x8", "16x16", "32x32"]
+        tasks.append(
+            TaskRun(
+                name="ttnn_transpose_wh",
+                family="data_movement_layout",
+                phase="phase3",
+                kind="static_profiler",
+                command=py_command(
+                    PROFILER_DIR / "ttnn_kernel_forks/ttnn_transpose_wh_protocol/run_ttnn_transpose_wh_protocol_cases.py",
+                    "--out-dir",
+                    out_dir,
+                    "--shapes",
+                    *transpose_shapes,
+                    "--num-pages",
+                    "2",
+                    "--repeats",
+                    repeats,
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "--device-id",
+                    device,
+                ),
+                out_dir=out_dir,
+                log_path=out_dir / "suite.log",
+                summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
+                notes="Real TTNN tiled transpose_wh reader/compute/writer fork; weak layout-family direct evidence.",
+            )
+        )
+
+        out_dir = task_dir(args, "ttnn_slice_tile")
+        slice_shapes = ["64x64x16x64x8x0"] if args.tier == "smoke" else [
+            "64x64x16x64x8x0",
+            "64x64x32x32x16x16",
+            "128x64x64x32x32x16",
+        ]
+        tasks.append(
+            TaskRun(
+                name="ttnn_slice_tile",
+                family="data_movement_layout",
+                phase="phase3",
+                kind="static_profiler",
+                command=py_command(
+                    PROFILER_DIR / "ttnn_kernel_forks/ttnn_slice_tile_protocol/run_ttnn_slice_tile_protocol_cases.py",
+                    "--out-dir",
+                    out_dir,
+                    "--shapes",
+                    *slice_shapes,
+                    "--num-pages",
+                    "2",
+                    "--repeats",
+                    repeats,
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "--device-id",
+                    device,
+                ),
+                out_dir=out_dir,
+                log_path=out_dir / "suite.log",
+                summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
+                notes="Real TTNN tiled slice reader/writer fork; weak layout-family direct evidence.",
             )
         )
 
@@ -1097,7 +1247,124 @@ def static_protocol_tasks(args):
                 summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
                 notes=(
                     "Real TTNN paged_update_cache update fork with decode-like 8-user shapes. "
-                    "This is direct static-protocol evidence for embedding/KV-cache update, not for cache read."
+                    "This is Level B static-streamreg-cbregs evidence for embedding/KV-cache update, not for cache read."
+                ),
+            )
+        )
+
+        level_b_out_dir = task_dir(args, "ttnn_paged_update_cache_compiletime_ablation")
+        tasks.append(
+            TaskRun(
+                name="ttnn_paged_update_cache_compiletime_ablation",
+                family="embedding_kv_cache",
+                phase="phase3",
+                kind="static_profiler",
+                command=py_command(
+                    PROFILER_DIR
+                    / "ttnn_kernel_forks/ttnn_paged_update_cache_protocol/run_ttnn_paged_update_cache_protocol_cases.py",
+                    "--out-dir",
+                    level_b_out_dir,
+                    "--users",
+                    "1",
+                    "--kv-heads",
+                    "1",
+                    "--head-dims",
+                    "128",
+                    "--block-sizes",
+                    "64",
+                    "--max-seq-lens",
+                    "2048",
+                    "--cache-idxs",
+                    "127",
+                    "--num-pages",
+                    "2",
+                    "--repeats",
+                    repeats,
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "static-streamreg-cbregs-compiletime",
+                    "--device-id",
+                    device,
+                ),
+                out_dir=level_b_out_dir,
+                log_path=level_b_out_dir / "suite.log",
+                summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
+                notes=(
+                    "Single-core paged_update_cache compile-time ablation. "
+                    "This is not the Level B standard mode; compile-time protocol defines are kernel-global."
+                ),
+            )
+        )
+
+        out_dir = task_dir(args, "ttnn_embedding_lookup")
+        embedding_shapes = ["64x1024x128"] if args.tier == "smoke" else ["256x32000x128", "1024x32000x128", "4096x32000x128"]
+        tasks.append(
+            TaskRun(
+                name="ttnn_embedding_lookup",
+                family="embedding_kv_cache",
+                phase="phase3",
+                kind="static_profiler",
+                command=py_command(
+                    PROFILER_DIR
+                    / "ttnn_kernel_forks/ttnn_embedding_lookup_protocol/run_ttnn_embedding_lookup_protocol_cases.py",
+                    "--out-dir",
+                    out_dir,
+                    "--shapes",
+                    *embedding_shapes,
+                    "--num-pages",
+                    "2",
+                    "--repeats",
+                    repeats,
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "--device-id",
+                    device,
+                ),
+                out_dir=out_dir,
+                log_path=out_dir / "suite.log",
+                summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
+                notes="Real TTNN-style embedding lookup/read-heavy fork; first direct evidence for embedding lookup.",
+            )
+        )
+
+        out_dir = task_dir(args, "ttnn_kv_cache_load_slice")
+        kv_load_shapes = ["128x32x4x0"] if args.tier == "smoke" else [
+            "128x32x4x0",
+            "512x64x4x64",
+            "1024x128x4x128",
+        ]
+        tasks.append(
+            TaskRun(
+                name="ttnn_kv_cache_load_slice",
+                family="embedding_kv_cache",
+                phase="phase3",
+                kind="static_profiler",
+                command=py_command(
+                    PROFILER_DIR
+                    / "ttnn_kernel_forks/ttnn_kv_cache_load_slice_protocol/run_ttnn_kv_cache_load_slice_protocol_cases.py",
+                    "--out-dir",
+                    out_dir,
+                    "--shapes",
+                    *kv_load_shapes,
+                    "--repeats",
+                    repeats,
+                    "--modes",
+                    "cb",
+                    "static-runtime",
+                    "static-streamreg-cbregs",
+                    "--device-id",
+                    device,
+                ),
+                out_dir=out_dir,
+                log_path=out_dir / "suite.log",
+                summary_files=("device_mode_comparison.csv", "host_mode_comparison.csv", "critical_stage_summary.csv"),
+                notes=(
+                    "Real TTNN nlp_kv_cache_load_slice-style cache-read fork. "
+                    "Current single-core shapes are kept within L1 capacity and are expected to be reader-critical."
                 ),
             )
         )
@@ -1130,6 +1397,9 @@ def static_protocol_tasks(args):
                 "static-input-only-cbregs",
                 "static-output-only-cbregs",
                 "static-input-output-cbregs",
+                "static-input-only-cbregs-compiletime",
+                "static-output-only-cbregs-compiletime",
+                "static-input-output-cbregs-compiletime",
                 "--device-id",
                 device,
             ),
@@ -1171,6 +1441,9 @@ def static_protocol_tasks(args):
                     "static-input-only-cbregs",
                     "static-output-only-cbregs",
                     "static-input-output-cbregs",
+                    "static-input-only-cbregs-compiletime",
+                    "static-output-only-cbregs-compiletime",
+                    "static-input-output-cbregs-compiletime",
                     "--skip-check",
                     "--device-id",
                     device,

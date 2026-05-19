@@ -18,6 +18,7 @@ MODE_LABELS = {
     "STATIC_SERIALIZED": "static-serialized",
     "STATIC_STREAMREG": "static-streamreg",
     "STATIC_STREAMREG_CBREGS": "static-streamreg-cbregs",
+    "STATIC_STREAMREG_CBREGS_COMPILETIME": "static-streamreg-cbregs-compiletime",
 }
 
 OP_LABELS = {
@@ -35,7 +36,10 @@ STAGE_LABELS = {
     "COMPUTE_PACK": "compute-pack",
 }
 
-MODE_PATTERN = "CB|STATIC_RUNTIME|STATIC_COMPILETIME|STATIC_SERIALIZED|STATIC_STREAMREG|STATIC_STREAMREG_CBREGS"
+MODE_PATTERN = (
+    "CB|STATIC_RUNTIME|STATIC_COMPILETIME|STATIC_SERIALIZED|STATIC_STREAMREG|"
+    "STATIC_STREAMREG_CBREGS|STATIC_STREAMREG_CBREGS_COMPILETIME"
+)
 STAGE_PATTERN = "READER|WRITER|COMPUTE_UNPACK|COMPUTE_MATH|COMPUTE_PACK"
 
 TILE_ZONE_RE = re.compile(
@@ -499,7 +503,7 @@ def build_mode_comparisons(host_summary):
                     "delta_us_per_input_pair": serialized["median_us_per_input_pair"] - runtime["median_us_per_input_pair"],
                 }
             )
-        for streamreg_mode in ("static-streamreg-cbregs",):
+        for streamreg_mode in ("static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"):
             if "cb" in modes and streamreg_mode in modes:
                 cb = modes["cb"]
                 streamreg = modes[streamreg_mode]
@@ -572,9 +576,12 @@ def build_device_mode_comparisons(zone_summary):
     comparison_pairs = [
         ("cb", "static-runtime"),
         ("cb", "static-streamreg-cbregs"),
+        ("cb", "static-streamreg-cbregs-compiletime"),
         ("static-runtime", "static-compiletime"),
         ("static-serialized", "static-runtime"),
         ("static-streamreg-cbregs", "static-runtime"),
+        ("static-runtime", "static-streamreg-cbregs-compiletime"),
+        ("static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"),
     ]
     for key, modes in sorted(grouped.items()):
         for lhs_mode, rhs_mode in comparison_pairs:

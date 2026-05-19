@@ -34,8 +34,20 @@ def parse_args():
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["cb", "static-runtime", "static-compiletime", "static-streamreg-scratch"],
-        choices=["cb", "static-runtime", "static-compiletime", "static-streamreg-scratch"],
+        default=[
+            "cb",
+            "static-runtime",
+            "static-compiletime",
+            "static-streamreg-scratch",
+            "static-streamreg-scratch-compiletime",
+        ],
+        choices=[
+            "cb",
+            "static-runtime",
+            "static-compiletime",
+            "static-streamreg-scratch",
+            "static-streamreg-scratch-compiletime",
+        ],
     )
     return parser.parse_args()
 
@@ -131,7 +143,12 @@ def build_critical_comparisons(critical_rows):
         cb = modes["cb"]
         active_cores = max(1, cb.get("core_count", 1))
         max_tiles_per_core = max(1, (key[0] + active_cores - 1) // active_cores)
-        for static_mode in ["static-runtime", "static-compiletime", "static-streamreg-scratch"]:
+        for static_mode in [
+            "static-runtime",
+            "static-compiletime",
+            "static-streamreg-scratch",
+            "static-streamreg-scratch-compiletime",
+        ]:
             if static_mode not in modes:
                 continue
             static = modes[static_mode]
@@ -172,7 +189,12 @@ def build_host_comparisons(host_summary_rows):
         cb = modes["cb"]
         active_cores = max(1, key[2] * key[3])
         max_tiles_per_core = max(1, (key[0] + active_cores - 1) // active_cores)
-        for static_mode in ["static-runtime", "static-compiletime", "static-streamreg-scratch"]:
+        for static_mode in [
+            "static-runtime",
+            "static-compiletime",
+            "static-streamreg-scratch",
+            "static-streamreg-scratch-compiletime",
+        ]:
             if static_mode not in modes:
                 continue
             static = modes[static_mode]

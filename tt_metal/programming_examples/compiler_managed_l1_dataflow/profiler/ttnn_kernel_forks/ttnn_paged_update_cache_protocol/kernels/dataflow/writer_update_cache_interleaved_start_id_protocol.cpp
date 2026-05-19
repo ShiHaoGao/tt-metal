@@ -22,8 +22,36 @@
 #define BENCH_USE_STREAM_REG_CBREGS 0
 #endif
 
+#ifndef BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
+#endif
+
+#ifndef BENCH_INTERMED_RING_ADDR
+#define BENCH_INTERMED_RING_ADDR 0
+#endif
+
+#ifndef BENCH_INPUT_UNTILIZED_ADDR
+#define BENCH_INPUT_UNTILIZED_ADDR 0
+#endif
+
+#ifndef BENCH_OUTPUT_RING_ADDR
+#define BENCH_OUTPUT_RING_ADDR 0
+#endif
+
+#ifndef BENCH_PAGE_SIZE
+#define BENCH_PAGE_SIZE 0
+#endif
+
+#ifndef BENCH_NUM_PAGES
+#define BENCH_NUM_PAGES 1
+#endif
+
+#ifndef BENCH_PROTOCOL_START_SEM_ADDR
+#define BENCH_PROTOCOL_START_SEM_ADDR 0
 #endif
 
 #ifndef BENCH_STREAM_REG_START_STREAM_ID
@@ -154,6 +182,15 @@ void kernel_main() {
     }
 
 #if BENCH_STATIC_PROTOCOL
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    constexpr uint32_t intermed_ring_addr = BENCH_INTERMED_RING_ADDR;
+    constexpr uint32_t input_untilized_addr = BENCH_INPUT_UNTILIZED_ADDR;
+    constexpr uint32_t output_ring_addr = BENCH_OUTPUT_RING_ADDR;
+    constexpr uint32_t intermed_page_size = BENCH_PAGE_SIZE;
+    constexpr uint32_t output_page_size = BENCH_PAGE_SIZE;
+    constexpr uint32_t num_pages = BENCH_NUM_PAGES;
+    constexpr uint32_t protocol_start_sem_addr = BENCH_PROTOCOL_START_SEM_ADDR;
+#else
     const uint32_t intermed_ring_addr = get_arg_val<uint32_t>(7);
     const uint32_t input_untilized_addr = get_arg_val<uint32_t>(8);
     const uint32_t output_ring_addr = get_arg_val<uint32_t>(9);
@@ -161,6 +198,7 @@ void kernel_main() {
     const uint32_t output_page_size = get_arg_val<uint32_t>(11);
     const uint32_t num_pages = get_arg_val<uint32_t>(12);
     const uint32_t protocol_start_sem_addr = get_arg_val<uint32_t>(13);
+#endif
 
 #if BENCH_USE_STREAM_REG_CBREGS
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_PROTOCOL_START_VALUE);
@@ -180,7 +218,11 @@ void kernel_main() {
     wait_equal_reg(input_untilized_ready_reg, 1);
 
 #if BENCH_USE_STREAM_REG_CBREGS
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    DeviceZoneScopedN("TPUC_STATIC_STREAMREG_CBREGS_COMPILETIME_WRITER");
+#else
     DeviceZoneScopedN("TPUC_STATIC_STREAMREG_CBREGS_WRITER");
+#endif
 #else
     DeviceZoneScopedN("TPUC_STATIC_RUNTIME_WRITER");
 #endif

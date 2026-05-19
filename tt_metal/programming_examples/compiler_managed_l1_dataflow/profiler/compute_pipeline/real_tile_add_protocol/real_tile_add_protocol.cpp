@@ -65,6 +65,7 @@ enum class Mode : uint32_t {
     StaticCompileTime = 2,
     StaticStreamReg = 3,
     StaticStreamRegCbRegs = 4,
+    StaticStreamRegCbRegsCompileTime = 5,
 };
 
 struct Options {
@@ -123,6 +124,7 @@ const char* mode_name(Mode mode) {
         case Mode::StaticCompileTime: return "static-compiletime";
         case Mode::StaticStreamReg: return "static-streamreg";
         case Mode::StaticStreamRegCbRegs: return "static-streamreg-cbregs";
+        case Mode::StaticStreamRegCbRegsCompileTime: return "static-streamreg-cbregs-compiletime";
     }
     return "unknown";
 }
@@ -143,29 +145,38 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     if (mode == "static-streamreg-cbregs") {
         return Mode::StaticStreamRegCbRegs;
     }
+    if (mode == "static-streamreg-cbregs-compiletime") {
+        return Mode::StaticStreamRegCbRegsCompileTime;
+    }
     return std::nullopt;
 }
 
 std::vector<Mode> modes_to_run(const std::string& mode) {
     if (mode == "all") {
-        return {Mode::Cb, Mode::StaticRuntime, Mode::StaticCompileTime, Mode::StaticStreamRegCbRegs};
+        return {
+            Mode::Cb,
+            Mode::StaticRuntime,
+            Mode::StaticCompileTime,
+            Mode::StaticStreamRegCbRegs,
+            Mode::StaticStreamRegCbRegsCompileTime};
     }
     auto parsed = parse_mode(mode);
     if (!parsed.has_value()) {
         throw std::invalid_argument(
             "Unknown --mode. Valid values are all, cb, static-runtime, static-compiletime, "
-            "static-streamreg-cbregs. The old static-streamreg compute mode is disabled.");
+            "static-streamreg-cbregs, static-streamreg-cbregs-compiletime. "
+            "The old static-streamreg compute mode is disabled.");
     }
     return {*parsed};
 }
 
 bool is_static_mode(Mode mode) {
     return mode == Mode::StaticRuntime || mode == Mode::StaticCompileTime || mode == Mode::StaticStreamReg ||
-           mode == Mode::StaticStreamRegCbRegs;
+           mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime;
 }
 
 bool uses_compile_time_args(Mode mode) {
-    return mode == Mode::StaticCompileTime;
+    return mode == Mode::StaticCompileTime || mode == Mode::StaticStreamRegCbRegsCompileTime;
 }
 
 bool uses_stream_reg_sync(Mode mode) {
@@ -173,7 +184,7 @@ bool uses_stream_reg_sync(Mode mode) {
 }
 
 bool uses_stream_reg_cbregs(Mode mode) {
-    return mode == Mode::StaticStreamRegCbRegs;
+    return mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime;
 }
 
 bool uses_stream_reg_start_gate(Mode mode) {
@@ -182,7 +193,8 @@ bool uses_stream_reg_start_gate(Mode mode) {
 
 void print_usage(const char* argv0) {
     fmt::print(
-        "Usage: {} [--mode=all|cb|static-runtime|static-compiletime|static-streamreg-cbregs] [--tiles=N] "
+        "Usage: {} [--mode=all|cb|static-runtime|static-compiletime|static-streamreg-cbregs|"
+        "static-streamreg-cbregs-compiletime] [--tiles=N] "
         "[--num-pages=N] "
         "[--repeats=N] [--device-id=N] [--core-x=N] [--core-y=N] "
         "[--core-grid-x=N] [--core-grid-y=N] "

@@ -42,7 +42,7 @@ def parse_args():
         "--modes",
         nargs="+",
         default=["cb", "static-runtime", "static-streamreg-cbregs"],
-        choices=["cb", "static-runtime", "static-streamreg-cbregs"],
+        choices=["cb", "static-runtime", "static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"],
     )
     args = parser.parse_args()
     for tiles in args.tiles:
@@ -149,7 +149,7 @@ def build_critical_comparisons(critical_rows):
         cb = modes["cb"]
         active_cores = max(1, cb.get("core_count", 1))
         max_tiles_per_core = max(1, (key[0] + active_cores - 1) // active_cores)
-        for static_mode in ["static-runtime", "static-streamreg-cbregs"]:
+        for static_mode in ["static-runtime", "static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"]:
             if static_mode not in modes:
                 continue
             static = modes[static_mode]
@@ -190,7 +190,7 @@ def build_host_comparisons(host_summary_rows):
         if "cb" not in modes:
             continue
         cb = modes["cb"]
-        for static_mode in ["static-runtime", "static-streamreg-cbregs"]:
+        for static_mode in ["static-runtime", "static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"]:
             if static_mode not in modes:
                 continue
             static = modes[static_mode]

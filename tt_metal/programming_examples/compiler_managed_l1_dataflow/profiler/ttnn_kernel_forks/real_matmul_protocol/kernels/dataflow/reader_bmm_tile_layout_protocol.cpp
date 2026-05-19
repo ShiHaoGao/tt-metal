@@ -23,6 +23,10 @@
 #define BENCH_USE_STREAM_REG_CBREGS 0
 #endif
 
+#ifndef BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
 #endif
@@ -49,7 +53,14 @@ constexpr uint32_t kCbIn0 = tt::CBIndex::c_0;
 constexpr uint32_t kCbIn1 = tt::CBIndex::c_1;
 constexpr uint32_t kCbOut = tt::CBIndex::c_16;
 
-#if BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS
+#if BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
+    BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_OUTPUT_CBREGS_COMPILETIME"
+#elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_ONLY_CBREGS_COMPILETIME"
+#elif BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+#define RMP_MODE_PREFIX "RMP_REUSE_STATIC_OUTPUT_ONLY_CBREGS_COMPILETIME"
+#elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS
 #define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_OUTPUT_CBREGS"
 #elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS
 #define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_ONLY_CBREGS"
@@ -144,6 +155,16 @@ void kernel_main() {
 #endif
 
 #if BENCH_STATIC_INPUT_PROTOCOL
+#if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
+    constexpr uint32_t in0_ring_addr = BENCH_SRC0_RING_ADDR;
+    constexpr uint32_t in1_ring_addr = BENCH_SRC1_RING_ADDR;
+    constexpr uint32_t in0_slot_bytes = BENCH_SRC0_SLOT_BYTES;
+    constexpr uint32_t in1_slot_bytes = BENCH_SRC1_SLOT_BYTES;
+    constexpr uint32_t num_pages = BENCH_NUM_PAGES;
+#if !BENCH_USE_STREAM_REG_CBREGS
+    constexpr uint32_t protocol_start_sem_addr = BENCH_PROTOCOL_START_SEM_ADDR;
+#endif
+#else
     const uint32_t in0_ring_addr = get_arg_val<uint32_t>(21);
     const uint32_t in1_ring_addr = get_arg_val<uint32_t>(22);
     const uint32_t in0_slot_bytes = get_arg_val<uint32_t>(23);
@@ -151,6 +172,7 @@ void kernel_main() {
     const uint32_t num_pages = get_arg_val<uint32_t>(25);
 #if !BENCH_USE_STREAM_REG_CBREGS
     const uint32_t protocol_start_sem_addr = get_arg_val<uint32_t>(26);
+#endif
 #endif
 
     volatile tt_reg_ptr uint32_t* input_ready_reg = reg_ptr_from_cb(kCbIn0, true);

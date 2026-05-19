@@ -16,6 +16,7 @@ MODE_LABELS = {
     "STATIC_RUNTIME": "static-runtime",
     "STATIC_COMPILETIME": "static-compiletime",
     "STATIC_STREAMREG_SCRATCH": "static-streamreg-scratch",
+    "STATIC_STREAMREG_SCRATCH_COMPILETIME": "static-streamreg-scratch-compiletime",
 }
 
 STAGE_LABELS = {
@@ -23,7 +24,10 @@ STAGE_LABELS = {
     "WRITER": "writer",
 }
 
-ZONE_RE = re.compile(r"^RTCOPY_(?P<mode>CB|STATIC_RUNTIME|STATIC_COMPILETIME|STATIC_STREAMREG_SCRATCH)_(?P<stage>READER|WRITER)$")
+ZONE_RE = re.compile(
+    r"^RTCOPY_(?P<mode>CB|STATIC_RUNTIME|STATIC_COMPILETIME|STATIC_STREAMREG_SCRATCH|"
+    r"STATIC_STREAMREG_SCRATCH_COMPILETIME)_(?P<stage>READER|WRITER)$"
+)
 CASE_RE = re.compile(
     r"real_copy_protocol: tiles=(?P<tiles>\d+), tile_size=(?P<tile_size>\d+), "
     r"num_pages=(?P<num_pages>\d+), repeats=(?P<repeats>\d+), "

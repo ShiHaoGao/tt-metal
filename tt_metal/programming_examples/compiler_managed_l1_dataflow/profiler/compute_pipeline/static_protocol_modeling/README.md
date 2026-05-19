@@ -16,6 +16,7 @@
 - `static-compiletime`：同样 protocol，但地址和计数 baked into kernel defines。
 - `static-serialized`：负向控制项，破坏 pipeline overlap，用来证明收益不是简单来自少调用 CB API。
 - `static-streamreg-cbregs`：同样 static ring protocol，但 queue counters 使用 per-logical-CB `tiles_received` / `tiles_acked` registers。
+- `static-streamreg-cbregs-compiletime`：compile-time config ablation / upper bound，在 per-CB stream-register counters 上继续静态化 ring/layout/config。
 
 旧 `static-streamreg` 在 compute-path workloads 中禁用。有效模型必须是 per logical CB：`c_0`、`c_1`、`c_16` 各自使用独立的 `get_cb_tiles_received_ptr(cbid)` / `get_cb_tiles_acked_ptr(cbid)`。
 
@@ -28,7 +29,7 @@ cmake --build build_Release --target static_protocol_modeling -j8
 ```bash
 TT_METAL_CACHE=/tmp/static_protocol_modeling_smoke \
   ./build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/static_protocol_modeling \
-  --op=tile-add --mode=all --tiles=4 --num-slots=1 --repeats=1
+  --op=tile-add --mode=static-streamreg-cbregs --tiles=4 --num-slots=2 --repeats=1
 ```
 
 ```bash

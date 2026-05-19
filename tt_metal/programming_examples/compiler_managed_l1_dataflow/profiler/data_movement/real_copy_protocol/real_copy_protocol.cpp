@@ -58,6 +58,7 @@ enum class Mode : uint32_t {
     StaticRuntime = 1,
     StaticCompileTime = 2,
     StaticStreamRegScratch = 3,
+    StaticStreamRegScratchCompileTime = 4,
 };
 
 struct Options {
@@ -112,6 +113,7 @@ const char* mode_name(Mode mode) {
         case Mode::StaticRuntime: return "static-runtime";
         case Mode::StaticCompileTime: return "static-compiletime";
         case Mode::StaticStreamRegScratch: return "static-streamreg-scratch";
+        case Mode::StaticStreamRegScratchCompileTime: return "static-streamreg-scratch-compiletime";
     }
     return "unknown";
 }
@@ -129,36 +131,47 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     if (mode == "static-streamreg-scratch") {
         return Mode::StaticStreamRegScratch;
     }
+    if (mode == "static-streamreg-scratch-compiletime") {
+        return Mode::StaticStreamRegScratchCompileTime;
+    }
     return std::nullopt;
 }
 
 std::vector<Mode> modes_to_run(const std::string& mode) {
     if (mode == "all") {
-        return {Mode::Cb, Mode::StaticRuntime, Mode::StaticCompileTime, Mode::StaticStreamRegScratch};
+        return {
+            Mode::Cb,
+            Mode::StaticRuntime,
+            Mode::StaticCompileTime,
+            Mode::StaticStreamRegScratch,
+            Mode::StaticStreamRegScratchCompileTime};
     }
     auto parsed = parse_mode(mode);
     if (!parsed.has_value()) {
         throw std::invalid_argument(
-            "Unknown --mode. Valid values are all, cb, static-runtime, static-compiletime, static-streamreg-scratch");
+            "Unknown --mode. Valid values are all, cb, static-runtime, static-compiletime, "
+            "static-streamreg-scratch, static-streamreg-scratch-compiletime");
     }
     return {*parsed};
 }
 
 bool is_static_mode(Mode mode) {
-    return mode == Mode::StaticRuntime || mode == Mode::StaticCompileTime || mode == Mode::StaticStreamRegScratch;
+    return mode == Mode::StaticRuntime || mode == Mode::StaticCompileTime || mode == Mode::StaticStreamRegScratch ||
+           mode == Mode::StaticStreamRegScratchCompileTime;
 }
 
 bool uses_compile_time_args(Mode mode) {
-    return mode == Mode::StaticCompileTime;
+    return mode == Mode::StaticCompileTime || mode == Mode::StaticStreamRegScratchCompileTime;
 }
 
 bool uses_stream_reg_sync(Mode mode) {
-    return mode == Mode::StaticStreamRegScratch;
+    return mode == Mode::StaticStreamRegScratch || mode == Mode::StaticStreamRegScratchCompileTime;
 }
 
 void print_usage(const char* argv0) {
     fmt::print(
-        "Usage: {} [--mode=all|cb|static-runtime|static-compiletime|static-streamreg-scratch] [--tiles=N] "
+        "Usage: {} [--mode=all|cb|static-runtime|static-compiletime|static-streamreg-scratch|"
+        "static-streamreg-scratch-compiletime] [--tiles=N] "
         "[--num-pages=N] [--repeats=N] [--device-id=N] [--core-x=N] [--core-y=N] "
         "[--core-grid-x=N] [--core-grid-y=N]\n",
         argv0);
@@ -410,7 +423,7 @@ RunResult run_one(
         throw std::invalid_argument("No active cores were selected");
     }
     if (uses_compile_time_args(mode) && core_work.size() != 1) {
-        throw std::invalid_argument("static-compiletime mode currently supports only one active core");
+        throw std::invalid_argument("compile-time modes currently support only one active core");
     }
     if (uses_stream_reg_sync(mode) && options.tiles > kStreamRegCounterMask) {
         throw std::invalid_argument("static-streamreg-scratch mode supports up to 24-bit tile counters");

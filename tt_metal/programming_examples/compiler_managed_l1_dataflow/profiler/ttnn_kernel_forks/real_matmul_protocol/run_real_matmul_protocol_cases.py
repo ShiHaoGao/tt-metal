@@ -41,6 +41,9 @@ def parse_args():
             "static-input-only-cbregs",
             "static-output-only-cbregs",
             "static-input-output-cbregs",
+            "static-input-only-cbregs-compiletime",
+            "static-output-only-cbregs-compiletime",
+            "static-input-output-cbregs-compiletime",
         ],
         choices=[
             "profiled-cb",
@@ -50,6 +53,9 @@ def parse_args():
             "static-input-only-cbregs",
             "static-output-only-cbregs",
             "static-input-output-cbregs",
+            "static-input-only-cbregs-compiletime",
+            "static-output-only-cbregs-compiletime",
+            "static-input-output-cbregs-compiletime",
         ],
     )
     parser.add_argument("--skip-check", action="store_true")
@@ -132,6 +138,9 @@ def build_comparisons(critical_rows):
             "static-input-only-cbregs",
             "static-output-only-cbregs",
             "static-input-output-cbregs",
+            "static-input-only-cbregs-compiletime",
+            "static-output-only-cbregs-compiletime",
+            "static-input-output-cbregs-compiletime",
         ]:
             if static_mode not in modes:
                 continue

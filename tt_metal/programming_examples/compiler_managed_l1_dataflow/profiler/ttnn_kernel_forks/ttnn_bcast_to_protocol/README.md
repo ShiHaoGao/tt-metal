@@ -22,12 +22,12 @@ conda run -n tt cmake --build build_Release --target ttnn_bcast_to_protocol -j8
 ```bash
 TT_METAL_DEVICE_PROFILER=0 TT_METAL_CACHE=/tmp/ttnn_bcast_to_protocol_smoke_cache \
   build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/ttnn_bcast_to_protocol \
-  --mode=all --tiles=64 --width-tiles=8 --num-pages=2 --repeats=1 --device-id=0
+  --mode=static-streamreg-cbregs --tiles=64 --width-tiles=8 --num-pages=2 --repeats=1 --device-id=0
 ```
 
 已验证输出：
 
-- `cb`、`static-runtime`、`static-streamreg-cbregs` 三种模式均 `max_abs_error=0`。
+- `cb`、`static-runtime`、`static-streamreg-cbregs`、`static-streamreg-cbregs-compiletime` 均 `max_abs_error=0`。
 
 ## Device profiler sweep
 

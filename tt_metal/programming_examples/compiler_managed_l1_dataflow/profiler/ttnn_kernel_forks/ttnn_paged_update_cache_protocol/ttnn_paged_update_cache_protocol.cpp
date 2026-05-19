@@ -70,6 +70,7 @@ enum class Mode : uint32_t {
     Cb = 0,
     StaticRuntime = 1,
     StaticStreamRegCbRegs = 2,
+    StaticStreamRegCbRegsCompileTime = 3,
 };
 
 struct Options {
@@ -145,6 +146,7 @@ const char* mode_name(Mode mode) {
         case Mode::Cb: return "cb";
         case Mode::StaticRuntime: return "static-runtime";
         case Mode::StaticStreamRegCbRegs: return "static-streamreg-cbregs";
+        case Mode::StaticStreamRegCbRegsCompileTime: return "static-streamreg-cbregs-compiletime";
     }
     return "unknown";
 }
@@ -159,32 +161,42 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     if (mode == "static-streamreg-cbregs") {
         return Mode::StaticStreamRegCbRegs;
     }
+    if (mode == "static-streamreg-cbregs-compiletime") {
+        return Mode::StaticStreamRegCbRegsCompileTime;
+    }
     return std::nullopt;
 }
 
 std::vector<Mode> modes_to_run(const std::string& mode) {
     if (mode == "all") {
-        return {Mode::Cb, Mode::StaticRuntime, Mode::StaticStreamRegCbRegs};
+        return {Mode::Cb, Mode::StaticRuntime, Mode::StaticStreamRegCbRegs, Mode::StaticStreamRegCbRegsCompileTime};
     }
     auto parsed = parse_mode(mode);
     if (!parsed.has_value()) {
         throw std::invalid_argument(
-            "Unknown --mode. Valid values are all, cb, static-runtime, static-streamreg-cbregs, static");
+            "Unknown --mode. Valid values are all, cb, static-runtime, static-streamreg-cbregs, "
+            "static-streamreg-cbregs-compiletime, static");
     }
     return {*parsed};
 }
 
 bool is_static_mode(Mode mode) {
-    return mode == Mode::StaticRuntime || mode == Mode::StaticStreamRegCbRegs;
+    return mode == Mode::StaticRuntime || mode == Mode::StaticStreamRegCbRegs ||
+           mode == Mode::StaticStreamRegCbRegsCompileTime;
 }
 
 bool uses_stream_reg_cbregs(Mode mode) {
-    return mode == Mode::StaticStreamRegCbRegs;
+    return mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime;
+}
+
+bool uses_compile_time_protocol_args(Mode mode) {
+    return mode == Mode::StaticStreamRegCbRegsCompileTime;
 }
 
 void print_usage(const char* argv0) {
     fmt::print(
-        "Usage: {} [--mode=all|cb|static-runtime|static-streamreg-cbregs] "
+        "Usage: {} [--mode=all|cb|static-runtime|static-streamreg-cbregs|"
+        "static-streamreg-cbregs-compiletime] "
         "[--users=N] [--kv-heads=N] [--head-dim=N] [--block-size=N] [--max-seq-len=N] "
         "[--cache-idx=N] [--per-user-stride=N] [--num-pages=N] [--repeats=N] "
         "[--device-id=N] [--core-x=N] [--core-y=N] [--core-grid-x=N] [--core-grid-y=N] [--skip-check]\n",
@@ -565,11 +577,29 @@ void create_circular_buffers(
         program, resources.core, CBIndex::c_3, shape.page_table_stick_size, 1, DataFormat::Int32, nullptr);
 }
 
-std::map<std::string, std::string> protocol_defines(Mode mode, uint32_t protocol_start_value) {
+std::map<std::string, std::string> protocol_defines(
+    Mode mode,
+    uint32_t protocol_start_value,
+    uint32_t cache_ring_addr,
+    uint32_t intermed_ring_addr,
+    uint32_t input_untilized_addr,
+    uint32_t output_ring_addr,
+    uint32_t input_tiles_addr,
+    uint32_t protocol_start_addr,
+    const Options& options) {
     return {
         {"BENCH_STATIC_PROTOCOL", is_static_mode(mode) ? "1" : "0"},
         {"BENCH_USE_STREAM_REG_CBREGS", uses_stream_reg_cbregs(mode) ? "1" : "0"},
+        {"BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS", uses_compile_time_protocol_args(mode) ? "1" : "0"},
         {"BENCH_PROTOCOL_START_VALUE", std::to_string(protocol_start_value)},
+        {"BENCH_CACHE_RING_ADDR", std::to_string(cache_ring_addr)},
+        {"BENCH_INTERMED_RING_ADDR", std::to_string(intermed_ring_addr)},
+        {"BENCH_INPUT_UNTILIZED_ADDR", std::to_string(input_untilized_addr)},
+        {"BENCH_OUTPUT_RING_ADDR", std::to_string(output_ring_addr)},
+        {"BENCH_INPUT_TILES_ADDR", std::to_string(input_tiles_addr)},
+        {"BENCH_PAGE_SIZE", std::to_string(kTileSizeBytes)},
+        {"BENCH_NUM_PAGES", std::to_string(options.num_pages)},
+        {"BENCH_PROTOCOL_START_SEM_ADDR", std::to_string(protocol_start_addr)},
         {"BENCH_STREAM_REG_START_STREAM_ID", std::to_string(kStreamRegStartStreamId)},
         {"BENCH_STREAM_REG_INPUT_READY0_STREAM_ID", std::to_string(kStreamRegInputReady0StreamId)},
         {"BENCH_STREAM_REG_INPUT_READY1_STREAM_ID", std::to_string(kStreamRegInputReady1StreamId)},
@@ -680,7 +710,40 @@ RunResult run_one(
         (0x5a5a0000u ^ options.users ^ (options.kv_heads << 4) ^ (options.head_dim << 8) ^
          (repeat * 0x00010001u) ^ cache_addr) &
         kStreamRegCounterMask;
-    auto defines = protocol_defines(mode, protocol_start_value == 0 ? 1 : protocol_start_value);
+    if (uses_compile_time_protocol_args(mode) && resources.size() != 1) {
+        throw std::invalid_argument("static-streamreg-cbregs-compiletime mode currently supports only one active core");
+    }
+    const auto first_static_addrs = [&]() {
+        struct Addresses {
+            uint32_t cache_ring_addr;
+            uint32_t intermed_ring_addr;
+            uint32_t input_untilized_addr;
+            uint32_t output_ring_addr;
+            uint32_t input_tiles_addr;
+            uint32_t protocol_start_addr;
+        };
+        if (!is_static_mode(mode)) {
+            return Addresses{};
+        }
+        const auto& item = resources.front();
+        return Addresses{
+            .cache_ring_addr = core_local_l1_address(item.cache_ring_l1, item.core),
+            .intermed_ring_addr = core_local_l1_address(item.intermed_shared_l1, item.core),
+            .input_untilized_addr = core_local_l1_address(item.input_untilized_l1, item.core),
+            .output_ring_addr = core_local_l1_address(item.output_ring_l1, item.core),
+            .input_tiles_addr = core_local_l1_address(item.input_tiles_l1, item.core),
+            .protocol_start_addr = core_local_l1_address(item.protocol_start_l1, item.core)};
+    }();
+    auto defines = protocol_defines(
+        mode,
+        protocol_start_value == 0 ? 1 : protocol_start_value,
+        first_static_addrs.cache_ring_addr,
+        first_static_addrs.intermed_ring_addr,
+        first_static_addrs.input_untilized_addr,
+        first_static_addrs.output_ring_addr,
+        first_static_addrs.input_tiles_addr,
+        first_static_addrs.protocol_start_addr,
+        options);
 
     std::vector<uint32_t> reader_compile_args = {
         static_cast<uint32_t>(CBIndex::c_0),
@@ -773,31 +836,33 @@ RunResult run_one(
         std::vector<uint32_t> compute_args;
         if (is_static_mode(mode)) {
             const uint32_t protocol_start_addr = core_local_l1_address(item.protocol_start_l1, item.core);
-            reader_args.insert(
-                reader_args.end(),
-                {core_local_l1_address(item.cache_ring_l1, item.core),
-                 kTileSizeBytes,
-                 options.num_pages,
-                 protocol_start_addr});
-            writer_args.insert(
-                writer_args.end(),
-                {core_local_l1_address(item.intermed_shared_l1, item.core),
-                 core_local_l1_address(item.input_untilized_l1, item.core),
-                 core_local_l1_address(item.output_ring_l1, item.core),
-                 kTileSizeBytes,
-                 kTileSizeBytes,
-                 options.num_pages,
-                 protocol_start_addr});
-            compute_args.insert(
-                compute_args.end(),
-                {core_local_l1_address(item.cache_ring_l1, item.core),
-                 core_local_l1_address(item.intermed_shared_l1, item.core),
-                 core_local_l1_address(item.input_untilized_l1, item.core),
-                 core_local_l1_address(item.output_ring_l1, item.core),
-                 kTileSizeBytes,
-                 options.num_pages,
-                 protocol_start_addr,
-                 core_local_l1_address(item.input_tiles_l1, item.core)});
+            if (!uses_compile_time_protocol_args(mode)) {
+                reader_args.insert(
+                    reader_args.end(),
+                    {core_local_l1_address(item.cache_ring_l1, item.core),
+                     kTileSizeBytes,
+                     options.num_pages,
+                     protocol_start_addr});
+                writer_args.insert(
+                    writer_args.end(),
+                    {core_local_l1_address(item.intermed_shared_l1, item.core),
+                     core_local_l1_address(item.input_untilized_l1, item.core),
+                     core_local_l1_address(item.output_ring_l1, item.core),
+                     kTileSizeBytes,
+                     kTileSizeBytes,
+                     options.num_pages,
+                     protocol_start_addr});
+                compute_args.insert(
+                    compute_args.end(),
+                    {core_local_l1_address(item.cache_ring_l1, item.core),
+                     core_local_l1_address(item.intermed_shared_l1, item.core),
+                     core_local_l1_address(item.input_untilized_l1, item.core),
+                     core_local_l1_address(item.output_ring_l1, item.core),
+                     kTileSizeBytes,
+                     options.num_pages,
+                     protocol_start_addr,
+                     core_local_l1_address(item.input_tiles_l1, item.core)});
+            }
         }
         SetRuntimeArgs(program, reader_kernel, item.core, reader_args);
         SetRuntimeArgs(program, writer_kernel, item.core, writer_args);

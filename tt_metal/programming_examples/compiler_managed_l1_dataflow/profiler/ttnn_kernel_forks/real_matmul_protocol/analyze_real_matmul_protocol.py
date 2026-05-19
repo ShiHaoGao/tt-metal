@@ -101,6 +101,15 @@ def parse_zone_name(zone):
     if rest.startswith("CB_"):
         mode = "profiled-cb"
         stage = rest[len("CB_") :]
+    elif rest.startswith("STATIC_INPUT_ONLY_CBREGS_COMPILETIME_"):
+        mode = "static-input-only-cbregs-compiletime"
+        stage = rest[len("STATIC_INPUT_ONLY_CBREGS_COMPILETIME_") :]
+    elif rest.startswith("STATIC_OUTPUT_ONLY_CBREGS_COMPILETIME_"):
+        mode = "static-output-only-cbregs-compiletime"
+        stage = rest[len("STATIC_OUTPUT_ONLY_CBREGS_COMPILETIME_") :]
+    elif rest.startswith("STATIC_INPUT_OUTPUT_CBREGS_COMPILETIME_"):
+        mode = "static-input-output-cbregs-compiletime"
+        stage = rest[len("STATIC_INPUT_OUTPUT_CBREGS_COMPILETIME_") :]
     elif rest.startswith("STATIC_INPUT_ONLY_CBREGS_"):
         mode = "static-input-only-cbregs"
         stage = rest[len("STATIC_INPUT_ONLY_CBREGS_") :]

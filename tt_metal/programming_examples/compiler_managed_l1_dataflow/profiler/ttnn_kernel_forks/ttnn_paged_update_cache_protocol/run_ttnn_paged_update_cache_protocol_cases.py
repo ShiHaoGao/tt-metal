@@ -50,7 +50,7 @@ def parse_args():
         "--modes",
         nargs="+",
         default=["cb", "static-runtime", "static-streamreg-cbregs"],
-        choices=["cb", "static-runtime", "static-streamreg-cbregs"],
+        choices=["cb", "static-runtime", "static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"],
     )
     parser.add_argument("--skip-check", action="store_true")
     return parser.parse_args()
@@ -117,6 +117,10 @@ def run_case(args, users, kv_heads, head_dim, block_size, max_seq_len, cache_idx
     return host_rows, host_summary, zone_rows, critical_rows
 
 
+def mode_supported_for_case(users, mode):
+    return mode != "static-streamreg-cbregs-compiletime" or users == 1
+
+
 def build_critical_comparisons(critical_rows):
     grouped = defaultdict(dict)
     for row in critical_rows:
@@ -132,7 +136,7 @@ def build_critical_comparisons(critical_rows):
         if "cb" not in modes:
             continue
         cb = modes["cb"]
-        for static_mode in ["static-runtime", "static-streamreg-cbregs"]:
+        for static_mode in ["static-runtime", "static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"]:
             if static_mode not in modes:
                 continue
             static = modes[static_mode]
@@ -164,7 +168,7 @@ def build_host_comparisons(host_summary_rows):
         if "cb" not in modes:
             continue
         cb = modes["cb"]
-        for static_mode in ["static-runtime", "static-streamreg-cbregs"]:
+        for static_mode in ["static-runtime", "static-streamreg-cbregs", "static-streamreg-cbregs-compiletime"]:
             if static_mode not in modes:
                 continue
             static = modes[static_mode]
@@ -201,6 +205,13 @@ def main():
                         for cache_idx in args.cache_idxs:
                             for num_pages in args.num_pages:
                                 for mode in args.modes:
+                                    if not mode_supported_for_case(users, mode):
+                                        print(
+                                            "skipping "
+                                            f"users={users} mode={mode}: compile-time protocol args require one active core",
+                                            flush=True,
+                                        )
+                                        continue
                                     print(
                                         "running "
                                         f"users={users} kv_heads={kv_heads} head_dim={head_dim} "

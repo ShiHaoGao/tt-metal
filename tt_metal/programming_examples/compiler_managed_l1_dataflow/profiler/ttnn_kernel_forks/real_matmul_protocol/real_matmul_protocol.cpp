@@ -65,6 +65,9 @@ enum class Mode : uint32_t {
     StaticInputOnlyCbRegs = 4,
     StaticOutputOnlyCbRegs = 5,
     StaticInputOutputCbRegs = 6,
+    StaticInputOnlyCbRegsCompileTime = 7,
+    StaticOutputOnlyCbRegsCompileTime = 8,
+    StaticInputOutputCbRegsCompileTime = 9,
 };
 
 struct Options {
@@ -155,6 +158,9 @@ const char* mode_name(Mode mode) {
         case Mode::StaticInputOnlyCbRegs: return "static-input-only-cbregs";
         case Mode::StaticOutputOnlyCbRegs: return "static-output-only-cbregs";
         case Mode::StaticInputOutputCbRegs: return "static-input-output-cbregs";
+        case Mode::StaticInputOnlyCbRegsCompileTime: return "static-input-only-cbregs-compiletime";
+        case Mode::StaticOutputOnlyCbRegsCompileTime: return "static-output-only-cbregs-compiletime";
+        case Mode::StaticInputOutputCbRegsCompileTime: return "static-input-output-cbregs-compiletime";
     }
     return "unknown";
 }
@@ -169,17 +175,26 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     if (mode == "static-input-only-cbregs") {
         return Mode::StaticInputOnlyCbRegs;
     }
+    if (mode == "static-input-only-cbregs-compiletime") {
+        return Mode::StaticInputOnlyCbRegsCompileTime;
+    }
     if (mode == "static-output-only") {
         return Mode::StaticOutputOnly;
     }
     if (mode == "static-output-only-cbregs") {
         return Mode::StaticOutputOnlyCbRegs;
     }
+    if (mode == "static-output-only-cbregs-compiletime") {
+        return Mode::StaticOutputOnlyCbRegsCompileTime;
+    }
     if (mode == "static-input-output" || mode == "static") {
         return Mode::StaticInputOutput;
     }
     if (mode == "static-input-output-cbregs" || mode == "static-cbregs") {
         return Mode::StaticInputOutputCbRegs;
+    }
+    if (mode == "static-input-output-cbregs-compiletime") {
+        return Mode::StaticInputOutputCbRegsCompileTime;
     }
     return std::nullopt;
 }
@@ -190,17 +205,25 @@ bool is_static_mode(Mode mode) {
 
 bool uses_static_input(Mode mode) {
     return mode == Mode::StaticInputOnly || mode == Mode::StaticInputOutput ||
-           mode == Mode::StaticInputOnlyCbRegs || mode == Mode::StaticInputOutputCbRegs;
+           mode == Mode::StaticInputOnlyCbRegs || mode == Mode::StaticInputOutputCbRegs ||
+           mode == Mode::StaticInputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime;
 }
 
 bool uses_static_output(Mode mode) {
     return mode == Mode::StaticOutputOnly || mode == Mode::StaticInputOutput ||
-           mode == Mode::StaticOutputOnlyCbRegs || mode == Mode::StaticInputOutputCbRegs;
+           mode == Mode::StaticOutputOnlyCbRegs || mode == Mode::StaticInputOutputCbRegs ||
+           mode == Mode::StaticOutputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime;
 }
 
 bool uses_stream_reg_cbregs(Mode mode) {
     return mode == Mode::StaticInputOnlyCbRegs || mode == Mode::StaticOutputOnlyCbRegs ||
-           mode == Mode::StaticInputOutputCbRegs;
+           mode == Mode::StaticInputOutputCbRegs || mode == Mode::StaticInputOnlyCbRegsCompileTime ||
+           mode == Mode::StaticOutputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime;
+}
+
+bool uses_compile_time_protocol_args(Mode mode) {
+    return mode == Mode::StaticInputOnlyCbRegsCompileTime || mode == Mode::StaticOutputOnlyCbRegsCompileTime ||
+           mode == Mode::StaticInputOutputCbRegsCompileTime;
 }
 
 std::vector<Mode> modes_to_run(const std::string& mode) {
@@ -212,14 +235,18 @@ std::vector<Mode> modes_to_run(const std::string& mode) {
             Mode::StaticInputOutput,
             Mode::StaticInputOnlyCbRegs,
             Mode::StaticOutputOnlyCbRegs,
-            Mode::StaticInputOutputCbRegs};
+            Mode::StaticInputOutputCbRegs,
+            Mode::StaticInputOnlyCbRegsCompileTime,
+            Mode::StaticOutputOnlyCbRegsCompileTime,
+            Mode::StaticInputOutputCbRegsCompileTime};
     }
     auto parsed = parse_mode(mode);
     if (!parsed.has_value()) {
         throw std::invalid_argument(
             "Unknown --mode. Valid values are all, profiled-cb, cb, static-input-only, static-output-only, "
             "static-input-output, static-input-only-cbregs, static-output-only-cbregs, "
-            "static-input-output-cbregs, static, static-cbregs");
+            "static-input-output-cbregs, static-input-only-cbregs-compiletime, "
+            "static-output-only-cbregs-compiletime, static-input-output-cbregs-compiletime, static, static-cbregs");
     }
     return {*parsed};
 }
@@ -227,7 +254,9 @@ std::vector<Mode> modes_to_run(const std::string& mode) {
 void print_usage(const char* argv0) {
     fmt::print(
         "Usage: {} [--mode=all|profiled-cb|static-input-only|static-output-only|static-input-output|"
-        "static-input-only-cbregs|static-output-only-cbregs|static-input-output-cbregs] "
+        "static-input-only-cbregs|static-output-only-cbregs|static-input-output-cbregs|"
+        "static-input-only-cbregs-compiletime|static-output-only-cbregs-compiletime|"
+        "static-input-output-cbregs-compiletime] "
         "[--M=N] [--N=N] [--K=N] "
         "[--B=N] [--num-pages=N] [--repeats=N] [--device-id=N] [--sweep=targeted] [--skip-check]\n",
         argv0);
@@ -481,13 +510,34 @@ uint32_t protocol_start_value(Mode mode, uint32_t repeat) {
     return (protocol_start_value() ^ (static_cast<uint32_t>(mode) << 8) ^ repeat) & 0x00ffffffu;
 }
 
-std::map<std::string, std::string> kernel_defines(Mode mode, uint32_t repeat) {
+std::map<std::string, std::string> kernel_defines(
+    Mode mode,
+    uint32_t repeat,
+    uint32_t src0_ring_addr,
+    uint32_t src1_ring_addr,
+    uint32_t out_ring_addr,
+    uint32_t src0_slot_bytes,
+    uint32_t src1_slot_bytes,
+    uint32_t out_slot_bytes,
+    uint32_t num_pages,
+    uint32_t out_num_pages,
+    uint32_t protocol_start_sem_addr) {
     return {
         {"BENCH_STATIC_PROTOCOL", is_static_mode(mode) ? "1" : "0"},
         {"BENCH_STATIC_INPUT_PROTOCOL", uses_static_input(mode) ? "1" : "0"},
         {"BENCH_STATIC_OUTPUT_PROTOCOL", uses_static_output(mode) ? "1" : "0"},
         {"BENCH_USE_STREAM_REG_CBREGS", uses_stream_reg_cbregs(mode) ? "1" : "0"},
+        {"BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS", uses_compile_time_protocol_args(mode) ? "1" : "0"},
         {"BENCH_PROTOCOL_START_VALUE", std::to_string(protocol_start_value(mode, repeat))},
+        {"BENCH_SRC0_RING_ADDR", std::to_string(src0_ring_addr)},
+        {"BENCH_SRC1_RING_ADDR", std::to_string(src1_ring_addr)},
+        {"BENCH_OUT_RING_ADDR", std::to_string(out_ring_addr)},
+        {"BENCH_SRC0_SLOT_BYTES", std::to_string(src0_slot_bytes)},
+        {"BENCH_SRC1_SLOT_BYTES", std::to_string(src1_slot_bytes)},
+        {"BENCH_OUT_SLOT_BYTES", std::to_string(out_slot_bytes)},
+        {"BENCH_NUM_PAGES", std::to_string(num_pages)},
+        {"BENCH_OUT_NUM_PAGES", std::to_string(out_num_pages)},
+        {"BENCH_PROTOCOL_START_SEM_ADDR", std::to_string(protocol_start_sem_addr)},
         {"BENCH_STREAM_REG_START_STREAM_ID", "3"},
     };
 }
@@ -672,6 +722,9 @@ RunResult run_one(
     if (is_static_mode(mode)) {
         static_resources = create_static_resources(mesh_device, shape, works, mode, single_tile_size, options.num_pages);
     }
+    if (uses_compile_time_protocol_args(mode) && works.size() != 1) {
+        throw std::invalid_argument("matmul *-cbregs-compiletime modes currently support only one active core");
+    }
 
     create_circular_buffers(program, shape, works, static_resources, mode, single_tile_size, options.num_pages);
 
@@ -701,7 +754,43 @@ RunResult run_one(
         shape.out_subblock_num_tiles,
         options.B};
 
-    auto defines = kernel_defines(mode, repeat);
+    const uint32_t src0_slot_bytes = checked_mul_u32(shape.in0_block_num_tiles, single_tile_size, "src0 slot");
+    const uint32_t src1_slot_bytes = checked_mul_u32(shape.in1_block_num_tiles, single_tile_size, "src1 slot");
+    const uint32_t out_slot_bytes = checked_mul_u32(shape.out_subblock_num_tiles, single_tile_size, "out slot");
+    const uint32_t out_num_pages = output_subblocks(shape);
+    const auto first_static_addrs = [&]() {
+        struct Addresses {
+            uint32_t src0_ring_addr;
+            uint32_t src1_ring_addr;
+            uint32_t out_ring_addr;
+            uint32_t protocol_start_sem_addr;
+        };
+        if (!is_static_mode(mode)) {
+            return Addresses{};
+        }
+        const auto& work = works.front();
+        const StaticCoreResources* r = find_static_resources(static_resources, work.core);
+        if (r == nullptr) {
+            throw std::runtime_error("Missing static L1 resources for compile-time defines");
+        }
+        return Addresses{
+            .src0_ring_addr = core_local_l1_address(r->src0_ring, work.core),
+            .src1_ring_addr = core_local_l1_address(r->src1_ring, work.core),
+            .out_ring_addr = core_local_l1_address(r->out_ring, work.core),
+            .protocol_start_sem_addr = core_local_l1_address(r->protocol_start_sem, work.core)};
+    }();
+    auto defines = kernel_defines(
+        mode,
+        repeat,
+        first_static_addrs.src0_ring_addr,
+        first_static_addrs.src1_ring_addr,
+        first_static_addrs.out_ring_addr,
+        src0_slot_bytes,
+        src1_slot_bytes,
+        out_slot_bytes,
+        options.num_pages,
+        out_num_pages,
+        first_static_addrs.protocol_start_sem_addr);
     auto reader_id = CreateKernel(
         program,
         std::string(kReaderKernel),
@@ -725,11 +814,6 @@ RunResult run_one(
         std::string(kComputeKernel),
         all_cores,
         ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_kernel_args, .defines = defines});
-
-    const uint32_t src0_slot_bytes = checked_mul_u32(shape.in0_block_num_tiles, single_tile_size, "src0 slot");
-    const uint32_t src1_slot_bytes = checked_mul_u32(shape.in1_block_num_tiles, single_tile_size, "src1 slot");
-    const uint32_t out_slot_bytes = checked_mul_u32(shape.out_subblock_num_tiles, single_tile_size, "out slot");
-    const uint32_t out_num_pages = output_subblocks(shape);
 
     for (const auto& work : works) {
         std::vector<uint32_t> reader_args = {
@@ -781,7 +865,7 @@ RunResult run_one(
             const uint32_t out_ring_addr = core_local_l1_address(r->out_ring, work.core);
             const uint32_t protocol_start_sem_addr = core_local_l1_address(r->protocol_start_sem, work.core);
 
-            if (uses_static_input(mode)) {
+            if (uses_static_input(mode) && !uses_compile_time_protocol_args(mode)) {
                 reader_args.push_back(src0_ring_addr);
                 reader_args.push_back(src1_ring_addr);
                 reader_args.push_back(src0_slot_bytes);
@@ -790,23 +874,25 @@ RunResult run_one(
                 reader_args.push_back(protocol_start_sem_addr);
             }
 
-            if (uses_static_output(mode)) {
+            if (uses_static_output(mode) && !uses_compile_time_protocol_args(mode)) {
                 writer_args.push_back(out_ring_addr);
                 writer_args.push_back(out_slot_bytes);
                 writer_args.push_back(out_num_pages);
                 writer_args.push_back(protocol_start_sem_addr);
             }
 
-            compute_args = {
-                src0_ring_addr,
-                src1_ring_addr,
-                out_ring_addr,
-                src0_slot_bytes,
-                src1_slot_bytes,
-                out_slot_bytes,
-                options.num_pages,
-                out_num_pages,
-                protocol_start_sem_addr};
+            if (!uses_compile_time_protocol_args(mode)) {
+                compute_args = {
+                    src0_ring_addr,
+                    src1_ring_addr,
+                    out_ring_addr,
+                    src0_slot_bytes,
+                    src1_slot_bytes,
+                    out_slot_bytes,
+                    options.num_pages,
+                    out_num_pages,
+                    protocol_start_sem_addr};
+            }
         }
 
         SetRuntimeArgs(program, reader_id, work.core, reader_args);

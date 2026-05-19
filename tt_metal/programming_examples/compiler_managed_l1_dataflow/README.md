@@ -48,7 +48,7 @@ build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/
 tt_metal/programming_examples/compiler_managed_l1_dataflow/docs/ttnn_compiler_managed_l1_dataflow_abi_2026_05_18.md
 ```
 
-TTNN 算子横向总结、收益归因、firmware/descriptor 链路和 Level 3 实验计划已经合并到这个主文档中；`docs/` 下不再维护第二份结论文档。
+TTNN 算子横向总结、收益归因、firmware/descriptor 链路和 Level C / Level 3 实验计划已经合并到这个主文档中；`docs/` 下不再维护第二份结论文档。
 
 跑覆盖计划：
 
@@ -87,7 +87,7 @@ conda run -n tt python \
   --out-dir /tmp/ttnn_static_protocol_suite_llm_decode
 ```
 
-当前 compute-path stream-register 控制项 smoke：
+当前 Level B compute-path smoke：
 
 ```bash
 TT_METAL_DEVICE_PROFILER=0 TT_METAL_CACHE=/tmp/rtadd_cbregs_smoke \
@@ -100,8 +100,10 @@ TT_METAL_DEVICE_PROFILER=0 TT_METAL_CACHE=/tmp/rtadd_cbregs_smoke \
 
 - stream-register 方向已经锁定为 per-CB ABI：每个 logical CB 使用自己的 `get_cb_tiles_received_ptr(cbid)` / `get_cb_tiles_acked_ptr(cbid)`。
 - dataflow-only copy 可以用 `static-streamreg-scratch` 做 ablation，但不能把它推广成 compute-path ABI。
+- Level B 的正式 compute-path mode 是 `static-streamreg-cbregs`：per-CB stream-register counter，per-core L1 地址和 work partition 通过 runtime args 传入。
+- `static-streamreg-cbregs-compiletime` 只作为 compile-time config ablation / upper bound，不作为 Level B 多核工程路径。
 - 大收益来自 memory-bound / simple elementwise 路径上的 static ring/schedule 替代 CB FIFO 动态管理。
-- `static-streamreg-cbregs` 验证 ABI 边界，但在当前 tile add 上相对 `static-runtime` 几乎没有新的 steady-state 收益。
+- `static-streamreg-cbregs` 验证 ABI 边界；在当前 tile add 上相对 `static-runtime` 几乎没有新的 steady-state 收益，说明 runtime args/config 不是主要瓶颈。
 - 真实 TTNN fork 应优先复制原始 C++ program factory 和 device kernels，再做最小协议替换；`ttnn_paged_update_cache_protocol` 已按这个路线验证。
 - `ttnn_binary_ng_no_bcast` 复跑仍为正，`static-runtime` 约 `19.8-23.4 cycles/local-tile`，median speedup 约 `1.035x`。
 - `ttnn_bcast_to_protocol` row-broadcast 已通过 device profiler；critical stage 是 writer。1024/4096/16384 tiles 上，`static-runtime` 约 `+5.03/+1.04/+0.27 cycles/tile`，`static-streamreg-cbregs` 约 `+11.44/+10.85/+2.74 cycles/tile`。这是 broadcast direct fork 的第一条证据，但还不能推广到所有 broadcast/SFPU-heavy 算子。

@@ -97,8 +97,13 @@ python3 tt_metal/programming_examples/compiler_managed_l1_dataflow/suite/ttnn_st
   --real-matmul-dir /tmp/real_matmul_protocol_ttnn_sweep_2026_05_18 \
   --ttnn-add-dir /tmp/ttnn_static_protocol_suite_direct_eltwise_kv_repro_2026_05_18/runs/ttnn_binary_ng_no_bcast \
   --ttnn-bcast-to-row-dir /tmp/ttnn_bcast_to_protocol_smoke_profile \
+  --ttnn-binary-ng-row-bcast-dir /tmp/ttnn_binary_ng_row_bcast_protocol_cases \
+  --ttnn-transpose-wh-dir /tmp/ttnn_transpose_wh_protocol_cases_2026_05_19 \
   --ttnn-paged-update-cache-dir /tmp/ttnn_static_protocol_suite_direct_eltwise_kv_repro_2026_05_18/runs/ttnn_paged_update_cache \
-  --out-dir /tmp/compiler_managed_l1_attribution_final_2026_05_18
+  --ttnn-embedding-lookup-dir /tmp/ttnn_embedding_lookup_protocol_cases_2026_05_19 \
+  --ttnn-slice-tile-dir /tmp/ttnn_slice_tile_protocol_cases_2026_05_19 \
+  --ttnn-kv-cache-load-slice-dir /tmp/ttnn_kv_cache_load_slice_protocol_cases_2026_05_19 \
+  --out-dir /tmp/compiler_managed_l1_attribution_full_2026_05_19_slice_kvload
 ```
 
 输出包括：
@@ -123,13 +128,70 @@ conda run -n tt python \
   --device-id 0
 ```
 
+显式 compile-time ablation 可以额外加入 `static-streamreg-cbregs-compiletime`，但它不计入 Level B 主线聚合。
+
+单独复现 layout/transpose direct fork：
+
+```bash
+conda run -n tt python \
+  tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/ttnn_kernel_forks/ttnn_transpose_wh_protocol/run_ttnn_transpose_wh_protocol_cases.py \
+  --out-dir /tmp/ttnn_transpose_wh_protocol_cases_2026_05_19 \
+  --shapes 8x8 16x16 32x32 \
+  --num-pages 2 \
+  --repeats 3 \
+  --modes cb static-runtime static-streamreg-cbregs \
+  --device-id 0
+```
+
+单独复现 embedding lookup direct fork：
+
+```bash
+conda run -n tt python \
+  tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/ttnn_kernel_forks/ttnn_embedding_lookup_protocol/run_ttnn_embedding_lookup_protocol_cases.py \
+  --out-dir /tmp/ttnn_embedding_lookup_protocol_cases_2026_05_19 \
+  --shapes 256x32000x128 1024x32000x128 4096x32000x128 \
+  --num-pages 2 \
+  --repeats 3 \
+  --modes cb static-runtime static-streamreg-cbregs \
+  --device-id 0
+```
+
+单独复现 slice/layout direct fork：
+
+```bash
+conda run -n tt python \
+  tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/ttnn_kernel_forks/ttnn_slice_tile_protocol/run_ttnn_slice_tile_protocol_cases.py \
+  --out-dir /tmp/ttnn_slice_tile_protocol_cases_2026_05_19 \
+  --shapes 64x64x16x64x8x0 64x64x32x32x16x16 128x64x64x32x32x16 \
+  --num-pages 2 \
+  --repeats 3 \
+  --modes cb static-runtime static-streamreg-cbregs \
+  --device-id 0
+```
+
+单独复现 KV cache load-slice/cache-read direct fork：
+
+```bash
+conda run -n tt python \
+  tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/ttnn_kernel_forks/ttnn_kv_cache_load_slice_protocol/run_ttnn_kv_cache_load_slice_protocol_cases.py \
+  --out-dir /tmp/ttnn_kv_cache_load_slice_protocol_cases_2026_05_19 \
+  --shapes 128x32x4x0 512x64x4x64 1024x128x4x128 \
+  --repeats 3 \
+  --modes cb static-runtime static-streamreg-cbregs \
+  --device-id 0
+```
+
+`2048x256x4x512` 这种单核 load-slice 会因为 output L1 shard 太大而失败；它不是协议负例。要判断大 cache-read，需要后续 Level C 或多核 sharding fork。
+
 ## 解读规则
 
 - device critical path 以 protocol profilers 为准。
 - sweep / pytest coverage 只说明 TTNN family surface 已覆盖，不代表该 family 已有 speedup claim。
 - decode-like、prefill-like、multi-core 结果必须分开看。
+- host timing 只能用于辅助排查，不能单独宣称 static protocol 收益。
 - stream-register 模式必须严格区分：
   - dataflow-only copy/layout ablation 使用 `static-streamreg-scratch`。
   - compute-path 使用 `static-streamreg-cbregs`，每个 logical CB 独立使用 `get_cb_tiles_received_ptr(cbid)` / `get_cb_tiles_acked_ptr(cbid)`。
+  - Level B 使用 `static-streamreg-cbregs`；`static-streamreg-cbregs-compiletime` 是 compile-time config ablation / upper bound，单独聚合。
   - 一个 idle stream 作为多个 compute CB 的共享 scratch register 不是有效对比。
 - TTNN workload baseline 只用来筛 direct fork 优先级；最终结论仍然必须回到 device critical-path stage delta。
