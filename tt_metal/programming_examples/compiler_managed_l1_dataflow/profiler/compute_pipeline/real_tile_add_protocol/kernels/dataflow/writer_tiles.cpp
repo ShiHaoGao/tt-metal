@@ -24,6 +24,18 @@
 #define BENCH_USE_STREAM_REG_CBREGS 0
 #endif
 
+#ifndef BENCH_LEVEL_C_GENERATED_STATIC
+#define BENCH_LEVEL_C_GENERATED_STATIC 0
+#endif
+
+#ifndef BENCH_LEVEL_C_LLK_DIRECT
+#define BENCH_LEVEL_C_LLK_DIRECT 0
+#endif
+
+#ifndef BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define BENCH_LEVEL_C_FW_SKIP_CB_INIT 0
+#endif
+
 #ifndef BENCH_TRACE_STATIC_PROTOCOL
 #define BENCH_TRACE_STATIC_PROTOCOL 0
 #endif
@@ -172,10 +184,19 @@ inline void set_local(volatile tt_l1_ptr uint32_t* sem, uint32_t value) {
     noc_async_write_barrier();
 }
 
-inline volatile tt_reg_ptr uint32_t* reg_ptr_from_cb(uint32_t cbid, bool received) {
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
+    return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
+        STREAM_REG_ADDR(
+            OPERAND_START_STREAM + cbid,
+            received ? STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX : STREAM_REMOTE_DEST_BUF_START_REG_INDEX));
+}
+#else
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
     return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
         received ? get_cb_tiles_received_ptr(cbid) : get_cb_tiles_acked_ptr(cbid));
 }
+#endif
 
 inline volatile tt_l1_ptr uint32_t* sem_slot(uint32_t sem_base_addr, uint32_t slot) {
     return reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_base_addr + slot * BENCH_SEM_SLOT_BYTES);
@@ -214,8 +235,8 @@ void kernel_main() {
 #if BENCH_USE_STREAM_REG_SYNC
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_STREAM_REG_START_REG_INDEX, BENCH_PROTOCOL_START_VALUE);
 #else
-    volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbOut, true);
-    volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbOut, false);
+    volatile tt_reg_ptr uint32_t* output_ready_reg = protocol_counter_ptr(kCbOut, true);
+    volatile tt_reg_ptr uint32_t* output_consumed_reg = protocol_counter_ptr(kCbOut, false);
 #endif
 
     InterleavedAddrGen<true> dst_addrgen = {.bank_base_address = dst_dram_addr, .page_size = page_size};
@@ -231,7 +252,13 @@ void kernel_main() {
     DEVICE_PRINT("rtadd writer start value={} pages={}\n", BENCH_PROTOCOL_START_VALUE, num_pages);
 #endif
 
-#if BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_ARGS
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT_WRITER");
+#elif BENCH_LEVEL_C_LLK_DIRECT
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_WRITER");
+#elif BENCH_LEVEL_C_GENERATED_STATIC
+    DeviceZoneScopedN("RTADD_LEVEL_C_GENERATED_STATIC_WRITER");
+#elif BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_ARGS
     DeviceZoneScopedN("RTADD_STATIC_STREAMREG_CBREGS_COMPILETIME_WRITER");
 #elif BENCH_USE_COMPILE_TIME_ARGS
     DeviceZoneScopedN("RTADD_STATIC_COMPILETIME_WRITER");

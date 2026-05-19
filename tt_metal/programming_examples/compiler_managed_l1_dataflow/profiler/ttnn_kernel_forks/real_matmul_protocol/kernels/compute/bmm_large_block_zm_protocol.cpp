@@ -10,6 +10,18 @@
 #include "tools/profiler/kernel_profiler.hpp"
 #include "tt-metalium/circular_buffer_constants.h"
 
+#ifdef TRISC_UNPACK
+#include "llk_unpack_AB_matmul.h"
+#include "llk_unpack_common.h"
+#endif
+#ifdef TRISC_MATH
+#include "llk_math_common.h"
+#include "llk_math_matmul.h"
+#endif
+#ifdef TRISC_PACK
+#include "llk_pack.h"
+#endif
+
 #ifndef BENCH_STATIC_PROTOCOL
 #define BENCH_STATIC_PROTOCOL 0
 #endif
@@ -28,6 +40,14 @@
 
 #ifndef BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
 #define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
+#endif
+
+#ifndef BENCH_LEVEL_C_LLK_DIRECT
+#define BENCH_LEVEL_C_LLK_DIRECT 0
+#endif
+
+#ifndef BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define BENCH_LEVEL_C_FW_SKIP_CB_INIT 0
 #endif
 
 #ifndef BENCH_PROTOCOL_START_VALUE
@@ -56,8 +76,13 @@ constexpr uint32_t kCbIn0 = tt::CBIndex::c_0;
 constexpr uint32_t kCbIn1 = tt::CBIndex::c_1;
 constexpr uint32_t kCbOut = tt::CBIndex::c_16;
 constexpr uint32_t kCbInterm = tt::CBIndex::c_24;
+constexpr uint32_t kBfp16Format = static_cast<uint32_t>(DataFormat::Float16_b);
 
-#if BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define RMP_MODE_PREFIX "RMP_REUSE_LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT"
+#elif BENCH_LEVEL_C_LLK_DIRECT
+#define RMP_MODE_PREFIX "RMP_REUSE_LEVEL_C_LLK_DIRECT"
+#elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
     BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
 #define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_OUTPUT_CBREGS_COMPILETIME"
 #elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
@@ -112,25 +137,138 @@ inline volatile tt_l1_ptr uint32_t* tensix_store_ptr(volatile tt_reg_ptr uint32_
         ((reinterpret_cast<uint32_t>(reg) >> 2) & 0x3ffff));
 }
 
-inline volatile tt_reg_ptr uint32_t* reg_ptr_from_cb(uint32_t cbid, bool received) {
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
+    return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
+        STREAM_REG_ADDR(
+            OPERAND_START_STREAM + cbid,
+            received ? STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX : STREAM_REMOTE_DEST_BUF_START_REG_INDEX));
+}
+#else
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
     return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
         received ? get_cb_tiles_received_ptr(cbid) : get_cb_tiles_acked_ptr(cbid));
 }
+#endif
 
 inline uint32_t to_cb_addr(uint32_t l1_addr) {
     return l1_addr >> CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT;
 }
 
+inline uint32_t to_llk_addr(uint32_t l1_addr) {
+    return to_cb_addr(l1_addr) - 1;
+}
+
+inline void raw_matmul_init(uint32_t /*out_subblock_num_tiles*/) {
+#if BENCH_LEVEL_C_LLK_DIRECT
+#ifdef TRISC_UNPACK
+    _llk_unpack_hw_configure_<DST_ACCUM_MODE>(
+        kBfp16Format,
+        kBfp16Format,
+        kBfp16Format,
+        kBfp16Format,
+        FACE_R_DIM,
+        FACE_R_DIM,
+        4,
+        4,
+        BENCH_SRC0_TILE_WORDS,
+        BENCH_SRC1_TILE_WORDS);
+    _llk_unpack_AB_matmul_init_(
+        0,
+        1,
+        1,
+        1,
+        FACE_R_DIM,
+        FACE_R_DIM,
+        4,
+        4,
+        false,
+        false);
+#endif
+#ifdef TRISC_MATH
+    _llk_math_pack_sync_init_<DST_SYNC_MODE, DST_ACCUM_MODE>();
+    _llk_math_hw_configure_<DST_ACCUM_MODE>(kBfp16Format, kBfp16Format);
+    _llk_math_matmul_init_<MATH_FIDELITY, MM_THROTTLE>(
+        TILE_R_DIM,
+        TILE_C_DIM,
+        TILE_R_DIM,
+        TILE_C_DIM,
+        false,
+        0,
+        1,
+        1);
+#endif
+#ifdef TRISC_PACK
+    _llk_pack_hw_configure_<DST_ACCUM_MODE, PackMode::Default>(
+        kBfp16Format,
+        kBfp16Format,
+        BENCH_OUT_TILE_WORDS,
+        FACE_R_DIM,
+        TILE_C_DIM,
+        4,
+        false,
+        0);
+    _llk_pack_init_<PackMode::Default, false, false>(FACE_R_DIM, TILE_C_DIM, 4, 1);
+    _llk_pack_dest_init_<DST_SYNC_MODE, DST_ACCUM_MODE>();
+#endif
+#else
+    mm_init(kCbIn0, kCbIn1, kCbOut);
+#endif
+}
+
+inline void raw_matmul_tile(
+    uint32_t in0_l1_base,
+    uint32_t in1_l1_base,
+    uint32_t in0_tile_index,
+    uint32_t in1_tile_index,
+    uint32_t dst_index) {
+#if BENCH_LEVEL_C_LLK_DIRECT
+#ifdef TRISC_UNPACK
+    _llk_unpack_AB_matmul_(
+        to_llk_addr(in0_l1_base),
+        to_llk_addr(in1_l1_base),
+        in0_tile_index,
+        in1_tile_index,
+        BENCH_SRC0_TILE_WORDS,
+        BENCH_SRC1_TILE_WORDS,
+        false,
+        false,
+        1,
+        1,
+        1);
+#endif
+#ifdef TRISC_MATH
+    _llk_math_matmul_<MATH_FIDELITY, MM_THROTTLE>(dst_index);
+#endif
+#else
+    matmul_tiles(kCbIn0, kCbIn1, in0_tile_index, in1_tile_index, dst_index);
+#endif
+}
+
+inline void raw_pack_tile(uint32_t dst_index, uint32_t out_l1_addr) {
+#if BENCH_LEVEL_C_LLK_DIRECT
+#ifdef TRISC_PACK
+    _llk_pack_<DST_SYNC_MODE, DST_ACCUM_MODE, PackMode::Default>(dst_index, to_llk_addr(out_l1_addr));
+#endif
+#else
+    pack_tile(dst_index, kCbOut);
+#endif
+}
+
 inline void set_static_read_base(uint32_t cb_id, uint32_t l1_addr) {
+#if !BENCH_LEVEL_C_LLK_DIRECT
 #ifdef TRISC_UNPACK
     get_local_cb_interface(cb_id).fifo_rd_ptr = to_cb_addr(l1_addr);
+#endif
 #endif
 }
 
 inline void set_static_write_base(uint32_t cb_id, uint32_t l1_addr) {
+#if !BENCH_LEVEL_C_LLK_DIRECT
 #ifdef TRISC_PACK
     get_local_cb_interface(cb_id).fifo_wr_ptr = to_cb_addr(l1_addr);
     get_local_cb_interface(cb_id).fifo_wr_tile_ptr = 0;
+#endif
 #endif
 }
 
@@ -170,7 +308,11 @@ void kernel_main() {
     uint32_t out_subblock_num_tiles = get_compile_time_arg_val(10);
     uint32_t batch = get_compile_time_arg_val(11);
 
+#if BENCH_STATIC_PROTOCOL
+    raw_matmul_init(out_subblock_num_tiles);
+#else
     mm_init(kCbIn0, kCbIn1, kCbOut);
+#endif
 
 #if BENCH_STATIC_PROTOCOL
 #if BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
@@ -203,10 +345,10 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* protocol_start_sem =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(protocol_start_sem_addr);
 #endif
-    volatile tt_reg_ptr uint32_t* input_ready_reg = reg_ptr_from_cb(kCbIn0, true);
-    volatile tt_reg_ptr uint32_t* input1_ready_reg = reg_ptr_from_cb(kCbIn1, true);
-    volatile tt_reg_ptr uint32_t* input_consumed_reg = reg_ptr_from_cb(kCbIn0, false);
-    volatile tt_reg_ptr uint32_t* input1_consumed_reg = reg_ptr_from_cb(kCbIn1, false);
+    volatile tt_reg_ptr uint32_t* input_ready_reg = protocol_counter_ptr(kCbIn0, true);
+    volatile tt_reg_ptr uint32_t* input1_ready_reg = protocol_counter_ptr(kCbIn1, true);
+    volatile tt_reg_ptr uint32_t* input_consumed_reg = protocol_counter_ptr(kCbIn0, false);
+    volatile tt_reg_ptr uint32_t* input1_consumed_reg = protocol_counter_ptr(kCbIn1, false);
 #if BENCH_USE_STREAM_REG_CBREGS
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_STREAM_REG_START_REG_INDEX, BENCH_PROTOCOL_START_VALUE);
 #else
@@ -215,8 +357,8 @@ void kernel_main() {
 #endif
 
 #if BENCH_STATIC_OUTPUT_PROTOCOL
-    volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbOut, true);
-    volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbOut, false);
+    volatile tt_reg_ptr uint32_t* output_ready_reg = protocol_counter_ptr(kCbOut, true);
+    volatile tt_reg_ptr uint32_t* output_consumed_reg = protocol_counter_ptr(kCbOut, false);
 #if BENCH_USE_STREAM_REG_CBREGS && !BENCH_STATIC_INPUT_PROTOCOL
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_STREAM_REG_START_REG_INDEX, BENCH_PROTOCOL_START_VALUE);
 #endif
@@ -254,6 +396,8 @@ void kernel_main() {
             set_static_read_base(kCbIn0, in0_l1_addr);
             set_static_read_base(kCbIn1, in1_l1_addr);
 #else
+            const uint32_t in0_l1_addr = 0;
+            const uint32_t in1_l1_addr = 0;
             cb_wait_front(kCbIn0, in0_block_num_tiles);
             cb_wait_front(kCbIn1, in1_block_num_tiles);
 #endif
@@ -294,7 +438,12 @@ void kernel_main() {
                             for (uint32_t inner_dim = 0; inner_dim < in0_block_w; inner_dim++) {
                                 int in0_index = in0_index_subblock_offset + in0_index_h_offset + inner_dim;
                                 int in1_index = in1_index_subblock_offset + in1_index_inner_dim_offset + w;
-                                matmul_tiles(kCbIn0, kCbIn1, in0_index, in1_index, dst_index);
+                                raw_matmul_tile(
+                                    in0_l1_addr,
+                                    in1_l1_addr,
+                                    in0_index,
+                                    in1_index,
+                                    dst_index);
                                 in1_index_inner_dim_offset += in1_per_core_w;
                             }
                             dst_index++;
@@ -315,7 +464,7 @@ void kernel_main() {
 #endif
                         set_static_write_base(kCbOut, out_l1_addr);
                         for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
-                            pack_tile(i, kCbOut);
+                            raw_pack_tile(i, out_l1_addr + i * BENCH_OUT_TILE_BYTES);
                         }
                         publish_output_after_pack(output_ready_reg, output_generation);
 #else

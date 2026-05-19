@@ -68,6 +68,8 @@ enum class Mode : uint32_t {
     StaticInputOnlyCbRegsCompileTime = 7,
     StaticOutputOnlyCbRegsCompileTime = 8,
     StaticInputOutputCbRegsCompileTime = 9,
+    LevelCLlkDirect = 10,
+    LevelCLlkDirectFwSkipCbInit = 11,
 };
 
 struct Options {
@@ -161,6 +163,8 @@ const char* mode_name(Mode mode) {
         case Mode::StaticInputOnlyCbRegsCompileTime: return "static-input-only-cbregs-compiletime";
         case Mode::StaticOutputOnlyCbRegsCompileTime: return "static-output-only-cbregs-compiletime";
         case Mode::StaticInputOutputCbRegsCompileTime: return "static-input-output-cbregs-compiletime";
+        case Mode::LevelCLlkDirect: return "level-c-llk-direct";
+        case Mode::LevelCLlkDirectFwSkipCbInit: return "level-c-llk-direct-fw-skip-cb-init";
     }
     return "unknown";
 }
@@ -196,6 +200,12 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     if (mode == "static-input-output-cbregs-compiletime") {
         return Mode::StaticInputOutputCbRegsCompileTime;
     }
+    if (mode == "level-c-llk-direct") {
+        return Mode::LevelCLlkDirect;
+    }
+    if (mode == "level-c-llk-direct-fw-skip-cb-init") {
+        return Mode::LevelCLlkDirectFwSkipCbInit;
+    }
     return std::nullopt;
 }
 
@@ -206,24 +216,35 @@ bool is_static_mode(Mode mode) {
 bool uses_static_input(Mode mode) {
     return mode == Mode::StaticInputOnly || mode == Mode::StaticInputOutput ||
            mode == Mode::StaticInputOnlyCbRegs || mode == Mode::StaticInputOutputCbRegs ||
-           mode == Mode::StaticInputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime;
+           mode == Mode::StaticInputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime ||
+           mode == Mode::LevelCLlkDirect || mode == Mode::LevelCLlkDirectFwSkipCbInit;
 }
 
 bool uses_static_output(Mode mode) {
     return mode == Mode::StaticOutputOnly || mode == Mode::StaticInputOutput ||
            mode == Mode::StaticOutputOnlyCbRegs || mode == Mode::StaticInputOutputCbRegs ||
-           mode == Mode::StaticOutputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime;
+           mode == Mode::StaticOutputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime ||
+           mode == Mode::LevelCLlkDirect || mode == Mode::LevelCLlkDirectFwSkipCbInit;
 }
 
 bool uses_stream_reg_cbregs(Mode mode) {
     return mode == Mode::StaticInputOnlyCbRegs || mode == Mode::StaticOutputOnlyCbRegs ||
            mode == Mode::StaticInputOutputCbRegs || mode == Mode::StaticInputOnlyCbRegsCompileTime ||
-           mode == Mode::StaticOutputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime;
+           mode == Mode::StaticOutputOnlyCbRegsCompileTime || mode == Mode::StaticInputOutputCbRegsCompileTime ||
+           mode == Mode::LevelCLlkDirect || mode == Mode::LevelCLlkDirectFwSkipCbInit;
 }
 
 bool uses_compile_time_protocol_args(Mode mode) {
     return mode == Mode::StaticInputOnlyCbRegsCompileTime || mode == Mode::StaticOutputOnlyCbRegsCompileTime ||
-           mode == Mode::StaticInputOutputCbRegsCompileTime;
+           mode == Mode::StaticInputOutputCbRegsCompileTime || mode == Mode::LevelCLlkDirect;
+}
+
+bool uses_level_c_llk_direct(Mode mode) {
+    return mode == Mode::LevelCLlkDirect || mode == Mode::LevelCLlkDirectFwSkipCbInit;
+}
+
+bool uses_fw_skip_cb_init(Mode mode) {
+    return mode == Mode::LevelCLlkDirectFwSkipCbInit;
 }
 
 std::vector<Mode> modes_to_run(const std::string& mode) {
@@ -238,7 +259,9 @@ std::vector<Mode> modes_to_run(const std::string& mode) {
             Mode::StaticInputOutputCbRegs,
             Mode::StaticInputOnlyCbRegsCompileTime,
             Mode::StaticOutputOnlyCbRegsCompileTime,
-            Mode::StaticInputOutputCbRegsCompileTime};
+            Mode::StaticInputOutputCbRegsCompileTime,
+            Mode::LevelCLlkDirect,
+            Mode::LevelCLlkDirectFwSkipCbInit};
     }
     auto parsed = parse_mode(mode);
     if (!parsed.has_value()) {
@@ -246,7 +269,8 @@ std::vector<Mode> modes_to_run(const std::string& mode) {
             "Unknown --mode. Valid values are all, profiled-cb, cb, static-input-only, static-output-only, "
             "static-input-output, static-input-only-cbregs, static-output-only-cbregs, "
             "static-input-output-cbregs, static-input-only-cbregs-compiletime, "
-            "static-output-only-cbregs-compiletime, static-input-output-cbregs-compiletime, static, static-cbregs");
+            "static-output-only-cbregs-compiletime, static-input-output-cbregs-compiletime, "
+            "level-c-llk-direct, level-c-llk-direct-fw-skip-cb-init, static, static-cbregs");
     }
     return {*parsed};
 }
@@ -256,7 +280,7 @@ void print_usage(const char* argv0) {
         "Usage: {} [--mode=all|profiled-cb|static-input-only|static-output-only|static-input-output|"
         "static-input-only-cbregs|static-output-only-cbregs|static-input-output-cbregs|"
         "static-input-only-cbregs-compiletime|static-output-only-cbregs-compiletime|"
-        "static-input-output-cbregs-compiletime] "
+        "static-input-output-cbregs-compiletime|level-c-llk-direct|level-c-llk-direct-fw-skip-cb-init] "
         "[--M=N] [--N=N] [--K=N] "
         "[--B=N] [--num-pages=N] [--repeats=N] [--device-id=N] [--sweep=targeted] [--skip-check]\n",
         argv0);
@@ -528,6 +552,8 @@ std::map<std::string, std::string> kernel_defines(
         {"BENCH_STATIC_OUTPUT_PROTOCOL", uses_static_output(mode) ? "1" : "0"},
         {"BENCH_USE_STREAM_REG_CBREGS", uses_stream_reg_cbregs(mode) ? "1" : "0"},
         {"BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS", uses_compile_time_protocol_args(mode) ? "1" : "0"},
+        {"BENCH_LEVEL_C_LLK_DIRECT", uses_level_c_llk_direct(mode) ? "1" : "0"},
+        {"BENCH_LEVEL_C_FW_SKIP_CB_INIT", uses_fw_skip_cb_init(mode) ? "1" : "0"},
         {"BENCH_PROTOCOL_START_VALUE", std::to_string(protocol_start_value(mode, repeat))},
         {"BENCH_SRC0_RING_ADDR", std::to_string(src0_ring_addr)},
         {"BENCH_SRC1_RING_ADDR", std::to_string(src1_ring_addr)},
@@ -535,6 +561,12 @@ std::map<std::string, std::string> kernel_defines(
         {"BENCH_SRC0_SLOT_BYTES", std::to_string(src0_slot_bytes)},
         {"BENCH_SRC1_SLOT_BYTES", std::to_string(src1_slot_bytes)},
         {"BENCH_OUT_SLOT_BYTES", std::to_string(out_slot_bytes)},
+        {"BENCH_SRC0_TILE_BYTES", std::to_string(tt::tile_size(tt::DataFormat::Float16_b))},
+        {"BENCH_SRC1_TILE_BYTES", std::to_string(tt::tile_size(tt::DataFormat::Float16_b))},
+        {"BENCH_OUT_TILE_BYTES", std::to_string(tt::tile_size(tt::DataFormat::Float16_b))},
+        {"BENCH_SRC0_TILE_WORDS", std::to_string(tt::tile_size(tt::DataFormat::Float16_b) >> 4)},
+        {"BENCH_SRC1_TILE_WORDS", std::to_string(tt::tile_size(tt::DataFormat::Float16_b) >> 4)},
+        {"BENCH_OUT_TILE_WORDS", std::to_string(tt::tile_size(tt::DataFormat::Float16_b) >> 4)},
         {"BENCH_NUM_PAGES", std::to_string(num_pages)},
         {"BENCH_OUT_NUM_PAGES", std::to_string(out_num_pages)},
         {"BENCH_PROTOCOL_START_SEM_ADDR", std::to_string(protocol_start_sem_addr)},
@@ -604,6 +636,9 @@ void create_circular_buffers(
     uint32_t num_pages) {
     const bool static_input = uses_static_input(mode);
     const bool static_output = uses_static_output(mode);
+    if (uses_fw_skip_cb_init(mode)) {
+        return;
+    }
 
     for (const auto& work : works) {
         const StaticCoreResources* r = is_static_mode(mode) ? find_static_resources(static_resources, work.core) : nullptr;
@@ -698,6 +733,11 @@ RunResult run_one(
     const uint32_t single_tile_size = tt::tile_size(cb_data_format);
     const auto compute_grid = mesh_device->compute_with_storage_grid_size();
     const MatmulShape shape = compute_shape(options, compute_grid);
+    if (uses_level_c_llk_direct(mode) && shape.num_blocks != 1) {
+        throw std::invalid_argument(
+            "level-c-llk-direct currently supports only num_blocks=1. Use K=64 with in0_block_w=2 for this "
+            "first matmul LLK-direct proof; partial-sum reload will be added as a separate step.");
+    }
     const auto works = make_core_works(shape, compute_grid);
     const CoreRangeSet all_cores(tt::tt_metal::num_cores_to_corerangeset(
         shape.num_active_cores, compute_grid, true));
@@ -723,7 +763,8 @@ RunResult run_one(
         static_resources = create_static_resources(mesh_device, shape, works, mode, single_tile_size, options.num_pages);
     }
     if (uses_compile_time_protocol_args(mode) && works.size() != 1) {
-        throw std::invalid_argument("matmul *-cbregs-compiletime modes currently support only one active core");
+        throw std::invalid_argument(
+            "matmul *-cbregs-compiletime and level-c-llk-direct modes currently support only one active core");
     }
 
     create_circular_buffers(program, shape, works, static_resources, mode, single_tile_size, options.num_pages);

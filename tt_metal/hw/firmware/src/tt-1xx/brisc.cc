@@ -500,18 +500,23 @@ int main() {
 #endif
                 uint64_t local_cb_mask = launch_msg_address->kernel_config.local_cb_mask;
                 uint32_t local_cb_mask_low = static_cast<uint32_t>(local_cb_mask & 0xFFFFFFFFULL);
-                {
+                if (local_cb_mask != 0) {
                     DeviceZoneScopedN("CBP_FW_LOCAL_CB_INIT");
-                    setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
+                    if (local_cb_mask_low != 0) {
+                        setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
+                    }
 #ifdef ARCH_BLACKHOLE
                     uint32_t local_cb_mask_upper = static_cast<uint32_t>(local_cb_mask >> 32);
-                    setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 32, local_cb_mask_upper);
+                    if (local_cb_mask_upper != 0) {
+                        setup_local_cb_read_write_interfaces<true, true, false, false>(
+                            cb_l1_base, 32, local_cb_mask_upper);
+                    }
 #endif
                 }
                 cb_l1_base =
                     (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg_address->kernel_config.remote_cb_offset);
                 uint32_t end_cb_index = launch_msg_address->kernel_config.min_remote_cb_start_index;
-                {
+                if (end_cb_index < NUM_CIRCULAR_BUFFERS) {
                     DeviceZoneScopedN("CBP_FW_REMOTE_CB_INIT");
                     experimental::setup_remote_cb_interfaces<true>(
                         cb_l1_base, end_cb_index, noc_index, noc_mode, true, cmd_buf);
@@ -536,7 +541,7 @@ int main() {
                     cb_l1_base =
                         (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg_address->kernel_config.remote_cb_offset);
                     uint32_t end_cb_index = launch_msg_address->kernel_config.min_remote_cb_start_index;
-                    {
+                    if (end_cb_index < NUM_CIRCULAR_BUFFERS) {
                         DeviceZoneScopedN("CBP_FW_REMOTE_CB_INIT");
                         experimental::setup_remote_cb_interfaces<true>(
                             cb_l1_base, end_cb_index, noc_index, noc_mode, true, cmd_buf);

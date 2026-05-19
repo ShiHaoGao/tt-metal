@@ -1,0 +1,140 @@
+add_executable(
+    level_c_descriptor_schema_sanity
+    ${CMAKE_CURRENT_SOURCE_DIR}/level_c_descriptor_schema_sanity.cpp
+)
+add_executable(
+    level_c_tile_add_codegen_sanity
+    ${CMAKE_CURRENT_SOURCE_DIR}/level_c_tile_add_codegen_sanity.cpp
+)
+add_executable(
+    level_c_axe_layout_coverage_sanity
+    ${CMAKE_CURRENT_SOURCE_DIR}/level_c_axe_layout_coverage_sanity.cpp
+)
+add_executable(
+    level_c_tt_metal_layout_adapter_sanity
+    ${CMAKE_CURRENT_SOURCE_DIR}/level_c_tt_metal_layout_adapter_sanity.cpp
+)
+add_executable(
+    level_c_lowering_adapter_sanity
+    ${CMAKE_CURRENT_SOURCE_DIR}/level_c_lowering_adapter_sanity.cpp
+)
+add_executable(
+    level_c_fw_skip_cb_init_contract_sanity
+    ${CMAKE_CURRENT_SOURCE_DIR}/level_c_fw_skip_cb_init_contract_sanity.cpp
+)
+add_executable(
+    level_c_tt_target_dialect_sanity
+    ${CMAKE_CURRENT_SOURCE_DIR}/level_c_tt_target_dialect_sanity.cpp
+)
+
+target_link_libraries(level_c_descriptor_schema_sanity PUBLIC TT::STL)
+target_link_libraries(level_c_tile_add_codegen_sanity PUBLIC TT::STL)
+target_link_libraries(level_c_axe_layout_coverage_sanity PUBLIC TT::STL)
+target_link_libraries(level_c_tt_metal_layout_adapter_sanity PUBLIC TT::STL)
+target_link_libraries(level_c_lowering_adapter_sanity PUBLIC TT::STL)
+target_link_libraries(level_c_fw_skip_cb_init_contract_sanity PUBLIC TT::STL)
+target_link_libraries(level_c_tt_target_dialect_sanity PUBLIC TT::STL)
+
+target_include_directories(
+    level_c_descriptor_schema_sanity
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/programming_examples
+)
+target_include_directories(
+    level_c_tile_add_codegen_sanity
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/programming_examples
+)
+target_include_directories(
+    level_c_axe_layout_coverage_sanity
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/programming_examples
+)
+target_include_directories(
+    level_c_tt_metal_layout_adapter_sanity
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/programming_examples
+)
+target_include_directories(
+    level_c_lowering_adapter_sanity
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/programming_examples
+)
+target_include_directories(
+    level_c_fw_skip_cb_init_contract_sanity
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/programming_examples
+        ${PROJECT_SOURCE_DIR}/tt_metal/api
+)
+target_include_directories(
+    level_c_tt_target_dialect_sanity
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/programming_examples
+)
+
+set_target_properties(
+    level_c_descriptor_schema_sanity
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY
+            ${PROJECT_BINARY_DIR}/programming_examples/compiler_managed_l1_dataflow/level_c
+)
+set_target_properties(
+    level_c_tile_add_codegen_sanity
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY
+            ${PROJECT_BINARY_DIR}/programming_examples/compiler_managed_l1_dataflow/level_c
+)
+set_target_properties(
+    level_c_axe_layout_coverage_sanity
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY
+            ${PROJECT_BINARY_DIR}/programming_examples/compiler_managed_l1_dataflow/level_c
+)
+set_target_properties(
+    level_c_tt_metal_layout_adapter_sanity
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY
+            ${PROJECT_BINARY_DIR}/programming_examples/compiler_managed_l1_dataflow/level_c
+)
+set_target_properties(
+    level_c_lowering_adapter_sanity
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY
+            ${PROJECT_BINARY_DIR}/programming_examples/compiler_managed_l1_dataflow/level_c
+)
+set_target_properties(
+    level_c_fw_skip_cb_init_contract_sanity
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY
+            ${PROJECT_BINARY_DIR}/programming_examples/compiler_managed_l1_dataflow/level_c
+)
+set_target_properties(
+    level_c_tt_target_dialect_sanity
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY
+            ${PROJECT_BINARY_DIR}/programming_examples/compiler_managed_l1_dataflow/level_c
+)
+
+add_custom_target(
+    compiler_managed_l1_dataflow_level_c_examples
+    DEPENDS
+        level_c_descriptor_schema_sanity
+        level_c_tile_add_codegen_sanity
+        level_c_axe_layout_coverage_sanity
+        level_c_tt_metal_layout_adapter_sanity
+        level_c_lowering_adapter_sanity
+        level_c_fw_skip_cb_init_contract_sanity
+        level_c_tt_target_dialect_sanity
+)
+
+set(
+    COMPILER_MANAGED_L1_DATAFLOW_LEVEL_C_TARGETS
+    level_c_descriptor_schema_sanity
+    level_c_tile_add_codegen_sanity
+    level_c_axe_layout_coverage_sanity
+    level_c_tt_metal_layout_adapter_sanity
+    level_c_lowering_adapter_sanity
+    level_c_fw_skip_cb_init_contract_sanity
+    level_c_tt_target_dialect_sanity
+    PARENT_SCOPE
+)

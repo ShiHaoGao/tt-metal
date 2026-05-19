@@ -18,6 +18,9 @@ MODE_LABELS = {
     "STATIC_STREAMREG": "static-streamreg",
     "STATIC_STREAMREG_CBREGS": "static-streamreg-cbregs",
     "STATIC_STREAMREG_CBREGS_COMPILETIME": "static-streamreg-cbregs-compiletime",
+    "LEVEL_C_GENERATED_STATIC": "level-c-generated-static",
+    "LEVEL_C_LLK_DIRECT": "level-c-llk-direct",
+    "LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT": "level-c-llk-direct-fw-skip-cb-init",
 }
 
 STAGE_LABELS = {
@@ -29,7 +32,7 @@ STAGE_LABELS = {
 }
 
 ZONE_RE = re.compile(
-    r"^RTADD_(?P<mode>CB|STATIC_RUNTIME|STATIC_COMPILETIME|STATIC_STREAMREG|STATIC_STREAMREG_CBREGS|STATIC_STREAMREG_CBREGS_COMPILETIME)_"
+    r"^RTADD_(?P<mode>CB|STATIC_RUNTIME|STATIC_COMPILETIME|STATIC_STREAMREG|STATIC_STREAMREG_CBREGS|STATIC_STREAMREG_CBREGS_COMPILETIME|LEVEL_C_GENERATED_STATIC|LEVEL_C_LLK_DIRECT|LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT)_"
     r"(?P<stage>READER|WRITER|COMPUTE_UNPACK|COMPUTE_MATH|COMPUTE_PACK)$"
 )
 CASE_RE = re.compile(
@@ -148,6 +151,10 @@ def phase_is_end(value):
 
 
 def parse_zone_name(zone):
+    if zone == "CBP_FW_LOCAL_CB_INIT":
+        return {"mode": "firmware", "stage": "local-cb-init"}
+    if zone == "CBP_FW_REMOTE_CB_INIT":
+        return {"mode": "firmware", "stage": "remote-cb-init"}
     match = ZONE_RE.match(zone)
     if not match:
         return None

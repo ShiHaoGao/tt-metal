@@ -25,6 +25,18 @@
 #define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
 #endif
 
+#ifndef BENCH_LEVEL_C_LLK_DIRECT
+#define BENCH_LEVEL_C_LLK_DIRECT 0
+#endif
+
+#ifndef BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define BENCH_LEVEL_C_FW_SKIP_CB_INIT 0
+#endif
+
+#ifndef BENCH_OUT_TILE_BYTES
+#define BENCH_OUT_TILE_BYTES 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
 #endif
@@ -49,7 +61,11 @@ namespace {
 
 constexpr uint32_t kCbOut = tt::CBIndex::c_16;
 
-#if BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define RMP_MODE_PREFIX "RMP_REUSE_LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT"
+#elif BENCH_LEVEL_C_LLK_DIRECT
+#define RMP_MODE_PREFIX "RMP_REUSE_LEVEL_C_LLK_DIRECT"
+#elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
     BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
 #define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_OUTPUT_CBREGS_COMPILETIME"
 #elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
@@ -101,10 +117,19 @@ inline void wait_equal_stream(uint32_t stream_id, uint32_t reg_index, uint32_t v
     }
 }
 
-inline volatile tt_reg_ptr uint32_t* reg_ptr_from_cb(uint32_t cbid, bool received) {
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
+    return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
+        STREAM_REG_ADDR(
+            OPERAND_START_STREAM + cbid,
+            received ? STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX : STREAM_REMOTE_DEST_BUF_START_REG_INDEX));
+}
+#else
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
     return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
         received ? get_cb_tiles_received_ptr(cbid) : get_cb_tiles_acked_ptr(cbid));
 }
+#endif
 #endif
 
 }  // namespace
@@ -129,7 +154,8 @@ void kernel_main() {
     uint32_t MtNt = get_arg_val<uint32_t>(11);
     uint32_t batch = get_arg_val<uint32_t>(12);
 
-    const uint32_t single_tile_size_bytes = get_tile_size(kCbOut);
+    const uint32_t single_tile_size_bytes =
+        BENCH_LEVEL_C_FW_SKIP_CB_INIT ? BENCH_OUT_TILE_BYTES : get_tile_size(kCbOut);
 
     constexpr auto s_args = TensorAccessorArgs<0>();
     const auto s = TensorAccessor(s_args, out_tensor_addr);
@@ -156,8 +182,8 @@ void kernel_main() {
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(protocol_start_sem_addr);
 #endif
 #endif
-    volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbOut, true);
-    volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbOut, false);
+    volatile tt_reg_ptr uint32_t* output_ready_reg = protocol_counter_ptr(kCbOut, true);
+    volatile tt_reg_ptr uint32_t* output_consumed_reg = protocol_counter_ptr(kCbOut, false);
 
 #if BENCH_USE_STREAM_REG_CBREGS
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_STREAM_REG_START_REG_INDEX, BENCH_PROTOCOL_START_VALUE);

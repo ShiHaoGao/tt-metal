@@ -66,6 +66,9 @@ enum class Mode : uint32_t {
     StaticStreamReg = 3,
     StaticStreamRegCbRegs = 4,
     StaticStreamRegCbRegsCompileTime = 5,
+    LevelCGeneratedStatic = 6,
+    LevelCLlkDirect = 7,
+    LevelCLlkDirectFwSkipCbInit = 8,
 };
 
 struct Options {
@@ -125,6 +128,9 @@ const char* mode_name(Mode mode) {
         case Mode::StaticStreamReg: return "static-streamreg";
         case Mode::StaticStreamRegCbRegs: return "static-streamreg-cbregs";
         case Mode::StaticStreamRegCbRegsCompileTime: return "static-streamreg-cbregs-compiletime";
+        case Mode::LevelCGeneratedStatic: return "level-c-generated-static";
+        case Mode::LevelCLlkDirect: return "level-c-llk-direct";
+        case Mode::LevelCLlkDirectFwSkipCbInit: return "level-c-llk-direct-fw-skip-cb-init";
     }
     return "unknown";
 }
@@ -148,6 +154,15 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     if (mode == "static-streamreg-cbregs-compiletime") {
         return Mode::StaticStreamRegCbRegsCompileTime;
     }
+    if (mode == "level-c-generated-static") {
+        return Mode::LevelCGeneratedStatic;
+    }
+    if (mode == "level-c-llk-direct") {
+        return Mode::LevelCLlkDirect;
+    }
+    if (mode == "level-c-llk-direct-fw-skip-cb-init") {
+        return Mode::LevelCLlkDirectFwSkipCbInit;
+    }
     return std::nullopt;
 }
 
@@ -158,13 +173,17 @@ std::vector<Mode> modes_to_run(const std::string& mode) {
             Mode::StaticRuntime,
             Mode::StaticCompileTime,
             Mode::StaticStreamRegCbRegs,
-            Mode::StaticStreamRegCbRegsCompileTime};
+            Mode::StaticStreamRegCbRegsCompileTime,
+            Mode::LevelCGeneratedStatic,
+            Mode::LevelCLlkDirect,
+            Mode::LevelCLlkDirectFwSkipCbInit};
     }
     auto parsed = parse_mode(mode);
     if (!parsed.has_value()) {
         throw std::invalid_argument(
             "Unknown --mode. Valid values are all, cb, static-runtime, static-compiletime, "
-            "static-streamreg-cbregs, static-streamreg-cbregs-compiletime. "
+            "static-streamreg-cbregs, static-streamreg-cbregs-compiletime, level-c-generated-static, "
+            "level-c-llk-direct, level-c-llk-direct-fw-skip-cb-init. "
             "The old static-streamreg compute mode is disabled.");
     }
     return {*parsed};
@@ -172,11 +191,14 @@ std::vector<Mode> modes_to_run(const std::string& mode) {
 
 bool is_static_mode(Mode mode) {
     return mode == Mode::StaticRuntime || mode == Mode::StaticCompileTime || mode == Mode::StaticStreamReg ||
-           mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime;
+           mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime ||
+           mode == Mode::LevelCGeneratedStatic || mode == Mode::LevelCLlkDirect ||
+           mode == Mode::LevelCLlkDirectFwSkipCbInit;
 }
 
 bool uses_compile_time_args(Mode mode) {
-    return mode == Mode::StaticCompileTime || mode == Mode::StaticStreamRegCbRegsCompileTime;
+    return mode == Mode::StaticCompileTime || mode == Mode::StaticStreamRegCbRegsCompileTime ||
+           mode == Mode::LevelCGeneratedStatic || mode == Mode::LevelCLlkDirect;
 }
 
 bool uses_stream_reg_sync(Mode mode) {
@@ -184,7 +206,20 @@ bool uses_stream_reg_sync(Mode mode) {
 }
 
 bool uses_stream_reg_cbregs(Mode mode) {
-    return mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime;
+    return mode == Mode::StaticStreamRegCbRegs || mode == Mode::StaticStreamRegCbRegsCompileTime ||
+           mode == Mode::LevelCLlkDirectFwSkipCbInit;
+}
+
+bool uses_level_c_generated_static(Mode mode) {
+    return mode == Mode::LevelCGeneratedStatic;
+}
+
+bool uses_level_c_llk_direct(Mode mode) {
+    return mode == Mode::LevelCLlkDirect || mode == Mode::LevelCLlkDirectFwSkipCbInit;
+}
+
+bool uses_fw_skip_cb_init(Mode mode) {
+    return mode == Mode::LevelCLlkDirectFwSkipCbInit;
 }
 
 bool uses_stream_reg_start_gate(Mode mode) {
@@ -194,7 +229,8 @@ bool uses_stream_reg_start_gate(Mode mode) {
 void print_usage(const char* argv0) {
     fmt::print(
         "Usage: {} [--mode=all|cb|static-runtime|static-compiletime|static-streamreg-cbregs|"
-        "static-streamreg-cbregs-compiletime] [--tiles=N] "
+        "static-streamreg-cbregs-compiletime|level-c-generated-static|level-c-llk-direct|"
+        "level-c-llk-direct-fw-skip-cb-init] [--tiles=N] "
         "[--num-pages=N] "
         "[--repeats=N] [--device-id=N] [--core-x=N] [--core-y=N] "
         "[--core-grid-x=N] [--core-grid-y=N] "
@@ -413,6 +449,9 @@ std::map<std::string, std::string> kernel_defines(
         {"BENCH_USE_COMPILE_TIME_ARGS", uses_compile_time_args(mode) ? "1" : "0"},
         {"BENCH_USE_STREAM_REG_SYNC", uses_stream_reg_sync(mode) ? "1" : "0"},
         {"BENCH_USE_STREAM_REG_CBREGS", uses_stream_reg_cbregs(mode) ? "1" : "0"},
+        {"BENCH_LEVEL_C_GENERATED_STATIC", uses_level_c_generated_static(mode) ? "1" : "0"},
+        {"BENCH_LEVEL_C_LLK_DIRECT", uses_level_c_llk_direct(mode) ? "1" : "0"},
+        {"BENCH_LEVEL_C_FW_SKIP_CB_INIT", uses_fw_skip_cb_init(mode) ? "1" : "0"},
         {"BENCH_ITERATIONS", std::to_string(options.tiles)},
         {"BENCH_START_TILE", "0"},
         {"BENCH_PAGE_SIZE", std::to_string(kTileSizeBytes)},
@@ -448,6 +487,10 @@ void create_circular_buffers(
     const std::shared_ptr<Buffer>& src0_ring_buffer,
     const std::shared_ptr<Buffer>& src1_ring_buffer,
     const std::shared_ptr<Buffer>& dst_ring_buffer) {
+    if (uses_fw_skip_cb_init(mode)) {
+        return;
+    }
+
     const uint32_t cb_size = options.num_pages * kTileSizeBytes;
     auto make_cb_config = [&](CBIndex cb_index, const std::shared_ptr<Buffer>& static_ring_buffer) {
         auto config =

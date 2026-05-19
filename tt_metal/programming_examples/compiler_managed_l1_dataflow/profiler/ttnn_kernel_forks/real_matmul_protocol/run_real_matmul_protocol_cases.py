@@ -44,6 +44,8 @@ def parse_args():
             "static-input-only-cbregs-compiletime",
             "static-output-only-cbregs-compiletime",
             "static-input-output-cbregs-compiletime",
+            "level-c-llk-direct",
+            "level-c-llk-direct-fw-skip-cb-init",
         ],
         choices=[
             "profiled-cb",
@@ -56,6 +58,8 @@ def parse_args():
             "static-input-only-cbregs-compiletime",
             "static-output-only-cbregs-compiletime",
             "static-input-output-cbregs-compiletime",
+            "level-c-llk-direct",
+            "level-c-llk-direct-fw-skip-cb-init",
         ],
     )
     parser.add_argument("--skip-check", action="store_true")
@@ -141,6 +145,8 @@ def build_comparisons(critical_rows):
             "static-input-only-cbregs-compiletime",
             "static-output-only-cbregs-compiletime",
             "static-input-output-cbregs-compiletime",
+            "level-c-llk-direct",
+            "level-c-llk-direct-fw-skip-cb-init",
         ]:
             if static_mode not in modes:
                 continue

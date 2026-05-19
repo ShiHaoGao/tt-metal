@@ -12,6 +12,18 @@
 #include "tt-metalium/circular_buffer_constants.h"
 #include "tools/profiler/kernel_profiler.hpp"
 
+#ifdef TRISC_UNPACK
+#include "llk_unpack_AB.h"
+#include "llk_unpack_common.h"
+#endif
+#ifdef TRISC_MATH
+#include "llk_math_common.h"
+#include "llk_math_eltwise_binary.h"
+#endif
+#ifdef TRISC_PACK
+#include "llk_pack.h"
+#endif
+
 #ifndef BENCH_STATIC_PROTOCOL
 #define BENCH_STATIC_PROTOCOL 0
 #endif
@@ -26,6 +38,18 @@
 
 #ifndef BENCH_USE_STREAM_REG_CBREGS
 #define BENCH_USE_STREAM_REG_CBREGS 0
+#endif
+
+#ifndef BENCH_LEVEL_C_GENERATED_STATIC
+#define BENCH_LEVEL_C_GENERATED_STATIC 0
+#endif
+
+#ifndef BENCH_LEVEL_C_LLK_DIRECT
+#define BENCH_LEVEL_C_LLK_DIRECT 0
+#endif
+
+#ifndef BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define BENCH_LEVEL_C_FW_SKIP_CB_INIT 0
 #endif
 
 #ifndef BENCH_TRACE_STATIC_PROTOCOL
@@ -163,6 +187,7 @@ constexpr uint32_t kCbIn1 = tt::CBIndex::c_1;
 constexpr uint32_t kCbOut = tt::CBIndex::c_16;
 constexpr uint32_t kDstReg = 0;
 constexpr uint32_t kOneTile = 1;
+constexpr uint32_t kBfp16Format = static_cast<uint32_t>(DataFormat::Float16_b);
 
 #if BENCH_STATIC_PROTOCOL
 inline void wait_min_local(volatile tt_l1_ptr uint32_t* sem, uint32_t value) {
@@ -223,10 +248,19 @@ inline volatile tt_l1_ptr uint32_t* tensix_store_ptr(volatile tt_reg_ptr uint32_
         ((reinterpret_cast<uint32_t>(reg) >> 2) & 0x3ffff));
 }
 
-inline volatile tt_reg_ptr uint32_t* reg_ptr_from_cb(uint32_t cbid, bool received) {
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
+    return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
+        STREAM_REG_ADDR(
+            OPERAND_START_STREAM + cbid,
+            received ? STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX : STREAM_REMOTE_DEST_BUF_START_REG_INDEX));
+}
+#else
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
     return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
         received ? get_cb_tiles_received_ptr(cbid) : get_cb_tiles_acked_ptr(cbid));
 }
+#endif
 
 inline void publish_after_pack(
     volatile tt_reg_ptr uint32_t* input_consumed_reg,
@@ -255,27 +289,88 @@ inline volatile tt_l1_ptr uint32_t* sem_slot(uint32_t sem_base_addr, uint32_t sl
 }
 
 inline void raw_tile_add_init(uint32_t /*page_size_bytes*/) {
+#if BENCH_LEVEL_C_LLK_DIRECT
+#ifdef TRISC_UNPACK
+    _llk_unpack_hw_configure_<DST_ACCUM_MODE>(
+        kBfp16Format,
+        kBfp16Format,
+        kBfp16Format,
+        kBfp16Format,
+        FACE_R_DIM,
+        FACE_R_DIM,
+        4,
+        4,
+        BENCH_PAGE_SIZE >> CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT,
+        BENCH_PAGE_SIZE >> CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT);
+    _llk_unpack_AB_init_<BroadcastType::NONE>(ckernel::DEFAULT_TENSOR_SHAPE, ckernel::Transpose::None);
+#endif
+#ifdef TRISC_MATH
+    _llk_math_pack_sync_init_<DST_SYNC_MODE, DST_ACCUM_MODE>();
+    _llk_math_hw_configure_<DST_ACCUM_MODE>(kBfp16Format, kBfp16Format);
+    _llk_math_eltwise_binary_init_<EltwiseBinaryType::ELWADD, BroadcastType::NONE, MathFidelity::LoFi>(
+        ckernel::DEFAULT_TENSOR_SHAPE, false);
+#endif
+#ifdef TRISC_PACK
+    _llk_pack_hw_configure_<DST_ACCUM_MODE, PackMode::Default>(
+        kBfp16Format,
+        kBfp16Format,
+        BENCH_PAGE_SIZE >> CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT,
+        FACE_R_DIM,
+        TILE_C_DIM,
+        4,
+        false,
+        0);
+    _llk_pack_init_<PackMode::Default, false, false>(FACE_R_DIM, TILE_C_DIM, 4, 1);
+    _llk_pack_dest_init_<DST_SYNC_MODE, DST_ACCUM_MODE>();
+#endif
+#else
     binary_op_init_common(kCbIn0, kCbIn1, kCbOut);
     add_tiles_init(kCbIn0, kCbIn1);
+#endif
 }
 
 inline uint32_t to_cb_addr(uint32_t l1_addr) {
     return l1_addr >> CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT;
 }
 
+inline uint32_t to_llk_addr(uint32_t l1_addr) {
+    return to_cb_addr(l1_addr) - 1;
+}
+
 inline void static_add_tile(uint32_t src0_l1_addr, uint32_t src1_l1_addr, uint32_t dst_reg) {
+#if BENCH_LEVEL_C_LLK_DIRECT
+#ifdef TRISC_UNPACK
+    _llk_unpack_AB_<BroadcastType::NONE>(to_llk_addr(src0_l1_addr), to_llk_addr(src1_l1_addr));
+#endif
+#ifdef TRISC_MATH
+    _llk_math_eltwise_binary_<
+        EltwiseBinaryType::ELWADD,
+        BroadcastType::NONE,
+        DST_SYNC_MODE,
+        DST_ACCUM_MODE,
+        MathFidelity::LoFi,
+        EltwiseBinaryReuseDestType::NONE>(ckernel::DEFAULT_TENSOR_SHAPE, dst_reg, true);
+#endif
+#else
 #ifdef TRISC_UNPACK
     get_local_cb_interface(kCbIn0).fifo_rd_ptr = to_cb_addr(src0_l1_addr);
     get_local_cb_interface(kCbIn1).fifo_rd_ptr = to_cb_addr(src1_l1_addr);
 #endif
     add_tiles(kCbIn0, kCbIn1, 0, 0, dst_reg);
+#endif
 }
 
 inline void static_pack_tile(uint32_t dst_reg, uint32_t dst_l1_addr) {
+#if BENCH_LEVEL_C_LLK_DIRECT
+#ifdef TRISC_PACK
+    _llk_pack_<DST_SYNC_MODE, DST_ACCUM_MODE, PackMode::Default>(dst_reg, to_llk_addr(dst_l1_addr));
+#endif
+#else
 #ifdef TRISC_PACK
     get_local_cb_interface(kCbOut).fifo_wr_ptr = to_cb_addr(dst_l1_addr);
     get_local_cb_interface(kCbOut).fifo_wr_tile_ptr = 0;
     pack_tile(dst_reg, kCbOut);
+#endif
 #endif
 }
 #endif
@@ -319,12 +414,12 @@ void kernel_main() {
 #if BENCH_USE_STREAM_REG_SYNC
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_STREAM_REG_START_REG_INDEX, BENCH_PROTOCOL_START_VALUE);
 #else
-    volatile tt_reg_ptr uint32_t* input_ready_reg = reg_ptr_from_cb(kCbIn0, true);
-    volatile tt_reg_ptr uint32_t* input1_ready_reg = reg_ptr_from_cb(kCbIn1, true);
-    volatile tt_reg_ptr uint32_t* input_consumed_reg = reg_ptr_from_cb(kCbIn0, false);
-    volatile tt_reg_ptr uint32_t* input1_consumed_reg = reg_ptr_from_cb(kCbIn1, false);
-    volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbOut, true);
-    volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbOut, false);
+    volatile tt_reg_ptr uint32_t* input_ready_reg = protocol_counter_ptr(kCbIn0, true);
+    volatile tt_reg_ptr uint32_t* input1_ready_reg = protocol_counter_ptr(kCbIn1, true);
+    volatile tt_reg_ptr uint32_t* input_consumed_reg = protocol_counter_ptr(kCbIn0, false);
+    volatile tt_reg_ptr uint32_t* input1_consumed_reg = protocol_counter_ptr(kCbIn1, false);
+    volatile tt_reg_ptr uint32_t* output_ready_reg = protocol_counter_ptr(kCbOut, true);
+    volatile tt_reg_ptr uint32_t* output_consumed_reg = protocol_counter_ptr(kCbOut, false);
 
 #if BENCH_USE_STREAM_REG_CBREGS
     wait_equal_stream(BENCH_STREAM_REG_START_STREAM_ID, BENCH_STREAM_REG_START_REG_INDEX, BENCH_PROTOCOL_START_VALUE);
@@ -340,7 +435,31 @@ void kernel_main() {
     DEVICE_PRINT_PACK("rtadd compute pack start value={} pages={}\n", BENCH_PROTOCOL_START_VALUE, num_pages);
 #endif
 
-#if BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_ARGS
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#if defined(TRISC_UNPACK)
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT_COMPUTE_UNPACK");
+#elif defined(TRISC_MATH)
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT_COMPUTE_MATH");
+#elif defined(TRISC_PACK)
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT_COMPUTE_PACK");
+#endif
+#elif BENCH_LEVEL_C_LLK_DIRECT
+#if defined(TRISC_UNPACK)
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_COMPUTE_UNPACK");
+#elif defined(TRISC_MATH)
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_COMPUTE_MATH");
+#elif defined(TRISC_PACK)
+    DeviceZoneScopedN("RTADD_LEVEL_C_LLK_DIRECT_COMPUTE_PACK");
+#endif
+#elif BENCH_LEVEL_C_GENERATED_STATIC
+#if defined(TRISC_UNPACK)
+    DeviceZoneScopedN("RTADD_LEVEL_C_GENERATED_STATIC_COMPUTE_UNPACK");
+#elif defined(TRISC_MATH)
+    DeviceZoneScopedN("RTADD_LEVEL_C_GENERATED_STATIC_COMPUTE_MATH");
+#elif defined(TRISC_PACK)
+    DeviceZoneScopedN("RTADD_LEVEL_C_GENERATED_STATIC_COMPUTE_PACK");
+#endif
+#elif BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_ARGS
 #if defined(TRISC_UNPACK)
     DeviceZoneScopedN("RTADD_STATIC_STREAMREG_CBREGS_COMPILETIME_COMPUTE_UNPACK");
 #elif defined(TRISC_MATH)

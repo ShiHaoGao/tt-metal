@@ -27,6 +27,22 @@
 #define BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS 0
 #endif
 
+#ifndef BENCH_LEVEL_C_LLK_DIRECT
+#define BENCH_LEVEL_C_LLK_DIRECT 0
+#endif
+
+#ifndef BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define BENCH_LEVEL_C_FW_SKIP_CB_INIT 0
+#endif
+
+#ifndef BENCH_SRC0_TILE_BYTES
+#define BENCH_SRC0_TILE_BYTES 0
+#endif
+
+#ifndef BENCH_SRC1_TILE_BYTES
+#define BENCH_SRC1_TILE_BYTES 0
+#endif
+
 #ifndef BENCH_PROTOCOL_START_VALUE
 #define BENCH_PROTOCOL_START_VALUE 1
 #endif
@@ -53,7 +69,11 @@ constexpr uint32_t kCbIn0 = tt::CBIndex::c_0;
 constexpr uint32_t kCbIn1 = tt::CBIndex::c_1;
 constexpr uint32_t kCbOut = tt::CBIndex::c_16;
 
-#if BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+#define RMP_MODE_PREFIX "RMP_REUSE_LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT"
+#elif BENCH_LEVEL_C_LLK_DIRECT
+#define RMP_MODE_PREFIX "RMP_REUSE_LEVEL_C_LLK_DIRECT"
+#elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_STATIC_OUTPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && \
     BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
 #define RMP_MODE_PREFIX "RMP_REUSE_STATIC_INPUT_OUTPUT_CBREGS_COMPILETIME"
 #elif BENCH_STATIC_INPUT_PROTOCOL && BENCH_USE_STREAM_REG_CBREGS && BENCH_USE_COMPILE_TIME_PROTOCOL_ARGS
@@ -96,10 +116,19 @@ inline void set_stream_sync(uint32_t stream_id, uint32_t reg_index, uint32_t val
     asm volatile("fence" ::: "memory");
 }
 
-inline volatile tt_reg_ptr uint32_t* reg_ptr_from_cb(uint32_t cbid, bool received) {
+#if BENCH_LEVEL_C_FW_SKIP_CB_INIT
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
+    return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
+        STREAM_REG_ADDR(
+            OPERAND_START_STREAM + cbid,
+            received ? STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX : STREAM_REMOTE_DEST_BUF_START_REG_INDEX));
+}
+#else
+inline volatile tt_reg_ptr uint32_t* protocol_counter_ptr(uint32_t cbid, bool received) {
     return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(
         received ? get_cb_tiles_received_ptr(cbid) : get_cb_tiles_acked_ptr(cbid));
 }
+#endif
 #endif
 
 }  // namespace
@@ -138,8 +167,10 @@ void kernel_main() {
     uint32_t batch = get_arg_val<uint32_t>(19);
     uint32_t bcast_B = get_arg_val<uint32_t>(20);
 
-    const uint32_t in0_single_tile_size_bytes = get_tile_size(kCbIn0);
-    const uint32_t in1_single_tile_size_bytes = get_tile_size(kCbIn1);
+    const uint32_t in0_single_tile_size_bytes =
+        BENCH_LEVEL_C_FW_SKIP_CB_INIT ? BENCH_SRC0_TILE_BYTES : get_tile_size(kCbIn0);
+    const uint32_t in1_single_tile_size_bytes =
+        BENCH_LEVEL_C_FW_SKIP_CB_INIT ? BENCH_SRC1_TILE_BYTES : get_tile_size(kCbIn1);
 
     constexpr auto s0_args = TensorAccessorArgs<0>();
     const auto s0 = TensorAccessor(s0_args, in0_tensor_addr);
@@ -147,8 +178,8 @@ void kernel_main() {
     const auto s1 = TensorAccessor(s1_args, in1_tensor_addr);
 
 #if BENCH_USE_STREAM_REG_CBREGS && !BENCH_STATIC_INPUT_PROTOCOL
-    volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbOut, true);
-    volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbOut, false);
+    volatile tt_reg_ptr uint32_t* output_ready_reg = protocol_counter_ptr(kCbOut, true);
+    volatile tt_reg_ptr uint32_t* output_consumed_reg = protocol_counter_ptr(kCbOut, false);
     output_ready_reg[0] = 0;
     output_consumed_reg[0] = 0;
     set_stream_sync(BENCH_STREAM_REG_START_STREAM_ID, BENCH_STREAM_REG_START_REG_INDEX, BENCH_PROTOCOL_START_VALUE);
@@ -175,10 +206,10 @@ void kernel_main() {
 #endif
 #endif
 
-    volatile tt_reg_ptr uint32_t* input_ready_reg = reg_ptr_from_cb(kCbIn0, true);
-    volatile tt_reg_ptr uint32_t* input1_ready_reg = reg_ptr_from_cb(kCbIn1, true);
-    volatile tt_reg_ptr uint32_t* input_consumed_reg = reg_ptr_from_cb(kCbIn0, false);
-    volatile tt_reg_ptr uint32_t* input1_consumed_reg = reg_ptr_from_cb(kCbIn1, false);
+    volatile tt_reg_ptr uint32_t* input_ready_reg = protocol_counter_ptr(kCbIn0, true);
+    volatile tt_reg_ptr uint32_t* input1_ready_reg = protocol_counter_ptr(kCbIn1, true);
+    volatile tt_reg_ptr uint32_t* input_consumed_reg = protocol_counter_ptr(kCbIn0, false);
+    volatile tt_reg_ptr uint32_t* input1_consumed_reg = protocol_counter_ptr(kCbIn1, false);
 
 #if BENCH_USE_STREAM_REG_CBREGS
     input_ready_reg[0] = 0;
@@ -186,8 +217,8 @@ void kernel_main() {
     input_consumed_reg[0] = 0;
     input1_consumed_reg[0] = 0;
 #if BENCH_STATIC_OUTPUT_PROTOCOL
-    volatile tt_reg_ptr uint32_t* output_ready_reg = reg_ptr_from_cb(kCbOut, true);
-    volatile tt_reg_ptr uint32_t* output_consumed_reg = reg_ptr_from_cb(kCbOut, false);
+    volatile tt_reg_ptr uint32_t* output_ready_reg = protocol_counter_ptr(kCbOut, true);
+    volatile tt_reg_ptr uint32_t* output_consumed_reg = protocol_counter_ptr(kCbOut, false);
     output_ready_reg[0] = 0;
     output_consumed_reg[0] = 0;
 #endif

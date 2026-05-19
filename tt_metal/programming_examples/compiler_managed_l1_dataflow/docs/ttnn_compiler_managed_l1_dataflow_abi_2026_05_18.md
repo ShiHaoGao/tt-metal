@@ -2,7 +2,7 @@
 
 这是当前 TTNN static-protocol / compiler-managed L1 dataflow ABI 实验的主结论文档。
 
-核心结论：**研究方向成立，但要表述为 compiler / ABI 问题，而不是单个 runtime 优化或局部 CB micro-optimization**。目标不是消灭所有 queue / operand slot / L1 view 这类硬件必需概念，而是把 TT-Metal 的 `TensorAccessor`、`CircularBufferConfig`、`CreateCircularBuffer`、`cb_*` FIFO API、firmware `CBInterface` 初始化和手写 program factory 从 compiler path 中整体替换掉。新的研究对象是 **compiler-managed CB / L1Queue / OperandView**：CB-like 概念仍然存在，但由编译器静态规划和维护，而不是由 TT-Metal runtime CB 维护。
+核心结论：**研究方向成立，但要表述为 compiler / ABI 问题，而不是单个 runtime 优化或局部 CB micro-optimization**。目标不是让用户手动管理 TT-Metal `LocalCBInterface`，也不是在 device code 中换一个 runtime CB struct。目标是把 TT-Metal 的 `TensorAccessor`、`CircularBufferConfig`、`CreateCircularBuffer`、`cb_*` FIFO API、firmware `CBInterface` 初始化和手写 program factory 从 compiler path 中整体替换掉。新的研究对象是 **compiler-time L1Queue / OperandView / Schedule abstraction**：CB-like queue 只存在于编译器 IR 和 lowering 决策中，lowering 后直接生成 L1 地址计算、同步、NoC 和 pack/unpack 所需代码。
 
 本文档现在是 `compiler_managed_l1_dataflow/docs` 下唯一主结论文档。原 `ttnn_operator_family_static_protocol_report_2026_05_18.md` 的横向算子报告、direct profiler 证据、收益/负例解释和下一步 family 优先级已经合并到本文档；后续不再维护第二份结论源。
 
@@ -20,13 +20,16 @@
 | `static-streamreg-cbregs` | **Level B 正式目标**：compute-path per-CB stream-register backend；每个 logical CB 使用自己的 `tiles_received` / `tiles_acked` register，per-core L1 address、work partition 和 shape/config 通过 runtime args 传入。 | 验证在 TT-Metal/LLK CB operand ABI 内替换 queue counter backend，评估真实多核工程路径的收益。 | 仍保留 `CreateCircularBuffer`/CB descriptor/LLK CB operand setup；runtime args 不是当前主要瓶颈。 |
 | `static-streamreg-cbregs-compiletime` | compile-time config ablation / upper bound：在 `static-streamreg-cbregs` 上继续把可 baked 的 queue/layout/config 放进 kernel defines。 | 估计 runtime args/config bake-in 在 TT-Metal/LLK CB ABI 内部还能多省多少。 | 不是 Level B 完成条件；direct TTNN fork 多数只适合 single-core 或 per-core kernel variant。 |
 | `static-input-only-cbregs-compiletime` / `static-output-only-cbregs-compiletime` / `static-input-output-cbregs-compiletime` | `real_matmul_protocol` 专属 compile-time ablation 命名，分别对应 input/output/input+output 三种替换范围。 | 在 matmul reuse 路径里隔离 input queue、output queue 和双端替换的上界效果。 | 当前只在 single-core low-K/GEMV-like 形状上有效，不能 broad promote，也不是全局 Level B 标准。 |
-| `compiler-owned operand/queue descriptor` | Level C：替换 TT-Metal CB/LLK operand ABI，由 compiler descriptor table 提供 operand/queue metadata。 | 判断是否真正绕过 TT-Metal CB 概念。 | 不在本轮实现。 |
+| `level-c-generated-static` | Level C first-proof hook：把 tile-add 的 L1 ring/layout/work partition 当作 compiler-lowered static schedule，用 compile-time constants 和独立 device-profiler zone 在真实 device path 上验证。 | 证明 `AxeTensor/L1Queue/OperandView` 方向可以落到真实 tile-add device path，并与 CB / Level B mode 做同 shape critical-stage 对比。 | 当前仍复用 TT-Metal `CreateCircularBuffer`、firmware `CBInterface` 初始化和 LLK CB-derived operand metadata；不是完整 CB-less / firmware-less Level C。 |
+| `level-c-llk-direct` | Level C LLK direct-address proof：复用 static L1 ring/sync，但 compute kernel 手工展开 raw-address LLK unpack/math/pack 入口，不再通过 `add_tiles()` / `matmul_tiles()` / `pack_tile()` wrapper 推导 operand 地址。 | 先证明 compiler-lowered L1 address 可以直接喂给 LLK 的 unpack/math/pack 组合；add 和 matmul 都有对应 proof hook。 | 当前仍保留 host `CircularBufferConfig`、firmware `CBInterface` 初始化和部分 LLK format/tile metadata bring-up；不是 firmware/launch descriptor 替换。matmul 第一版限 `K=64,num_blocks=1,single-core`。 |
+| `level-c-llk-direct-fw-skip-cb-init` | Level C firmware / launch descriptor gate：沿用 raw-address LLK proof，但 host 不注册 CB，launch descriptor 不设置 local CB mask，firmware 因 descriptor sentinel 跳过 local/remote CB init。 | 证明 experimental path 不再 materialize `CBInterface[]` 作为 operand/queue metadata 事实来源，同时 correctness 和 device critical-stage 对比仍成立。 | 本轮没有新增全局 `DISPATCH_MODE_COMPILER_L1` enum；当前是实验 executable 的 descriptor-empty/sentinel gate。它证明 ownership boundary，但不代表完整 TTNN runtime 已迁移。 |
+| `compiler-owned operand/queue lowering IR` | Level C：替换 TT-Metal CB/LLK operand ABI，由 compiler IR 生成具体地址计算、同步和 operand-view 代码；descriptor 只是 bring-up / runtime-dynamic 字段载体，不是新的 runtime CB object。 | 判断是否真正绕过 TT-Metal CB 概念。 | 不在本轮实现完整 profiler。 |
 
 ## Level 2 Completion Definition
 
 Level B / Level 2 本轮正式定义为：**保留 TT-Metal CB/LLK operand ABI，保留 correctness synchronization，使用 per-CB stream-register counter 替代 compute-path queue counter backend；多核 per-core L1 address、work partition 和 shape/config 默认通过 runtime args 传入。**
 
-本轮只回答一个问题：在 TT-Metal/LLK CB ABI 内部，`static-streamreg-cbregs` 是否能稳定、省得可预测，并足够指导下一步 Level C 的源码级替换。`static-streamreg-cbregs-compiletime` 只回答 runtime args/config bake-in 的上界，不回答 Level C 的问题，即 compiler-owned operand/queue descriptor 能否替换 firmware `CBInterface`、launch `local_cb_mask` 和 LLK 的 CB-derived operand metadata。
+本轮只回答一个问题：在 TT-Metal/LLK CB ABI 内部，`static-streamreg-cbregs` 是否能稳定、省得可预测，并足够指导下一步 Level C 的源码级替换。`static-streamreg-cbregs-compiletime` 只回答 runtime args/config bake-in 的上界，不回答 Level C 的问题，即 compiler-time operand/queue/schedule abstraction 能否 lowering 成不依赖 firmware `CBInterface`、launch `local_cb_mask` 和 LLK CB-derived operand metadata 的具体代码。
 
 Level 2 完成条件：
 
@@ -92,7 +95,7 @@ git push -u origin exp/cb-runtime-vs-static-protocol
 然后比较多个 backend：
 
 - 现有 TT-Metal CB backend。
-- compiler-managed CB on TT-Metal-compatible launch：kernel 不调用 `cb_*`，但 firmware launch 仍可临时提供兼容 descriptor。
+- compiler-generated L1Queue lowering on TT-Metal-compatible launch：kernel 不调用 `cb_*`，queue/schedule 在编译器中规划，lowering 后直接生成 L1 ring 地址、sync 和 operand-view 代码；firmware launch 只允许作为临时 transport/fallback。
 - compiler-owned descriptor-table backend：host / dispatch / firmware 不再通过 TT-Metal `local_cb_mask` 初始化 CB，而加载 compiler descriptor table。
 - LLK-compatible `OperandView` backend：继续复用 LLK 的 pack/unpack/math helper，但 LLK 读取的是 compiler-owned operand metadata。
 - mini-LLK / raw Tensix instruction backend：直接生成 pack/unpack/math 指令或宏，只在 firmware ABI 和 `OperandView` 稳定后推进。
@@ -279,7 +282,7 @@ Level C 的收益假设不是“把 runtime args 全部改成 compile-time defin
 
 2. **减少 generic CB/FIFO steady-state 路径。**
    - Level B 已经绕过一部分 `cb_wait/reserve/push/pop`，但仍保留 CB descriptor 和 LLK CB operand setup。
-   - Level C 如果让 reader/writer/compute 直接读 compiler-owned descriptor，可以减少泛化 pointer/counter 维护、CB id 到 operand metadata 的适配，以及不必要的 queue capability checks。
+   - Level C 如果让 reader/writer/compute 使用 compiler-lowered 地址表达式、sync 和 operand view，可以减少泛化 pointer/counter 维护、CB id 到 operand metadata 的适配，以及不必要的 queue capability checks。
    - 预期首先体现在 memory-bound / simple elementwise 和 writer-bound 小 op 上。
 
 3. **释放 L1 allocation、lifetime 和 bank placement。**
@@ -293,7 +296,7 @@ Level C 的收益假设不是“把 runtime args 全部改成 compile-time defin
 
 5. **减少 host/program-factory/firmware launch 的结构性开销。**
    - 对大 GEMM 这通常不是主因；对 decode step、小 batch、小 tensor、many-op graphs 可能可见。
-   - Level C 目标是 compiler-generated descriptor table，而不是每个 op 手写 CB/TensorAccessor/program factory。
+   - Level C 目标是 compiler-generated L1Queue/OperandView lowering；descriptor table 只承载 runtime-dynamic 字段或 bring-up 验证，不是新的 device runtime CB struct。
 
 按当前 Level B 数据，Level C 首批收益假设如下：
 
@@ -306,7 +309,7 @@ Level C 的收益假设不是“把 runtime args 全部改成 compile-time defin
 | matmul reuse | 不作为首批收益目标。 | reuse/compute/writeback 掩盖 queue-only 收益，Level B mixed。 |
 | pure copy L1 semaphore static-runtime | 作为负例保留。 | 说明错误的 sync storage/backend 可能比 TT-Metal CB 更慢。 |
 
-因此 Level C 的首要 thesis 是：**收益来自 compiler 拥有 operand descriptor、queue state、L1 lifetime 和 schedule，而不是来自把 per-core 参数全部编译期常量化。**
+因此 Level C 的首要 thesis 是：**收益来自 compiler 拥有 operand view、queue topology、L1 lifetime 和 schedule，并把它们 lowering 成具体代码；不是来自把 per-core 参数全部编译期常量化，也不是来自用户手动维护 `LocalCBInterface`。**
 
 ## Level C ABI 依赖路线图
 
@@ -315,10 +318,10 @@ Level C 的收益假设不是“把 runtime args 全部改成 compile-time defin
 | Phase | 目标 | 关键产物 | 当前状态 |
 |---|---|---|---|
 | Phase 0: Evidence baseline | 保留 CB/runtime/static 基线，区分 protocol-bound 与非 protocol-bound family。 | `cb_protocol_overhead`、`real_copy_protocol`、`real_tile_add_protocol`、TTNN fork sweeps。 | 已足够指导后续替换顺序。 |
-| Phase 1: Compiler IR and descriptor schema | 定义不含 TT-Metal CB/TensorAccessor 语义的 compiler IR。 | `CompilerCBDescriptor`、`OperandViewDescriptor`、`TensorLayoutDescriptor`、`QueueSyncDescriptor`。 | 需要从当前实验约束中固化字段。 |
+| Phase 1: Compiler IR and descriptor schema | 定义不含 TT-Metal CB/TensorAccessor 语义的 compiler IR，并区分 IR 与后续 lowering/ABI descriptor。 | `AxeTensor`、`AxeStorage`、`AxeLayout`、`AxeIter`；以及 lowering descriptor：`L1QueueDescriptor`、`OperandViewDescriptor`、`TensorLayoutDescriptor`、`QueueSyncDescriptor`。 | `level_c_ir.hpp` 是 compiler IR，可用 `std::vector` / `std::string`；`level_c_lowering_descriptors.hpp` 是后续 lowering / dynamic-field carrier，不是 runtime CB object。 |
 | Phase 2: Host and launch descriptor replacement | 替换 `CreateCircularBuffer` / `CircularBufferConfig` / `TensorAccessorArgs` / `local_cb_mask`。 | compiler descriptor table、per-core L1 allocation table、launch descriptor extension 或 side-table。 | 尚未进入；应优先于 mini-LLK。 |
-| Phase 3: Firmware descriptor loader | firmware 加载 compiler descriptor table，不再走 TT-Metal CB 初始化路径。 | `compiler_cb_interface` 或 `operand_view_table` loader；跳过 `setup_local_cb_read_write_interfaces` 的实验路径。 | 尚未进入；这是判断“是否真正绕过 TT-Metal CB”的边界。 |
-| Phase 4: Kernel dataflow CompilerCB backend | kernel 不调用 `cb_*`，由 compiler 生成 queue acquire/release、NoC、L1 pointer、sync。 | `compiler_cb_wait/acquire/release` 或直接展开的 generated code。 | 现有 static protocol fork 是局部原型。 |
+| Phase 3: Firmware metadata transport | firmware 搬运/暴露 compiler lowering 所需 metadata，不再走 TT-Metal CB 初始化路径。 | `operand_view_table` / lowering metadata loader；跳过 `setup_local_cb_read_write_interfaces` 的实验路径。 | 尚未进入；这是判断“是否真正绕过 TT-Metal CB”的边界。 |
+| Phase 4: Kernel L1Queue codegen backend | kernel 不调用 `cb_*`，由 compiler 直接生成 queue acquire/release、NoC、L1 pointer、sync。 | 直接展开的 generated code；静态 schedule 下生成 slot/address expression。 | 现有 static protocol fork 是局部原型。 |
 | Phase 5: LLK-compatible OperandView backend | 继续复用 LLK，但 LLK 看到的是 compiler-owned operand metadata，不是 TT-Metal CB state。 | `OperandView -> LLK operand setup` 兼容层。 | 尚未进入；这是从 CB descriptor 解耦 compute 的主路径。 |
 | Phase 6: Operator-family migration | 按 family 迁移真实 op，建立 backend selection policy。 | elementwise、layout、KV cache、softmax、reduction、matmul/CCL 的 direct forks。 | Level B operator-family evidence 已给出优先级。 |
 | Phase 7: mini-LLK / raw Tensix backend | 对少数核心 op 绕过 LLK，直接生成 Tensix 指令/MOP/config。 | raw pack/unpack/math codegen；Tensix instruction schedule。 | 只应在 Phase 3/5 稳定后推进。 |
@@ -352,7 +355,7 @@ tt_metal/api/tt-metalium/circular_buffer_constants.h
 
 - `local_cb_mask` 不是 descriptor 本体，它只是告诉 firmware 哪些 CB slot 需要初始化。
 - descriptor 本体在每个 core 的 kernel config L1 区中。
-- 当前 descriptor schema 以 TT-Metal CB 为中心，compiler-owned descriptor table 需要从这里开始替换或 side-load。
+- 当前 launch schema 以 TT-Metal CB 为中心，compiler-owned lowering metadata 需要从这里开始替换或 side-load。
 
 ### Firmware materialization 链路
 
@@ -428,30 +431,167 @@ tt_metal/programming_examples/compiler_managed_l1_dataflow/suite
 
 下面 Phase 1-7 是设计约束说明，不是新的执行顺序；执行顺序见 `Level C Kickoff Plan`。
 
-### Phase 1: descriptor schema
+### Phase 1: compiler IR 与 lowering descriptor 分层
 
-最低需要三类 descriptor：
+当前 prototype header 已拆成两层：
 
 ```text
-TensorLayoutDescriptor:
-  memory_space, base_addr, page_size, shard_map, bank_map, strides, shape, dtype
+tt_metal/programming_examples/compiler_managed_l1_dataflow/include/level_c_ir.hpp
+tt_metal/programming_examples/compiler_managed_l1_dataflow/include/level_c_lowering_descriptors.hpp
+```
 
-CompilerCBDescriptor:
-  l1_base, total_size, slot_count, page_size, bank_policy,
-  producer_thread, consumer_thread, sync_kind, produced_addr, consumed_addr,
-  static_schedule_id, lifetime_start, lifetime_end
+当前要先区分两层：`AxeTensor` / `AxeLayout` 是 compiler IR，表达 tensor view 和 layout algebra 本体；`TensorLayoutDescriptor`、`L1QueueDescriptor`、`OperandViewDescriptor`、`QueueSyncDescriptor` 和 `DescriptorTableHeader` 是后续 lowering / runtime-dynamic field carrier，不是 device-side runtime CB object。
+
+```text
+AxeTensor:
+  name, element_type,
+  storage: AxeStorage{
+    name, kind, memory_space, ownership,
+    size_bytes, base_address, root_storage_name, device_scope
+  },
+  layout: AxeLayout
+
+AxeStorage:
+  kind: owned_device_allocation | owned_mesh_allocation |
+        borrowed_host_storage | borrowed_device_address |
+        view_of_storage | register_fragment
+  ownership: owned | borrowed | view | temporary
+
+AxeLayout:
+  d_iters: vector<AxeIter{extent, stride, axis=AxeAxis{name, kind}}>
+  r_iters: vector<AxeIter{extent, stride, axis=AxeAxis{name, kind}}>
+  o_entries: vector<AxeCoordinateEntry{value, axis=AxeAxis{name, kind}}>
+
+TensorLayoutDescriptor:
+  schema_version, memory_space, address_policy, data_format,
+  base_addr, page_size_bytes, page_count,
+  logical_shape(rank, dims[4]), physical_shape(rank, dims[4]),
+  stride_pages[4],
+  shard_map_index, bank_map_index
+
+QueueSyncDescriptor:
+  schema_version, sync_kind, producer, consumer,
+  produced_addr, consumed_addr,
+  produced_stream_reg, consumed_stream_reg,
+  static_schedule_id, initial_produced, initial_consumed
+
+L1QueueDescriptor:
+  schema_version, l1_base_addr, total_size_bytes, slot_count,
+  page_size_bytes, bank_policy, bank_map_index, sync_descriptor_index,
+  lifetime_start_step, lifetime_end_step, flags
 
 OperandViewDescriptor:
-  operand_id, l1_base, tile_shape, data_format, page_size,
-  read_stride, write_stride, pack_unpack_role, queue_ref
+  schema_version, operand_id, operand_role, pack_unpack_role,
+  data_format, tile_shape, page_size_bytes,
+  queue_descriptor_index, tensor_layout_index,
+  l1_base_addr, read_stride_pages, write_stride_pages,
+  tiles_per_page, flags
+
+DescriptorTableHeader:
+  schema_version, tensor_layout_count, queue_sync_count,
+  l1_queue_count, operand_view_count,
+  tensor_layout_offset_bytes, queue_sync_offset_bytes,
+  l1_queue_offset_bytes, operand_view_offset_bytes,
+  total_size_bytes
 ```
 
 设计规则：
 
 - IR 中不能出现 TT-Metal `CBIndex`、`TensorAccessorArgs` 或 `CircularBufferConfig`。
+- `AxeTensor` 不单独保存 `logical_shape`。layout 是 tensor domain 和 mapping 的唯一事实源：`D` 中 iter 的 extent 表达可访问 domain，stride/axis 表达坐标映射，`R` 表达 replica，`O` 表达 fixed coordinate offset。
+- `AxeTensor` 必须有明确的 `AxeStorage`，不能是没有 storage engine 的悬空 tensor。这个 storage 可以在编译早期是 symbolic storage；`base_address=0` 表示尚未物理分配，但 kind、memory space、ownership、root/view/device scope 等资源语义仍然明确，后续再 lowering 到 L1/DRAM/base address/queue slot。
 - `operand_id` 可以存在，但它是硬件 operand selector，不是 TT-Metal CB id。
 - `queue_ref` 可以 lowering 到 compiler counter、stream register、static ordering 或 fallback TT-Metal CB。
+- 参照 CuTe 的 `Tensor = Engine + Layout` 和 MLIR `memref` 的分层方式，compiler semantic type 可以表达 element type、storage、layout、memory space 和 schedule 约束；真实生成代码不应依赖 `ShapeDescriptor` 这个 C++ 类型。
+- `ShapeDescriptor{rank, dims[4]}` 只是 Phase 1 descriptor-table bring-up 的 lowered metadata carrier，用来承载 lowering 后仍需要运行时传递的 shape 字段；如果某个 shape/layout 已经静态确定，应被折叠成常量地址表达式、loop bounds 或 compile-time schedule。
+- 固定上限仍保留为 4 维，维度不命名为 `n/c/h/w`，避免把 NCHW 或某一种布局语义写进 descriptor ABI。host / TTNN 层可以继续使用已有 `tt::tt_metal::Shape` 或未来 MLIR-like 类型，lowering 到 descriptor-table backend 时再转换成固定上限数组。
+- `page_size_bytes` / `page_count` / `stride_pages` 描述的是物理存储单位和地址步进，不是 tensor 维度本身；如果采用 Axe 风格的统一 layout，这一层可以直接看成 block/atom 级 layout 的一个实现细节。它们存在的原因是 lowering 后需要生成可执行的 L1 地址算式、ring slot 算式和布局访问算式，而不是因为我们必须把 page 当成独立语义层。
+- `AxeLayout` 直接按 Axe 论文 Figure 1 建模：`AxeIter = (extent, stride, axis)` 是显式 IR 类型，`D` 是 ordered list of iters，`R` 是 replication iters 的 set，`O` 是一个 fixed coordinate offset。CuTe/CUTLASS 的 `Shape + Stride` 只说明单个 iter 的 extent/stride 地址含义，不再作为顶层 layout IR 形状。
+- 因为 `AxeTensor` / `AxeLayout` 是 compiler IR，不是 device ABI descriptor，所以不需要 `schema_version`、`d_iter_count`、`r_iter_count`、`o_count` 或固定容量数组；`AxeLayout` 顶层直接是 `d_iters`、`r_iters`、`o_entries` 三个 vector。`o_entries` 表达单个 coordinate `O` 的稀疏 axis-value entries；未出现的 axis 默认 offset 为 0，它不是多个 offset。只有进入序列化、kernel config 或跨 host/device ABI 时，才需要另行定义固定数组和 count。
+- `AxeAxis` 是独立的 compiler IR 对象，不只是 enum 包装。`name` 表达轴身份，可以区分 `row_outer` / `row_inner` / `tile_row` 这类不同轴；`kind` 只是 TT-Metal lowering 需要的分类 hint。shard、replica、offset 的语义分别来自 iter 所在的 `D`、`R`、`O` 容器，而不是来自 axis 内部的 role。
+- tile、face、page、block、stick 不应成为互相平行的特殊 layout 字段；它们应被看成嵌套 layout mode 和 named axis。当前 `TensorLayoutDescriptor` 保留 page 字段，是为了兼容 lowering 后的 TT-Metal allocator / TensorAccessor 风格地址算式，不是因为 page 必须作为独立 compiler IR 概念长期存在。
+- `block_size_bytes`、`atom_size_bytes`、`tile_height`、`tile_width`、`face_height`、`face_width`、`buffer_layout` 这类字段已经从 layout algebra 中移除。它们要么能由 mode extent/stride 推导，要么属于 TT-Metal lowering/backend policy，不应污染统一 layout 类型。
+- `TensorLayout`、`PageConfig`、`Tile`、`ShardSpec`、`ShardSpecBuffer`、`BufferShardingArgs`、`NdShardSpec`、`MeshBuffer`、`TensorAccessorArgs` 这些现有概念可以映射到统一 layout algebra；`Buffer` / `MeshBuffer` / `Tensor` 的 allocation、ownership、lifetime、device visibility、view/root 和 API interop 语义则映射到 `AxeStorage` 这层 CuTe-style storage engine。
+- 因此，“一网打尽”的正确边界更新为：`AxeLayout` 统一 logical index 到 physical address / bank / core / mesh / tile / face 的 mapping 语义；`AxeStorage` 统一 resource/storage engine 语义；`AxeTensor` 统一承载 element type、storage 和 layout。当前 proof 不等价于 TTNN public API 已经迁移或删除。
 - descriptor 必须能表达 dataflow-only、compute input、compute output、remote/multicast 四类路径。
+- 后续要下发到 device 的 lowering descriptor 必须是 POD/trivially-copyable，不能依赖 `std::vector`、`std::string`、TT-Metal host object 或 device 不可解释的 C++ runtime state；但 compiler IR 层的 `AxeTensor` / `AxeLayout` 可以使用 `std::vector` 和 `std::string`。
+- Level C generated code 中不应出现 `LocalCBInterface`、`CBInterface[]`、`get_local_cb_interface()`、`cb_wait_front()`、`cb_reserve_back()`、`cb_push_back()`、`cb_pop_front()`、CB API 形式的 `get_read_ptr()` / `get_write_ptr()`。
+
+### Phase 1.5: layout algebra coverage sanity
+
+当前新增的可执行 proof target：
+
+```text
+tt_metal/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_axe_layout_coverage_sanity.cpp
+tt_metal/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_tt_metal_layout_adapter_sanity.cpp
+```
+
+它们不是性能实验，而是 coverage sanity：第一层把 tech report 和当前类型系统里最核心的 layout family 都落到同一个 `AxeLayout` 上，并检查每个 case 至少具备对应的 named axis、`D` iter、`R` iter 或 `O` offset 信息；第二层模拟 TT-Metal / TTNN 真实类型的语义输入，证明这些输入可以经 adapter 生成 `AxeTensor + AxeStorage + AxeLayout`，并对关键地址/placement 公式和资源语义做等价检查。
+
+覆盖项：
+
+| TT-Metal 概念 | Axe-like 表达 |
+|---|---|
+| row-major | `D=[(64,64,row),(64,1,col)]` |
+| tiled layout | `D=[tile_row,tile_col,face_row,face_col]`，每个 iter 携带自己的 extent/stride |
+| face order / tile atom | `D` 中嵌套 `tile_*` + `face_*` iter；atom size 由 nested extent/stride 推导，不再是字段 |
+| interleaved memory | `D` 中同时出现 `storage` 和 `bank` iter，表达 physical placement |
+| height sharding | `D` 中出现 `core_y` shard placement iter，local `height/width` 仍是普通 iter |
+| width sharding | `D` 中出现 `core_x` shard placement iter，local `height/width` 仍是普通 iter |
+| block sharding | `D` 中出现 `core_y/core_x` placement iter，local block `height/width` 仍是普通 iter |
+| ND sharding | `D` 中组合多个 logical axis、`core_x/core_y` placement axis 和 `storage` axis |
+| mesh replicated | `D=[row,col]`，`R=[mesh_x,mesh_y]` |
+| mesh sharded | `D` 中包含 `mesh_x/mesh_y` placement iter |
+| TensorAccessor 地址表达 | 从统一 layout 的 `D + O` 生成 `base + offset + index * stride` 类地址算式 |
+
+TT-Metal adapter proof 覆盖项：
+
+| TT-Metal / TTNN 类型或语义 | Proof 中的 adapter 结论 |
+|---|---|
+| `TensorLayout + RowMajorPageConfig` | `AxeTensor` 持有确定 storage，`AxeLayout D=[row,col]`，row-major offset 与 `row * width + col` 等价。 |
+| `TensorLayout + TilePageConfig + Tile` | tile、face、face 内坐标都表达为 named axes；`transpose_tile=true` 通过不同 stride 表达 face/value 转置，不需要额外特殊字段。 |
+| `MemoryConfig(INTERLEAVED, DRAM/L1)` / `InterleavedAddrGen` | storage 落到 `AxeStorage.memory_space`，page 到 bank 的 round-robin 和 bank-local page offset 由 `bank` / `bank_page` axes 表达。 |
+| `TensorMemoryLayout::HEIGHT_SHARDED + ShardSpecBuffer` | core placement 用 `core_y/core_x` axes 表达，local shard page 用 `local_page_row/local_page_col` 表达；page->core/page_offset 与现有 height sharded addrgen 公式等价。 |
+| `TensorMemoryLayout::WIDTH_SHARDED + ShardSpecBuffer` | width-fractured placement 用 `core_x/core_y` 和 local page axes 表达；page->core/page_offset 与 width sharded addrgen 公式等价。 |
+| `TensorMemoryLayout::BLOCK_SHARDED + ShardSpecBuffer` | 2D block placement 用 `core_y/core_x` + local block axes 表达；page->core/page_offset 与 block sharded addrgen 公式等价。 |
+| `TensorMemoryLayout::ND_SHARDED + NdShardSpec` | 每个 sharded dimension 拆成 `shard_dim_i` 和 `local_dim_i`；round-robin bank distribution 用 `bank` / `bank_shard` axes 表达，覆盖 regular、uneven distribution 和 single-dimension sharding。 |
+| `MeshBuffer` replicated | device mesh replication 落到 `R=[mesh_x, mesh_y]`。 |
+| `MeshBuffer` sharded | mesh placement 落到 `D` 中的 `mesh_x/mesh_y` axes。 |
+| `Buffer::view` / padded-slice offset | fixed base/view offset 落到单个 `O` 的 sparse coordinate entries。 |
+| `Buffer` owned allocation | owned device allocation 落到 `AxeStorage{kind=owned_device_allocation, ownership=owned, memory_space, base_address, device_scope}`。 |
+| `Buffer::view` ownership | view/root lifetime 语义落到 `AxeStorage{kind=view_of_storage, ownership=view, root_storage_name}`。 |
+| `MeshBuffer` owned allocation | mesh backing allocation 和 mesh scope 落到 `AxeStorage{kind=owned_mesh_allocation, ownership=owned, device_scope="mesh[...]"} `。 |
+| `HostTensor` / borrowed data | host-side borrowed storage 落到 `AxeStorage{kind=borrowed_host_storage, ownership=borrowed, memory_space=system_memory}`。 |
+| externally owned device address | 外部 L1/DRAM address 落到 `AxeStorage{kind=borrowed_device_address, ownership=borrowed, base_address}`。 |
+| register fragment | 临时 compute fragment 落到 `AxeStorage{kind=register_fragment, ownership=temporary, memory_space=register_file}`。 |
+
+当前 proof 输出 layout 和 resource 两类计数：`layout_covered_cases=14`，`resource_covered_cases=6`，`covered_cases=20`。这证明的是“layout mapping + storage/resource engine 语义可表达”，不是证明当前 TT-Metal 源码已经迁移，也不是证明 TTNN public API 类型已经删除。
+
+这证明的是“表达能力覆盖”，不是证明当前 TT-Metal 代码已经重构完成。真正迁移时应先把现有 `TensorAccessorArgs` / sharding helper 变成 `AxeLayout` adapter，再逐步让 kernel lowering 从统一 layout 直接生成地址表达式。
+
+### Phase 1.75: lowering adapter 与 CB 建模 sanity
+
+当前新增的 lowering adapter proof target：
+
+```text
+tt_metal/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_lowering_adapter_sanity.cpp
+tt_metal/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_tile_add_codegen_sanity.cpp
+```
+
+这一步证明的是：CB 可以在 compiler IR 中拆成几件独立职责，而不是作为 `LocalCBInterface` runtime object 继续存在：
+
+| 原 CB / TensorAccessor 职责 | Level C 表达 |
+|---|---|
+| L1 payload storage | `AxeStorage{memory_space=l1, base_address, size_bytes}` + `AxeLayout D=[ring_slot, byte]` |
+| queue/ring 容量和 slot 地址 | `L1QueueDescriptor{l1_base_addr, slot_count, page_size_bytes}` |
+| producer/consumer 同步 | `QueueSyncDescriptor{sync_kind=stream_register_pair/static_schedule/...}` |
+| compute operand selector 和 pack/unpack 角色 | `OperandViewDescriptor{operand_id, operand_role, pack_unpack_role, data_format, tile_shape}` |
+| DRAM tensor page 地址 | `AxeTensor` + `TensorLayoutDescriptor{base_addr, page_size_bytes, page_count}` |
+| view/root offset | `AxeStorage{kind=view_of_storage, root_storage_name}` + `AxeLayout O` |
+
+`level_c_lowering_adapter_sanity` 的当前输出为 `lowering_adapter_cases=7`，覆盖 CB payload、CB sync、CB operand、Axe ring address evaluator、TensorAccessor DRAM address、Buffer view offset 和 generated pseudo-code no-runtime-CB-token 检查。`level_c_tile_add_codegen_sanity` 进一步证明 tile-add 的 ring schedule 可以从 descriptor 生成等价地址序列，例如 tile 0/2 复用 slot 0，tile 1/3 复用 slot 1。
+
+这一步仍是 host-side / codegen sanity，不是 device profiler proof。它的意义是把“CB 能否建模出来”回答清楚：**能建模，但要建模成 storage + layout + queue + sync + operand view + schedule，而不是建模成新的 runtime CB 结构体。**
 
 ### Phase 2: host / dispatch 替换
 
@@ -464,7 +604,7 @@ OperandViewDescriptor:
 
 替代方案：
 
-- compiler 先完成 per-core L1 allocation，并生成 `CompilerCBDescriptor[]`。
+- compiler 先完成 per-core L1 allocation，并生成 `L1QueueDescriptor[]` 或直接生成等价 lowering code。
 - compiler 生成 tensor layout / bank mapping，不再让 kernel 用 `TensorAccessor` 动态解释布局。
 - dispatch 只负责把 descriptor table 放到每个 core 可见的 L1/config 区域。
 - launch descriptor 中增加或 side-load `compiler_descriptor_offset`、`compiler_descriptor_count`、`operand_view_offset`。
@@ -473,7 +613,7 @@ OperandViewDescriptor:
 
 - 一个 unary/binary elementwise op 的 host path 不再创建 TT-Metal CB。
 - `local_cb_mask` 可以为 0，或者只用于 legacy fallback。
-- kernel 仍能通过 compiler descriptor 完成读、算、写。
+- kernel 仍能通过 compiler lowering metadata 或已经展开的 codegen 完成读、算、写。
 
 ### Phase 3: firmware descriptor loader
 
@@ -483,15 +623,15 @@ OperandViewDescriptor:
 
 - 新增 experimental launch mode，例如 `DISPATCH_MODE_COMPILER_L1`。
 - firmware 检测该 mode 后跳过 `setup_local_cb_read_write_interfaces` / `setup_remote_cb_interfaces`。
-- firmware 加载 compiler descriptor table，初始化 compiler-owned operand view / queue state。
+- firmware 只加载或搬运 compiler lowering 所需的 runtime-dynamic metadata；不初始化新的 runtime CB object。
 - 对 legacy TT-Metal program 保持原路径，不破坏现有 op。
 
 最小实验：
 
 1. 单 core unary/binary elementwise，不使用 remote CB。
 2. `local_cb_mask=0` 或 descriptor-only sentinel。
-3. firmware 只初始化 `OperandViewDescriptor` 所需 metadata。
-4. kernel 通过 compiler descriptor 获取 L1 base/page size/format/sync。
+3. firmware 只暴露 `OperandViewDescriptor` 等 lowering metadata 所需的 runtime-dynamic 字段。
+4. kernel 通过 compiler lowering metadata 或已经展开的 generated code 获取 L1 base/page size/format/sync。
 
 验收标准：
 
@@ -499,13 +639,13 @@ OperandViewDescriptor:
 - kernel correctness 通过。
 - device critical path 可与 legacy CB、kernel-only static protocol 对比。
 
-### Phase 4: kernel CompilerCB backend
+### Phase 4: kernel L1Queue codegen backend
 
 目标是让 generated kernel 不出现 TT-Metal dataflow API：
 
 - 不调用 `cb_reserve_back` / `cb_wait_front` / `cb_push_back` / `cb_pop_front`。
 - 不调用 `get_read_ptr` / `get_write_ptr` / `get_tile_size` 获取 TT-Metal CB state。
-- reader/writer/compute 使用 compiler descriptor 中的 L1 地址、page size 和 sync state。
+- reader/writer/compute 使用 compiler lowering 后的 L1 地址表达式、page size 和 sync code。
 
 backend 变体：
 
@@ -648,6 +788,232 @@ compile-time 上界消融输出记录在：
 - 可以作为第二批候选：broadcast 和 layout/transpose 弱正例；它们需要按 shape 和 critical stage 继续分开判断。
 - 暂不进入 Level C 首批：matmul reuse、pure copy L1 semaphore static runtime、SFPU-heavy 噪声区间路径。
 - Level C 修改源码时应优先替换 compiler/firmware/launch descriptor 中的 TT-Metal CB dependency，而不是追求把 runtime args 全部 bake 成 compile-time defines。
+
+## Level C First Proof: Tile Add
+
+当前第一条真实 device proof 不是完整 CB-less kernel，而是 `real_tile_add_protocol` 中新增的 `level-c-generated-static` mode。它的作用是把 Level C IR/lowering 方向落到一个真实可运行的 tile-add device path 上，并保留独立 profiler zone，便于与 `cb` 和 Level B `static-streamreg-cbregs` 做同 shape device critical-stage 对比。
+
+复现命令：
+
+```bash
+conda run -n tt cmake --build build_Release \
+  --target compiler_managed_l1_dataflow_level_c_examples real_tile_add_protocol -j8
+
+build_Release/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_descriptor_schema_sanity
+build_Release/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_axe_layout_coverage_sanity
+build_Release/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_tt_metal_layout_adapter_sanity
+build_Release/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_lowering_adapter_sanity
+build_Release/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_tile_add_codegen_sanity
+
+TT_METAL_DEVICE_PROFILER=0 TT_METAL_CACHE=/tmp/rtadd_level_c_generated_static_smoke \
+  conda run -n tt \
+  build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/real_tile_add_protocol \
+  --mode=level-c-generated-static --tiles=4 --num-pages=2 --repeats=1 --device-id=0
+
+conda run -n tt python \
+  tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/compute_pipeline/real_tile_add_protocol/run_real_tile_add_protocol_cases.py \
+  --out-dir /tmp/level_c_tile_add_first_proof_2026_05_19 \
+  --tiles 256 \
+  --num-pages 2 \
+  --repeats 1 \
+  --modes cb static-streamreg-cbregs level-c-generated-static
+```
+
+本轮验证结果：
+
+| Check | 结果 |
+|---|---|
+| `level_c_descriptor_schema_sanity` | pass；示例 descriptor table `280 bytes`。 |
+| `level_c_axe_layout_coverage_sanity` | pass；row-major、tile/face、interleaved、height/width/block/ND sharding、mesh replicated/sharded、offset view、TensorAccessor-style address 全部 covered。 |
+| `level_c_tt_metal_layout_adapter_sanity` | pass；`layout_covered_cases=14`，`resource_covered_cases=6`，`covered_cases=20`。 |
+| `level_c_lowering_adapter_sanity` | pass；`lowering_adapter_cases=7`。 |
+| `level_c_tile_add_codegen_sanity` | pass；tile 0/2 复用 slot 0，tile 1/3 复用 slot 1。 |
+| `real_tile_add_protocol --mode=level-c-generated-static --tiles=4` | pass；`max_abs_error=0`。 |
+
+Device-profiler first proof：
+
+| Mode | Critical stage | Critical cycles | Delta vs CB | Delta / tile | Speedup vs CB |
+|---|---|---:|---:|---:|---:|
+| `cb` | writer | 283809 | 0 | 0 | 1.000x |
+| `static-streamreg-cbregs` | writer | 159605 | 124204 | 485.17 | 1.778x |
+| `level-c-generated-static` | writer | 150432 | 133377 | 521.00 | 1.887x |
+
+结论边界：
+
+- 这条 proof 证明 `AxeTensor/AxeLayout/AxeStorage -> lowering descriptor/address expression -> real tile-add device path` 的第一段链路可行。
+- 它也证明真实 device profiler 能识别 `RTADD_LEVEL_C_GENERATED_STATIC_*` zones，并能按 critical stage 与 CB / Level B 对比。
+- 它没有证明 firmware 已经跳过 `CBInterface` 初始化，也没有证明 LLK operand metadata 已经摆脱 `get_local_cb_interface(cbid)`。当前 compute helper 仍通过 `add_tiles(kCbIn0,kCbIn1,...)` 和 `pack_tile(...,kCbOut)` 复用 LLK 的 CB-derived operand ABI。
+- 因此当前 Level C 进展应描述为 **IR/lowering/真实 device first-proof 已打通**，而不是完整 Level C ABI 已实现。
+
+## Level C LLK Direct-Address Proof: Add + Matmul
+
+用户提出 add 例子过于简单，因此本轮把 proof 扩展到 `real_matmul_protocol`。这个扩展不是复制 `programming_examples/matmul` 的教学 target，而是在现有 TTNN-style matmul profiler fork 中加入同类 Level C hook：它复用 `matmul_common/bmm_op.hpp` 的 blocking 和 `bmm_large_block_zm` compute 结构，同时保留 reader/writer/profiler/analyzer 的真实协议实验环境。
+
+新增模式：
+
+- `real_tile_add_protocol --mode=level-c-llk-direct`：手工展开 `_llk_unpack_AB_`、`_llk_math_eltwise_binary_`、`_llk_pack_`。
+- `real_matmul_protocol --mode=level-c-llk-direct`：手工展开 `_llk_unpack_AB_matmul_`、`_llk_math_matmul_`、`_llk_pack_`。
+
+关键设计：
+
+- static input/output L1 ring、per-CB stream-register counter 和 writer/reader 同步逻辑沿用 Level B `static-streamreg-cbregs`。
+- compute kernel 不再通过高层 compute API wrapper 推导当前 tile 地址；raw LLK 入口直接接收 compiler-lowered L1 地址表达式。
+- raw LLK 地址遵循现有 TT-Metal wrapper 的 Tensix 约定：传入 `(l1_addr >> CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT) - 1`，tile size 传入 16B word count，而不是 byte count。
+- matmul 第一版限制为 `K=64` / `num_blocks=1` / single-core active shape。原因是 `K>64` 会进入 partial-sum spill/reload，需要继续展开 `copy_tile(kCbInterm)` 等价 LLK 路径；如果第一步把 reload 也混入，无法分清主 matmul unpack/math/pack 是否已经可行。
+
+复现命令：
+
+```bash
+conda run -n tt cmake --build build_Release \
+  --target real_tile_add_protocol real_matmul_protocol -j8
+
+TT_METAL_DEVICE_PROFILER=0 TT_METAL_CACHE=/tmp/rtadd_level_c_llk_direct_smoke \
+  conda run -n tt \
+  build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/real_tile_add_protocol \
+  --mode=level-c-llk-direct --tiles=4 --num-pages=2 --repeats=1 --device-id=0
+
+TT_METAL_DEVICE_PROFILER=0 TT_METAL_CACHE=/tmp/rmp_level_c_llk_direct_smoke \
+  conda run -n tt \
+  build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/real_matmul_protocol \
+  --mode=level-c-llk-direct --M=64 --N=64 --K=64 --num-pages=2 --repeats=1 --device-id=0
+```
+
+device-profiler 对比：
+
+```bash
+conda run -n tt python \
+  tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/compute_pipeline/real_tile_add_protocol/run_real_tile_add_protocol_cases.py \
+  --out-dir /tmp/level_c_tile_add_llk_direct_proof_2026_05_19 \
+  --tiles 256 \
+  --num-pages 2 \
+  --repeats 1 \
+  --modes cb level-c-generated-static level-c-llk-direct
+
+conda run -n tt python \
+  tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/ttnn_kernel_forks/real_matmul_protocol/run_real_matmul_protocol_cases.py \
+  --out-dir /tmp/level_c_matmul_llk_direct_proof_2026_05_19 \
+  --dims 64 \
+  --Ks 64 \
+  --num-pages 2 \
+  --repeats 1 \
+  --modes profiled-cb static-input-output-cbregs level-c-llk-direct
+```
+
+结论边界：
+
+- 这一步回答的是“能不能先不改 firmware，证明 LLK unpack/math/pack 可以不依赖 CB wrapper 接收 compiler-lowered raw L1 address”。这是进入 firmware / launch descriptor 改造前的必要 proof。
+- 它仍不是完整 Level C，因为 host 仍创建 `CircularBufferConfig`，firmware 仍初始化 `CBInterface`，LLK 的 format/tile shape setup 仍由现有 operand metadata bring-up 辅助完成。
+- 当前 smoke/JIT/device profiler 已通过两个 proof case：
+  - `real_tile_add_protocol --mode=level-c-llk-direct --tiles=4`：`max_abs_error=0`。
+  - `real_matmul_protocol --mode=level-c-llk-direct --M=64 --N=64 --K=64`：`pcc=0.999049`，`max_abs_error=0.015625`。
+- 当前 device-profiler 结果：
+
+| Proof | Mode | Critical stage | Critical cycles | Delta vs CB |
+|---|---|---|---:|---:|
+| tile-add `tiles=256,num_pages=2` | `cb` | writer | 283532 | 0 |
+| tile-add `tiles=256,num_pages=2` | `level-c-generated-static` | writer | 149239 | 134293 |
+| tile-add `tiles=256,num_pages=2` | `level-c-llk-direct` | writer | 149072 | 134460 |
+| matmul `M=N=K=64,num_pages=2` | `profiled-cb` | writer | 2703 | 0 |
+| matmul `M=N=K=64,num_pages=2` | `static-input-output-cbregs` | writer | 2461 | 242 |
+| matmul `M=N=K=64,num_pages=2` | `level-c-llk-direct` | writer | 2472 | 231 |
+
+- 结论是：add 和低 K matmul 的 compute wrapper dependency 可以被移除，raw LLK direct-address path 可以正确运行并被 device profiler 观察到。
+- 性能归因不能说“raw LLK 带来额外收益”。add 中 `level-c-llk-direct` 与 `level-c-generated-static` 基本持平，matmul 中 `level-c-llk-direct` 与 `static-input-output-cbregs` 基本持平。收益主要仍来自 static L1 ring/schedule 替代 CB FIFO 动态管理；raw LLK direct 的价值是证明 compiler-lowered address 可以穿过 LLK 边界。
+- matmul 仍不能 broad promote：该 proof 只覆盖 `K=64,num_blocks=1`，不覆盖 partial-sum reload、多核 large GEMM、multicast reuse 等路径。
+
+## Level C Firmware / Launch Descriptor Gate: Add + Matmul
+
+本轮目标不再是继续证明 raw LLK 能跑，而是跨过 Level C 的 firmware / launch ownership boundary：experimental path 不能再把 host `CreateCircularBuffer`、launch `local_cb_mask` 和 firmware materialized `CBInterface[]` 当作 operand/queue metadata 的事实来源。
+
+新增模式：
+
+- `real_tile_add_protocol --mode=level-c-llk-direct-fw-skip-cb-init`
+- `real_matmul_protocol --mode=level-c-llk-direct-fw-skip-cb-init`
+
+实现边界：
+
+- host path 在该 mode 下直接返回，不调用 `CreateCircularBuffer` / `CircularBufferConfig` 注册 `c_0`、`c_1`、`c_16`/`c_24`。
+- 因为没有注册 local/remote CB，launch descriptor 的 `local_cb_mask=0`，remote CB range 为空。
+- `tt_metal/hw/firmware/src/tt-1xx/brisc.cc`、`ncrisc.cc`、`trisc.cc` 改为只有在 `local_cb_mask != 0` 时才进入 `CBP_FW_LOCAL_CB_INIT` / `setup_local_cb_read_write_interfaces()`，只有在 remote range 非空时才进入 `CBP_FW_REMOTE_CB_INIT` / `setup_remote_cb_interfaces()`。
+- kernel 的 L1 base、page size、format/tile words、tile shape 和 sync binding 来自 compile-time descriptor / runtime args / 显式 stream-register binding。fw-skip kernel variant 的 sync counter 地址用 `STREAM_REG_ADDR(OPERAND_START_STREAM + cbid, ...)` 展开，不再通过 `get_cb_tiles_received_ptr(cbid)` / `get_cb_tiles_acked_ptr(cbid)` 作为事实来源。
+- 本轮没有新增全局 `DISPATCH_MODE_COMPILER_L1` enum；这是刻意保守的实验切分。当前 proof 使用实验 executable 的 descriptor-empty/sentinel gate 先证明“不注册 CB 时 firmware 可以跳过 CB init 且 kernel 正确”。后续产品化可以再把这个 gate 提升为显式 launch mode。
+
+复现命令：
+
+```bash
+conda run -n tt cmake --build build_Release \
+  --target real_tile_add_protocol real_matmul_protocol level_c_fw_skip_cb_init_contract_sanity -j8
+
+build_Release/programming_examples/compiler_managed_l1_dataflow/level_c/level_c_fw_skip_cb_init_contract_sanity
+
+TT_METAL_ALLOCATOR_MODE_HYBRID=1 \
+  build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/real_tile_add_protocol \
+  --mode=level-c-llk-direct-fw-skip-cb-init --tiles=4 --num-pages=2 --repeats=1 --device-id=0
+
+TT_METAL_ALLOCATOR_MODE_HYBRID=1 \
+  build_Release/programming_examples/compiler_managed_l1_dataflow/profiler/real_matmul_protocol \
+  --mode=level-c-llk-direct-fw-skip-cb-init --M=64 --N=64 --K=64 --num-pages=2 --repeats=1 --device-id=0
+```
+
+device-profiler 对比：
+
+```bash
+python3 tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/compute_pipeline/real_tile_add_protocol/run_real_tile_add_protocol_cases.py \
+  --out-dir /tmp/level_c_tile_add_fw_skip_cb_init_proof_2026_05_19_rerun \
+  --tiles 256 \
+  --num-pages 2 \
+  --repeats 1 \
+  --modes cb static-streamreg-cbregs level-c-llk-direct level-c-llk-direct-fw-skip-cb-init
+
+python3 tt_metal/programming_examples/compiler_managed_l1_dataflow/profiler/ttnn_kernel_forks/real_matmul_protocol/run_real_matmul_protocol_cases.py \
+  --out-dir /tmp/level_c_matmul_fw_skip_cb_init_proof_2026_05_19_rerun \
+  --dims 64 \
+  --Ks 64 \
+  --num-pages 2 \
+  --repeats 1 \
+  --modes profiled-cb static-input-output-cbregs level-c-llk-direct level-c-llk-direct-fw-skip-cb-init
+```
+
+正确性：
+
+| Proof | Mode | Result |
+|---|---|---|
+| tile-add `tiles=4,num_pages=2` | `level-c-llk-direct-fw-skip-cb-init` | pass；`max_abs_error=0` |
+| matmul `M=N=K=64,num_pages=2` | `level-c-llk-direct-fw-skip-cb-init` | pass；`pcc=0.999049`，`max_abs_error=0.015625` |
+| contract sanity | `level_c_fw_skip_cb_init_contract_sanity` | pass；`local_cb_mask=0`，`min_remote_cb_start_index=64`，即当前 Blackhole/host build 的 remote-empty sentinel。 |
+
+firmware profiler 证据：
+
+| Proof | Mode | `CBP_FW_LOCAL_CB_INIT` / `CBP_FW_REMOTE_CB_INIT` |
+|---|---|---|
+| tile-add | `cb` | present |
+| tile-add | `static-streamreg-cbregs` | present |
+| tile-add | `level-c-llk-direct` | present |
+| tile-add | `level-c-llk-direct-fw-skip-cb-init` | absent |
+| matmul | `profiled-cb` | present |
+| matmul | `static-input-output-cbregs` | present |
+| matmul | `level-c-llk-direct` | present |
+| matmul | `level-c-llk-direct-fw-skip-cb-init` | absent |
+
+device critical-stage 结果：
+
+| Proof | Mode | Critical stage | Critical cycles | Delta vs CB |
+|---|---|---|---:|---:|
+| tile-add `tiles=256,num_pages=2` | `cb` | writer | 284846 | 0 |
+| tile-add `tiles=256,num_pages=2` | `static-streamreg-cbregs` | writer | 159337 | 125509 |
+| tile-add `tiles=256,num_pages=2` | `level-c-llk-direct` | writer | 149240 | 135606 |
+| tile-add `tiles=256,num_pages=2` | `level-c-llk-direct-fw-skip-cb-init` | writer | 160302 | 124544 |
+| matmul `M=N=K=64,num_pages=2` | `profiled-cb` | writer | 2660 | 0 |
+| matmul `M=N=K=64,num_pages=2` | `static-input-output-cbregs` | writer | 2559 | 101 |
+| matmul `M=N=K=64,num_pages=2` | `level-c-llk-direct` | writer | 2555 | 105 |
+| matmul `M=N=K=64,num_pages=2` | `level-c-llk-direct-fw-skip-cb-init` | writer | 2575 | 85 |
+
+结论：
+
+- 这一步已经证明 experimental path 中 `CBInterface[]` 不再是 operand/queue metadata 的事实来源。host 没有注册 CB，launch descriptor 不再用 `local_cb_mask` 驱动该路径的 CB 初始化，firmware profiler 也证明 CB init path 被跳过。
+- kernel correctness 通过，device critical stage 仍可与 legacy CB、Level B `static-streamreg-cbregs` 和旧 `level-c-llk-direct` 对比。
+- fw-skip 相对 Level B / 旧 `level-c-llk-direct` 没有新的 steady-state writer critical 收益。tile-add 中 fw-skip 与 `static-streamreg-cbregs` 基本同级，但慢于旧 `level-c-llk-direct`；matmul 中 fw-skip 与 Level B / 旧 LLK-direct 只差几十 cycles。这里不能把差异解释为 firmware skip 回退，因为 fw-skip 当前把 L1 base/page/sync metadata 作为 runtime args 运输，而旧 `level-c-llk-direct` 仍是 compile-time protocol args upper-bound。真正结论是：firmware CB init 是 launch-time path，不是 steady-state writer loop 的主要成本。
+- 因此本轮的价值不是“又快了一大截”，而是 ownership boundary 已经从 TT-Metal runtime/firmware CB materialization 切到 compiler descriptor / static schedule。性能大头仍来自 static L1 ring/schedule 替代 CB FIFO 动态管理。
 
 ## Phase 0/1 Microbenchmark
 
@@ -946,31 +1312,75 @@ Level C 的修改原则：
 - `git diff --check` 和 Level B smoke 通过。
 - 新分支的第一条 commit 只包含 Level B 文档/runner 收敛，不包含 Level C 源码改造。
 
-### Step 1: 固化 descriptor schema
+### Step 1: 固化 compiler IR 与 lowering descriptor 边界
 
 修改范围：
 
 ```text
 tt_metal/programming_examples/compiler_managed_l1_dataflow/docs
-tt_metal/programming_examples/compiler_managed_l1_dataflow/include   # 新增 experimental prototype header
+tt_metal/programming_examples/compiler_managed_l1_dataflow/include   # experimental prototype headers
 ```
 
 目标：
 
-- 在 prototype header 中定义 `TensorLayoutDescriptor`、`CompilerCBDescriptor`、`OperandViewDescriptor`、`QueueSyncDescriptor`。
-- 字段只表达 compiler-owned L1 storage、queue sync、operand view、format/tile metadata。
+- 在 `level_c_ir.hpp` 中定义 `AxeTensor`、`AxeStorage`、`AxeLayout`、`AxeIter`；在 `level_c_lowering_descriptors.hpp` 中定义 `TensorLayoutDescriptor`、`L1QueueDescriptor`、`OperandViewDescriptor`、`QueueSyncDescriptor`。
+- `AxeTensor` 是 `element_type + storage + layout`，其中 storage 是 CuTe-style engine，必须明确存在，可表达 owned device allocation、owned mesh allocation、borrowed host storage、borrowed device address、view-of-storage 和 register fragment；layout 同时表达 domain 和 mapping，不再单独维护 `logical_shape`。`AxeLayout` 直接用 `d_iters`、`r_iters`、`o_entries` 三个 vector 表达 `D/R/O`；`O` 是单个 fixed coordinate offset，`o_entries` 是它的稀疏 entries，不携带 `schema_version` 或固定数组 count。其它 descriptor 字段只表达 compiler-owned L1 storage、queue topology/sync、operand view、format/tile metadata，是后续 lowering / dynamic-field carrier，不是新的 runtime CB object。
 - 不出现 TT-Metal `CBIndex`、`CircularBufferConfig`、`TensorAccessorArgs` 作为 IR 语义。
-- descriptor schema 明确区分：
+- tensor shape 在高层 compiler IR 中来自 `AxeLayout` 的 domain，即 `D` iter 的 extent；`rank + dims[4]` 只用于 descriptor-table backend 的 lowered metadata，不代表最终 kernel 必须读取这个结构体。
+- 完全静态的 shape/layout 应在 codegen 时消失，变成常量地址表达式、loop bounds、tile count 或 schedule；只有运行时仍动态的字段才进入 descriptor table。
+- descriptor table 不直接嵌入 TT-Metal host-side `Shape` 或 `AxeLayout` 的 `std::vector`，也不使用带 `n/c/h/w` 语义的结构体；需要跨 host/device ABI 时应另行定义 serialized lowering form。
+- compiler IR / descriptor schema 明确区分：
   - L1 storage/lifetime：base、size、bank policy、lifetime。
   - queue/sync：capacity、producer/consumer、sync kind、counter/register binding。
   - operand view：format、tile shape、page size、stride、pack/unpack role。
-  - tensor layout：global tensor shape、page layout、shard mapping、NoC address policy。
+  - tensor layout：global tensor rank/dims、page layout、shard mapping、NoC address policy。
+  - unified tensor/layout algebra：`AxeTensor{name, element_type, storage, layout}` + `AxeStorage{kind, memory_space, ownership, size/address/root/device scope}` + `AxeAxis{name, kind}` + `AxeIter{extent, stride, axis}` + `D(list)` / `R(set)` / `O(offset)`。
 
 验收：
 
-- header 可被 host 和 kernel-side experimental code include。
+- `level_c_ir.hpp` 可被 host-side experimental compiler code include；`level_c_lowering_descriptors.hpp` 可被 host 和 kernel-side experimental lowering code include。
 - 文档中 descriptor 字段和 header 保持一致。
 - 不能只是把 `CircularBufferConfig` 字段原样改名；必须能表达 non-CB L1 storage 和 operand view。
+- `level_c_descriptor_schema_sanity` 可以单独构建和运行，证明 `AxeTensor` / `AxeLayout` 是 vector/string-based IR，同时输出 lowering descriptor size 和一个示例 descriptor table size。
+- `level_c_axe_layout_coverage_sanity` 可以单独构建和运行，覆盖 row-major、tile/face、interleaved、height/width/block/ND sharding、mesh replicated/sharded 和 TensorAccessor-style address expression。
+- `level_c_tt_metal_layout_adapter_sanity` 可以单独构建和运行，覆盖 tech report / 源码中的 `TensorLayout`、`PageConfig`、`Tile`、`MemoryConfig`、`ShardSpec`、`ShardSpecBuffer`、`NdShardSpec`、`MeshBuffer`、`Buffer::view` 语义，并额外覆盖 `Buffer` owned allocation、view/root ownership、`MeshBuffer` owned allocation、`HostTensor` borrowed storage、externally owned device address、register fragment 等资源语义。
+
+### Step 1.5: 证明 layout 语义覆盖边界
+
+目标：
+
+- 以 TT-Metal 当前 tech report 中的 tensor layout / memory layout / tensor sharding 为输入，证明它们都能被 Axe Figure 1 的 `AxeIter(extent, stride, axis)`、`D(shard list)`、`R(replica set)`、`O(offset)` 表达。
+- 把 `page` 从高层语义中降级为 block/atom/storage unit：它可以继续出现在 lowered metadata 中，但不再是独立于 layout algebra 的 compiler IR 概念。
+- axis 在 compiler IR 中是 `AxeAxis{name, kind}` 对象；它不是 device runtime object。kernel lowering 只消费 iter 的 extent/stride/axis 和 `D/R/O` 归属生成地址算式，必要时再把 axis lowering 成紧凑 id 或固定数组。
+- 明确资源层边界：`AxeLayout` 不单独替代 `Buffer`、`MeshBuffer`、`Tensor`；这些对象中的 allocation、ownership、lifetime、device/API interop 语义应由 `AxeStorage` 表达，最终由 `AxeTensor + AxeStorage + AxeLayout` 统一承载。
+- 以 adapter 方式逐步迁移 `TensorLayout`、`PageConfig`、`Tile`、`ShardSpec`、`ShardSpecBuffer`、`BufferShardingArgs`、`TensorAccessorArgs`，避免一次性改动 TTNN public API。
+
+验收：
+
+- `level_c_axe_layout_coverage_sanity` 输出所有 coverage case 为 `covered`。
+- `level_c_tt_metal_layout_adapter_sanity` 输出所有 adapter case 为 `covered`，并报告 `layout_covered_cases=14`、`resource_covered_cases=6`、`covered_cases=20`。
+- README 和本文档明确写出“`AxeLayout` 统一 layout mapping，`AxeStorage` 统一 resource/storage engine，`AxeTensor` 统一 tensor 语义；当前 proof 不等价于 TTNN public API 已经删除”的边界。
+- 下一步 adapter 设计必须能从现有 TT-Metal/TTNN 类型生成 `AxeLayout`，并能从该 IR 生成 TensorAccessor 等价地址表达式。
+
+### Step 1.6: TT target dialect v0
+
+新增文档：
+
+```text
+tt_metal/programming_examples/compiler_managed_l1_dataflow/docs/tt_target_dialect_design_2026_05_19.md
+```
+
+目标：
+
+- 把 Level C 的底层 dialect 定义为硬件动作 dialect，而不是 TT-Metal CB / TensorAccessor 的改名版本。
+- 分清三层：`AxeTensor/AxeLayout/AxeStorage` 表达 tensor/layout/storage；schedule / lowering IR 表达 per-core work、L1 lifetime、ring slot 复用和 producer/consumer 依赖；`tt.target` 表达 NoC、stream register、L1 地址、tile register、unpack/math/pack。
+- `TensorAccessor`、`CircularBuffer`、`CircularBufferConfig`、`CreateCircularBuffer`、`cb_*`、`get_local_cb_interface`、`CBInterface[]` 只能作为 legacy adapter 输入或 baseline 对照，不能进入 canonical bottom IR。
+- v0 op set 只覆盖 add / matmul 已验证 proof：`tt.target.addr.*`、`tt.target.noc.*`、`tt.target.reg.*`、`tt.target.wait.*`、`tt.target.tile.*`、`tt.target.unpack.*`、`tt.target.math.*`、`tt.target.pack`。
+
+验收：
+
+- `level_c_tt_target_dialect_sanity` 可以单独构建和运行。
+- checker 内置 tile-add 和 real-matmul pseudo IR，并验证没有 legacy CB/TensorAccessor token、reader/compute/writer stage 存在、producer/consumer token 配对、ring slot 地址可静态求值、关键 `tt.target` op family 全部覆盖。
 
 ### Step 2: host-side descriptor table 原型
 
@@ -1011,7 +1421,7 @@ tt_metal/hw/inc/internal
 
 - 新增只影响实验 target 的 launch mode、compile-time flag 或 sentinel。
 - 在 compiler-managed mode 下跳过 `setup_local_cb_read_write_interfaces` 和 `setup_remote_cb_interfaces`。
-- 加载 compiler descriptor table，初始化 compiler-owned operand view / queue state。
+- 加载或搬运 compiler lowering 所需 metadata，不初始化 compiler-owned runtime queue object。
 - legacy mode 保持原 CB init 路径。
 - firmware 不再以 `local_cb_mask` 决定 compiler-managed operand/queue metadata；`local_cb_mask` 只允许作为 legacy fallback 或 disabled sentinel。
 
@@ -1022,7 +1432,7 @@ tt_metal/hw/inc/internal
 - experimental target 不依赖 `local_cb_mask` 驱动 `CBInterface[]` 初始化。
 - 这是 Level C 的第一条硬边界：如果 firmware 仍 materialize `CBInterface[]` 作为事实来源，只能算 Level B+，不能算 Level C。
 
-### Step 4: no-`cb_*` CompilerCB kernel backend
+### Step 4: no-`cb_*` L1Queue codegen backend
 
 修改范围：
 
@@ -1034,9 +1444,9 @@ tt_metal/programming_examples/compiler_managed_l1_dataflow/include
 目标：
 
 - single-core tile-add / binary elementwise。
-- reader/writer/compute 从 compiler descriptor 获取 L1 base、page size、tile count、sync binding。
+- reader/writer/compute 从 compiler lowering metadata 或展开后的 codegen 获取 L1 base、page size、tile count、sync binding。
 - kernel 中禁止 `cb_reserve_back`、`cb_wait_front`、`cb_push_back`、`cb_pop_front`、`get_read_ptr`、`get_write_ptr`、`get_tile_size`。
-- compute 先允许继续走 LLK-compatible path，但 operand metadata 的事实来源必须是 compiler descriptor，不是 TT-Metal CB。
+- compute 先允许继续走 LLK-compatible path，但 operand metadata 的事实来源必须是 compiler OperandView/L1Queue lowering，不是 TT-Metal CB。
 
 验收：
 
@@ -1107,10 +1517,10 @@ tt_metal/programming_examples/compiler_managed_l1_dataflow/include
 
 | Milestone | 必须证明 | 不足以证明 |
 |---|---|---|
-| M1: Descriptor schema | IR 不包含 TT-Metal CB/TensorAccessor 语义，descriptor 能表达 L1 storage、queue、operand view。 | 只把字段从 `CircularBufferConfig` 改名。 |
+| M1: Compiler IR / descriptor schema | IR 不包含 TT-Metal CB/TensorAccessor 语义；`AxeTensor` 固定为 element type + storage + layout；lowering descriptor 能表达 L1 storage、queue、operand view。 | 只把字段从 `CircularBufferConfig` 改名，或在 tensor 里维护第二份 logical shape。 |
 | M2: Host path replacement | 新 compiler path 不调用 `CreateCircularBuffer` / `TensorAccessorArgs`。 | 只在 kernel 里绕开 `cb_*`。 |
 | M3: Firmware mode | compiler mode 下 firmware 不走 TT-Metal CB init，或 CB init 只作为 legacy fallback。 | `local_cb_mask` 仍驱动 `CBInterface` 初始化。 |
-| M4: Kernel CompilerCB | reader/writer/compute 不使用 TT-Metal CB API，正确性通过。 | 只把 `cb_*` 包一层 wrapper。 |
+| M4: Kernel L1Queue codegen | reader/writer/compute 不使用 TT-Metal CB API，正确性通过；queue lowering 后是具体地址/同步代码。 | 只把 `cb_*` 包一层 wrapper，或引入新的 runtime CB struct。 |
 | M5: LLK-compatible OperandView | LLK 的 operand metadata 来自 compiler descriptor，而不是 TT-Metal CB state。 | 仍依赖 `get_local_cb_interface(cbid)` 作为事实来源。 |
 | M6: Operator policy | 能按 family/shape 给出 backend selection rule。 | 用一个全局平均 speedup 宣称所有 op 都应替换。 |
 | M7: mini-LLK | raw Tensix backend 对选定 microkernel 正确且可归因。 | 结果无法区分来自 LLK 重写还是 CB/firmware 替换。 |
@@ -1120,7 +1530,7 @@ tt_metal/programming_examples/compiler_managed_l1_dataflow/include
 这条线最终要产出的不是“某个 op 快了多少”的局部优化报告，而是一个新的编译器后端论证：
 
 - 抽象层：TT-Metal runtime-managed CB / TensorAccessor 不应是 compiler IR 的核心抽象。
-- ABI 层：firmware launch 应接收 compiler descriptor table，而不是只认识 `local_cb_mask` 和 CB config blob。
+- ABI 层：firmware launch 应接收 compiler lowering metadata / descriptor table，而不是只认识 `local_cb_mask` 和 CB config blob。
 - Backend 层：compiler 可以根据 op family 和 shape 选择 static schedule、stream register、L1 counter、legacy CB fallback 或 raw Tensix backend。
 - 评估层：收益要拆成 host/firmware/kernel steady-state/compute operand setup，而不是只看 end-to-end latency。
 

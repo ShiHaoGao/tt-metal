@@ -96,11 +96,21 @@ def phase_is_end(value):
 def parse_zone_name(zone):
     prefix = "RMP_REUSE_"
     if not zone.startswith(prefix):
+        if zone == "CBP_FW_LOCAL_CB_INIT":
+            return {"mode": "firmware", "stage": "local-cb-init"}
+        if zone == "CBP_FW_REMOTE_CB_INIT":
+            return {"mode": "firmware", "stage": "remote-cb-init"}
         return None
     rest = zone[len(prefix) :]
     if rest.startswith("CB_"):
         mode = "profiled-cb"
         stage = rest[len("CB_") :]
+    elif rest.startswith("LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT_"):
+        mode = "level-c-llk-direct-fw-skip-cb-init"
+        stage = rest[len("LEVEL_C_LLK_DIRECT_FW_SKIP_CB_INIT_") :]
+    elif rest.startswith("LEVEL_C_LLK_DIRECT_"):
+        mode = "level-c-llk-direct"
+        stage = rest[len("LEVEL_C_LLK_DIRECT_") :]
     elif rest.startswith("STATIC_INPUT_ONLY_CBREGS_COMPILETIME_"):
         mode = "static-input-only-cbregs-compiletime"
         stage = rest[len("STATIC_INPUT_ONLY_CBREGS_COMPILETIME_") :]
