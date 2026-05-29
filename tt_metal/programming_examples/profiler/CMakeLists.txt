@@ -10,6 +10,7 @@ set(PROFILER_EXAMPLES_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/test_noc_event_profiler/test_noc_event_profiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_device_api_debugger/test_device_api_debugger.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/matmul_variants_profile/matmul_variants_profile.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/flash_attention_profile.cpp
 )
 
 CREATE_PGM_EXAMPLES_EXE("${PROFILER_EXAMPLES_SRCS}" "profiler")
@@ -28,6 +29,33 @@ target_include_directories(
     matmul_variants_profile
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/matmul_variants_profile
+)
+
+target_sources(
+    flash_attention_profile
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/flash_attention_profile_runners.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/copied_sdpa/device/sdpa_device_operation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/copied_sdpa/device/sdpa_program_factory.cpp
+)
+
+target_link_libraries(
+    flash_attention_profile
+    PUBLIC
+        TTNN::TTNN
+        tt_metal
+        m
+        pthread
+)
+
+target_include_directories(
+    flash_attention_profile
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/ttnn/cpp
+        ${PROJECT_SOURCE_DIR}/ttnn/api
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/copied_sdpa/device
 )
 
 add_custom_target(profiler_examples DEPENDS ${PROGRAMMING_EXAMPLES_TEST_TARGETS})
