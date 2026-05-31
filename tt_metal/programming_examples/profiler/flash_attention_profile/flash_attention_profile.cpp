@@ -46,7 +46,9 @@ struct Options {
     uint32_t device_id = 0;
     bool high_precision = false;
     bool read_device_profiler = true;
+    bool print_device_profiler_by_risc = false;
     bool check_correctness = false;
+    fap::ExperimentMode experiment_mode = fap::ExperimentMode::Copied;
     fap::PipelineMode pipeline_mode = fap::PipelineMode::Auto;
     uint32_t pipeline_depth = 2;
     fap::CopiedKernelOptions copied_kernel_options;
@@ -161,6 +163,7 @@ struct DeviceZoneSummary {
     std::filesystem::path csv_path;
     double chip_freq_mhz = 0.0;
     std::map<std::string, ZoneStats> zones;
+    std::map<std::pair<std::string, std::string>, ZoneStats> zones_by_risc;
 };
 
 std::string trim(std::string_view text) {
@@ -365,6 +368,7 @@ DeviceZoneSummary read_device_zone_summary(const std::filesystem::path& csv_path
 
     std::map<ZoneKey, std::vector<uint64_t>> open_zones;
     std::map<std::string, ZoneAggregate> aggregates_by_zone;
+    std::map<std::pair<std::string, std::string>, ZoneAggregate> aggregates_by_zone_risc;
     uint64_t run_start_cycles = std::numeric_limits<uint64_t>::max();
     const int max_column = std::max({columns.time, columns.zone, columns.phase, columns.core_x, columns.core_y, columns.risc});
 
@@ -398,6 +402,10 @@ DeviceZoneSummary read_device_zone_summary(const std::filesystem::path& csv_path
                 aggregate.durations.push_back(end - start);
                 aggregate.first_start_cycles = std::min(aggregate.first_start_cycles, start);
                 aggregate.last_end_cycles = std::max(aggregate.last_end_cycles, end);
+                auto& risc_aggregate = aggregates_by_zone_risc[{key.zone, key.risc}];
+                risc_aggregate.durations.push_back(end - start);
+                risc_aggregate.first_start_cycles = std::min(risc_aggregate.first_start_cycles, start);
+                risc_aggregate.last_end_cycles = std::max(risc_aggregate.last_end_cycles, end);
                 run_start_cycles = std::min(run_start_cycles, start);
                 starts.pop_back();
             }
@@ -410,6 +418,9 @@ DeviceZoneSummary read_device_zone_summary(const std::filesystem::path& csv_path
 
     for (const auto& [zone, aggregate] : aggregates_by_zone) {
         summary.zones[zone] = make_zone_stats(aggregate, summary.chip_freq_mhz, run_start_cycles);
+    }
+    for (const auto& [zone_risc, aggregate] : aggregates_by_zone_risc) {
+        summary.zones_by_risc[zone_risc] = make_zone_stats(aggregate, summary.chip_freq_mhz, run_start_cycles);
     }
     return summary;
 }
@@ -583,6 +594,19 @@ std::optional<fap::GridPolicy> parse_grid_policy(std::string_view text) {
     return std::nullopt;
 }
 
+std::optional<fap::ExperimentMode> parse_experiment_mode(std::string_view text) {
+    if (text == "copied") {
+        return fap::ExperimentMode::Copied;
+    }
+    if (text == "split_compute_v1") {
+        return fap::ExperimentMode::SplitComputeV1;
+    }
+    if (text == "llk_microflow_v1") {
+        return fap::ExperimentMode::LlkMicroflowV1;
+    }
+    return std::nullopt;
+}
+
 std::optional<fap::ShapeConfig> preset_shape(std::string_view name) {
     for (const auto& shape : Options::default_shapes()) {
         if (shape.name == name) {
@@ -724,6 +748,230 @@ std::string qk_softmax_schedule_label(uint32_t schedule) {
     }
 }
 
+std::optional<uint32_t> parse_qk_detail_profile_stage(std::string_view value) {
+    if (value == "none" || value == "0") {
+        return 0;
+    }
+    if (value == "qk_threads" || value == "1") {
+        return 1;
+    }
+    if (value == "q_reader" || value == "2") {
+        return 2;
+    }
+    if (value == "qk_init" || value == "3") {
+        return 3;
+    }
+    if (value == "phase_timeline" || value == "4") {
+        return 4;
+    }
+    if (value == "qktv_detail" || value == "5") {
+        return 5;
+    }
+    if (value == "qktv_barrier_split" || value == "6") {
+        return 6;
+    }
+    if (value == "qktv_matmul_detail" || value == "7") {
+        return 7;
+    }
+    if (value == "qktv_math_detail" || value == "8") {
+        return 8;
+    }
+    if (value == "qktv_pack_detail" || value == "9") {
+        return 9;
+    }
+    if (value == "qktv_pipeline_detail" || value == "10") {
+        return 10;
+    }
+    if (value == "writer_pipeline_detail" || value == "11") {
+        return 11;
+    }
+    if (value == "first_output_handoff" || value == "12") {
+        return 12;
+    }
+    if (value == "fa3_pipe_detail" || value == "13") {
+        return 13;
+    }
+    if (value == "llk_microflow_detail" || value == "14") {
+        return 14;
+    }
+    return std::nullopt;
+}
+
+std::string qk_detail_profile_stage_label(uint32_t stage) {
+    switch (stage) {
+        case 0: return "none";
+        case 1: return "qk_threads";
+        case 2: return "q_reader";
+        case 3: return "qk_init";
+        case 4: return "phase_timeline";
+        case 5: return "qktv_detail";
+        case 6: return "qktv_barrier_split";
+        case 7: return "qktv_matmul_detail";
+        case 8: return "qktv_math_detail";
+        case 9: return "qktv_pack_detail";
+        case 10: return "qktv_pipeline_detail";
+        case 11: return "writer_pipeline_detail";
+        case 12: return "first_output_handoff";
+        case 13: return "fa3_pipe_detail";
+        case 14: return "llk_microflow_detail";
+        default: return fmt::format("unknown_{}", stage);
+    }
+}
+
+std::optional<uint32_t> parse_q_reader_schedule(std::string_view value) {
+    if (value == "default" || value == "0") {
+        return 0;
+    }
+    if (value == "first_before_k" || value == "1") {
+        return 1;
+    }
+    if (value == "first_during_k_read" || value == "2") {
+        return 2;
+    }
+    return std::nullopt;
+}
+
+std::string q_reader_schedule_label(uint32_t schedule) {
+    switch (schedule) {
+        case 0: return "default";
+        case 1: return "first_before_k";
+        case 2: return "first_during_k_read";
+        default: return fmt::format("unknown_{}", schedule);
+    }
+}
+
+std::optional<uint32_t> parse_qk_first_body_warmup(std::string_view value) {
+    if (value == "none" || value == "0") {
+        return 0;
+    }
+    if (value == "tiny_matmul" || value == "1") {
+        return 1;
+    }
+    if (value == "same_config_init" || value == "2") {
+        return 2;
+    }
+    return std::nullopt;
+}
+
+std::string qk_first_body_warmup_label(uint32_t warmup) {
+    switch (warmup) {
+        case 0: return "none";
+        case 1: return "tiny_matmul";
+        case 2: return "same_config_init";
+        default: return fmt::format("unknown_{}", warmup);
+    }
+}
+
+std::optional<uint32_t> parse_compute_pipeline_schedule(std::string_view value) {
+    if (value == "default" || value == "0") {
+        return 0;
+    }
+    if (value == "partial_handoff_v1" || value == "1") {
+        return 1;
+    }
+    if (value == "qktv_drain_all_then_matmul" || value == "2") {
+        return 2;
+    }
+    if (value == "group0_early_push_v1" || value == "3") {
+        return 3;
+    }
+    if (value == "fa3_pv_softmax_v1" || value == "4") {
+        return 4;
+    }
+    if (value == "llk_drain_exp_before_pv_v1" || value == "5") {
+        return 5;
+    }
+    if (value == "llk_prev_exp_after_pv_v1" || value == "6") {
+        return 6;
+    }
+    if (value == "llk_salad_before_pv_v1" || value == "7") {
+        return 7;
+    }
+    if (value == "llk_v_ready_prefetch_v1" || value == "8") {
+        return 8;
+    }
+    if (value == "split_signal_only_v1" || value == "9") {
+        return 9;
+    }
+    if (value == "split_output_stream_signal_v1" || value == "10") {
+        return 10;
+    }
+    if (value == "split_l1_ready_signal_v1" || value == "11") {
+        return 11;
+    }
+    if (value == "split_state_ready_signal_v1" || value == "12") {
+        return 12;
+    }
+    if (value == "split_state_consumer_probe_v1" || value == "13") {
+        return 13;
+    }
+    if (value == "split_state_consumer_probe_x4_v1" || value == "14") {
+        return 14;
+    }
+    if (value == "split_state_consumer_probe_x8_v1" || value == "15") {
+        return 15;
+    }
+    if (value == "split_state_consumer_vprefetch_x8_v1" || value == "16") {
+        return 16;
+    }
+    if (value == "split_state_consumer_vafter_state_x8_v1" || value == "17") {
+        return 17;
+    }
+    if (value == "split_state_real_p_vprefetch_x8_v1" || value == "18") {
+        return 18;
+    }
+    if (value == "split_state_real_p_vafter_state_x8_v1" || value == "19") {
+        return 19;
+    }
+    if (value == "split_state_real_p_kt_stream_v1" || value == "20") {
+        return 20;
+    }
+    if (value == "split_pv_owner_probe_v1" || value == "21") {
+        return 21;
+    }
+    if (value == "split_state_mailbox_ring_v1" || value == "22") {
+        return 22;
+    }
+    if (value == "split_pv_owner_output_v1" || value == "23") {
+        return 23;
+    }
+    if (value == "split_pv_owner_output_no_ack_v1" || value == "25") {
+        return 25;
+    }
+    return std::nullopt;
+}
+
+std::string compute_pipeline_schedule_label(uint32_t schedule) {
+    switch (schedule) {
+        case 0: return "default";
+        case 1: return "partial_handoff_v1";
+        case 2: return "qktv_drain_all_then_matmul";
+        case 3: return "group0_early_push_v1";
+        case 4: return "fa3_pv_softmax_v1";
+        case 5: return "llk_drain_exp_before_pv_v1";
+        case 6: return "llk_prev_exp_after_pv_v1";
+        case 7: return "llk_salad_before_pv_v1";
+        case 8: return "llk_v_ready_prefetch_v1";
+        case 9: return "split_signal_only_v1";
+        case 10: return "split_output_stream_signal_v1";
+        case 11: return "split_l1_ready_signal_v1";
+        case 12: return "split_state_ready_signal_v1";
+        case 13: return "split_state_consumer_probe_v1";
+        case 14: return "split_state_consumer_probe_x4_v1";
+        case 15: return "split_state_consumer_probe_x8_v1";
+        case 16: return "split_state_consumer_vprefetch_x8_v1";
+        case 17: return "split_state_consumer_vafter_state_x8_v1";
+        case 18: return "split_state_real_p_vprefetch_x8_v1";
+        case 19: return "split_state_real_p_vafter_state_x8_v1";
+        case 20: return "split_state_real_p_kt_stream_v1";
+        case 21: return "split_pv_owner_probe_v1";
+        case 22: return "split_state_mailbox_ring_v1";
+        case 23: return "split_pv_owner_output_v1";
+        case 25: return "split_pv_owner_output_no_ack_v1";
+        default: return fmt::format("unknown_{}", schedule);
+    }
+}
+
 std::string copied_qk_subblock_label(const fap::CopiedKernelOptions& options) {
     if (!options.qk_subblock_override.has_value()) {
         return "auto";
@@ -762,7 +1010,12 @@ std::string grid_label(
     const fap::ShapeConfig& shape,
     const std::shared_ptr<distributed::MeshDevice>& mesh_device) {
     const auto resolved_grid = fap::resolve_flash_attention_grid(
-        variant, options.grid_policy, options.grid_override, shape, mesh_device->compute_with_storage_grid_size());
+        variant,
+        options.experiment_mode,
+        options.grid_policy,
+        options.grid_override,
+        shape,
+        mesh_device->compute_with_storage_grid_size());
     if (!resolved_grid.has_value()) {
         return "auto";
     }
@@ -792,8 +1045,16 @@ Options parse_options(int argc, char** argv) {
             options.high_precision = true;
         } else if (arg == "--no-device-profiler-read") {
             options.read_device_profiler = false;
+        } else if (arg == "--device-profiler-by-risc") {
+            options.print_device_profiler_by_risc = true;
         } else if (arg == "--check-correctness") {
             options.check_correctness = true;
+        } else if (arg == "--experiment") {
+            auto experiment_mode = parse_experiment_mode(require_value(arg));
+            if (!experiment_mode.has_value()) {
+                TT_THROW("--experiment expects copied, split_compute_v1, or llk_microflow_v1");
+            }
+            options.experiment_mode = *experiment_mode;
         } else if (arg == "--pipeline") {
             auto pipeline_mode = parse_pipeline_mode(require_value(arg));
             if (!pipeline_mode.has_value()) {
@@ -848,6 +1109,32 @@ Options parse_options(int argc, char** argv) {
                 TT_THROW("--qk-softmax-schedule expects before_matmul, after_matmul, or after_matmul_except_final_kt");
             }
             options.copied_kernel_options.qk_softmax_schedule = *schedule;
+        } else if (arg == "--qk-detail-profile") {
+            auto stage = parse_qk_detail_profile_stage(require_value(arg));
+            if (!stage.has_value()) {
+                TT_THROW(
+                    "--qk-detail-profile expects none, qk_threads, q_reader, qk_init, phase_timeline, qktv_detail, qktv_barrier_split, qktv_matmul_detail, qktv_math_detail, qktv_pack_detail, qktv_pipeline_detail, writer_pipeline_detail, first_output_handoff, fa3_pipe_detail, or llk_microflow_detail");
+            }
+            options.copied_kernel_options.qk_detail_profile_stage = *stage;
+        } else if (arg == "--q-reader-schedule") {
+            auto schedule = parse_q_reader_schedule(require_value(arg));
+            if (!schedule.has_value()) {
+                TT_THROW("--q-reader-schedule expects default, first_before_k, or first_during_k_read");
+            }
+            options.copied_kernel_options.q_reader_schedule = *schedule;
+        } else if (arg == "--qk-first-body-warmup") {
+            auto warmup = parse_qk_first_body_warmup(require_value(arg));
+            if (!warmup.has_value()) {
+                TT_THROW("--qk-first-body-warmup expects none, tiny_matmul, or same_config_init");
+            }
+            options.copied_kernel_options.qk_first_body_warmup = *warmup;
+        } else if (arg == "--compute-pipeline-schedule") {
+            auto schedule = parse_compute_pipeline_schedule(require_value(arg));
+            if (!schedule.has_value()) {
+                TT_THROW(
+                    "--compute-pipeline-schedule expects default, partial_handoff_v1, qktv_drain_all_then_matmul, group0_early_push_v1, fa3_pv_softmax_v1, llk_drain_exp_before_pv_v1, llk_prev_exp_after_pv_v1, llk_salad_before_pv_v1, llk_v_ready_prefetch_v1, split_signal_only_v1, split_output_stream_signal_v1, split_l1_ready_signal_v1, split_state_ready_signal_v1, split_state_consumer_probe_v1, split_state_consumer_probe_x4_v1, split_state_consumer_probe_x8_v1, split_state_consumer_vprefetch_x8_v1, split_state_consumer_vafter_state_x8_v1, split_state_real_p_vprefetch_x8_v1, split_state_real_p_vafter_state_x8_v1, split_state_real_p_kt_stream_v1, split_pv_owner_probe_v1, split_state_mailbox_ring_v1, split_pv_owner_output_v1, or split_pv_owner_output_no_ack_v1");
+            }
+            options.copied_kernel_options.compute_pipeline_schedule = *schedule;
         } else if (arg == "--preset") {
             std::string_view value(require_value(arg));
             if (!saw_shape_filter) {
@@ -914,6 +1201,7 @@ Options parse_options(int argc, char** argv) {
                 "Usage: flash_attention_profile [--preset BUILTIN_PRESET|all] "
                 "[--shape B,H,KVH,S,D,prefill,q,k,page] "
                 "[--chunks Q,K] "
+                "[--experiment copied|split_compute_v1|llk_microflow_v1] "
                 "[--variant ttnn_sdpa_baseline|ttnn_chunked_baseline|copied_sdpa|copied_chunked|all] "
                 "[--mode eager|prepared|prepared_no_q_copy|trace|all] "
                 "[--pipeline auto|stream_h1|qktv_h1|salad_first|qktv_h1_salad_first|non_streaming] "
@@ -921,6 +1209,11 @@ Options parse_options(int argc, char** argv) {
                 "[--qk-subblock H,W] [--q-buffer-factor N] [--dst-full-sync|--dst-half-sync] "
                 "[--qk-softmax-profile none|wait_max|sub_math|wait_sub|exp_sfpu|pack] "
                 "[--qk-softmax-schedule before_matmul|after_matmul|after_matmul_except_final_kt] "
+                "[--qk-detail-profile none|qk_threads|q_reader|qk_init|phase_timeline|qktv_detail|qktv_barrier_split|qktv_matmul_detail|qktv_math_detail|qktv_pack_detail|qktv_pipeline_detail|writer_pipeline_detail|first_output_handoff|fa3_pipe_detail|llk_microflow_detail] "
+                "[--device-profiler-by-risc] "
+                "[--q-reader-schedule default|first_before_k|first_during_k_read] "
+                "[--qk-first-body-warmup none|tiny_matmul|same_config_init] "
+                "[--compute-pipeline-schedule default|partial_handoff_v1|qktv_drain_all_then_matmul|group0_early_push_v1|fa3_pv_softmax_v1|llk_drain_exp_before_pv_v1|llk_prev_exp_after_pv_v1|llk_salad_before_pv_v1|llk_v_ready_prefetch_v1|split_signal_only_v1|split_output_stream_signal_v1|split_l1_ready_signal_v1|split_state_ready_signal_v1|split_state_consumer_probe_v1|split_state_consumer_probe_x4_v1|split_state_consumer_probe_x8_v1|split_state_consumer_vprefetch_x8_v1|split_state_consumer_vafter_state_x8_v1|split_state_real_p_vprefetch_x8_v1|split_state_real_p_vafter_state_x8_v1|split_state_real_p_kt_stream_v1|split_pv_owner_probe_v1|split_state_mailbox_ring_v1|split_pv_owner_output_v1|split_pv_owner_output_no_ack_v1] "
                 "[--grid X,Y] [--warmup N] [--iters N] [--device-id N] "
                 "[--high-precision] [--check-correctness] [--no-device-profiler-read]\n");
             std::exit(0);
@@ -968,9 +1261,10 @@ std::optional<DeviceZoneSummary> read_device_profiler(
     auto csv_path = profiler_csv_path();
     auto summary = read_device_zone_summary(csv_path, csv_offset);
     fmt::print(
-        "FLASH_ATTN_PROFILE_DEVICE shape={} variant={} mode={} pipeline={} pipeline_depth={} qk_subblock={} q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} grid_policy={} grid={} csv={} chip_freq_mhz={:.3f} zones={}\n",
+        "FLASH_ATTN_PROFILE_DEVICE shape={} variant={} experiment={} mode={} pipeline={} pipeline_depth={} qk_subblock={} q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} qk_detail_profile={} q_reader_schedule={} qk_first_body_warmup={} compute_pipeline_schedule={} grid_policy={} grid={} csv={} chip_freq_mhz={:.3f} zones={}\n",
         shape.name,
         fap::variant_name(variant),
+        fap::experiment_mode_name(options.experiment_mode),
         fap::run_mode_name(mode),
         fap::pipeline_mode_name(options.pipeline_mode),
         options.pipeline_depth,
@@ -979,6 +1273,10 @@ std::optional<DeviceZoneSummary> read_device_profiler(
         copied_dst_sync_label(options.copied_kernel_options),
         qk_softmax_profile_stage_label(options.copied_kernel_options.qk_softmax_profile_stage),
         qk_softmax_schedule_label(options.copied_kernel_options.qk_softmax_schedule),
+        qk_detail_profile_stage_label(options.copied_kernel_options.qk_detail_profile_stage),
+        q_reader_schedule_label(options.copied_kernel_options.q_reader_schedule),
+        qk_first_body_warmup_label(options.copied_kernel_options.qk_first_body_warmup),
+        compute_pipeline_schedule_label(options.copied_kernel_options.compute_pipeline_schedule),
         fap::grid_policy_name(options.grid_policy),
         grid_label(options, variant, shape, mesh_device),
         csv_path.string(),
@@ -986,10 +1284,11 @@ std::optional<DeviceZoneSummary> read_device_profiler(
         summary.zones.size());
     for (const auto& [zone, stats] : summary.zones) {
         fmt::print(
-            "FLASH_ATTN_PROFILE_STAGE_RESULT shape={} variant={} mode={} pipeline={} pipeline_depth={} qk_subblock={} q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} grid_policy={} grid={} zone=\"{}\" count={} min_cycles={} "
+            "FLASH_ATTN_PROFILE_STAGE_RESULT shape={} variant={} experiment={} mode={} pipeline={} pipeline_depth={} qk_subblock={} q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} qk_detail_profile={} q_reader_schedule={} qk_first_body_warmup={} compute_pipeline_schedule={} grid_policy={} grid={} zone=\"{}\" count={} min_cycles={} "
             "avg_cycles={} max_cycles={} critical_us={:.3f} first_start_us={:.3f} last_end_us={:.3f} span_us={:.3f}\n",
             shape.name,
             fap::variant_name(variant),
+            fap::experiment_mode_name(options.experiment_mode),
             fap::run_mode_name(mode),
             fap::pipeline_mode_name(options.pipeline_mode),
             options.pipeline_depth,
@@ -998,6 +1297,10 @@ std::optional<DeviceZoneSummary> read_device_profiler(
             copied_dst_sync_label(options.copied_kernel_options),
             qk_softmax_profile_stage_label(options.copied_kernel_options.qk_softmax_profile_stage),
             qk_softmax_schedule_label(options.copied_kernel_options.qk_softmax_schedule),
+            qk_detail_profile_stage_label(options.copied_kernel_options.qk_detail_profile_stage),
+            q_reader_schedule_label(options.copied_kernel_options.q_reader_schedule),
+            qk_first_body_warmup_label(options.copied_kernel_options.qk_first_body_warmup),
+            compute_pipeline_schedule_label(options.copied_kernel_options.compute_pipeline_schedule),
             fap::grid_policy_name(options.grid_policy),
             grid_label(options, variant, shape, mesh_device),
             zone,
@@ -1009,6 +1312,41 @@ std::optional<DeviceZoneSummary> read_device_profiler(
             stats.first_start_us,
             stats.last_end_us,
             stats.span_us);
+    }
+    if (options.print_device_profiler_by_risc) {
+        for (const auto& [zone_risc, stats] : summary.zones_by_risc) {
+            const auto& [zone, risc] = zone_risc;
+            fmt::print(
+                "FLASH_ATTN_PROFILE_STAGE_RISC_RESULT shape={} variant={} experiment={} mode={} pipeline={} pipeline_depth={} qk_subblock={} q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} qk_detail_profile={} q_reader_schedule={} qk_first_body_warmup={} compute_pipeline_schedule={} grid_policy={} grid={} zone=\"{}\" risc=\"{}\" count={} min_cycles={} "
+                "avg_cycles={} max_cycles={} critical_us={:.3f} first_start_us={:.3f} last_end_us={:.3f} span_us={:.3f}\n",
+                shape.name,
+                fap::variant_name(variant),
+                fap::experiment_mode_name(options.experiment_mode),
+                fap::run_mode_name(mode),
+                fap::pipeline_mode_name(options.pipeline_mode),
+                options.pipeline_depth,
+                copied_qk_subblock_label(options.copied_kernel_options),
+                copied_q_buffer_factor_label(options.copied_kernel_options),
+                copied_dst_sync_label(options.copied_kernel_options),
+                qk_softmax_profile_stage_label(options.copied_kernel_options.qk_softmax_profile_stage),
+                qk_softmax_schedule_label(options.copied_kernel_options.qk_softmax_schedule),
+                qk_detail_profile_stage_label(options.copied_kernel_options.qk_detail_profile_stage),
+                q_reader_schedule_label(options.copied_kernel_options.q_reader_schedule),
+                qk_first_body_warmup_label(options.copied_kernel_options.qk_first_body_warmup),
+                compute_pipeline_schedule_label(options.copied_kernel_options.compute_pipeline_schedule),
+                fap::grid_policy_name(options.grid_policy),
+                grid_label(options, variant, shape, mesh_device),
+                zone,
+                risc,
+                stats.count,
+                stats.min_cycles,
+                stats.avg_cycles,
+                stats.max_cycles,
+                stats.critical_us,
+                stats.first_start_us,
+                stats.last_end_us,
+                stats.span_us);
+        }
     }
     return summary;
 }
@@ -1026,9 +1364,10 @@ void run_one(
             options.pipeline_mode,
             options.pipeline_depth)) {
         fmt::print(
-            "FLASH_ATTN_PROFILE_SKIP shape={} variant={} mode={} pipeline={} pipeline_depth={} grid_policy={} grid={} reason=\"{}\"\n",
+            "FLASH_ATTN_PROFILE_SKIP shape={} variant={} experiment={} mode={} pipeline={} pipeline_depth={} grid_policy={} grid={} reason=\"{}\"\n",
             shape.name,
             fap::variant_name(variant),
+            fap::experiment_mode_name(options.experiment_mode),
             fap::run_mode_name(mode),
             fap::pipeline_mode_name(options.pipeline_mode),
             options.pipeline_depth,
@@ -1044,6 +1383,7 @@ void run_one(
     auto runner = fap::prepare_flash_attention_runner(
         variant,
         mode,
+        options.experiment_mode,
         options.pipeline_mode,
         options.pipeline_depth,
         options.copied_kernel_options,
@@ -1087,11 +1427,12 @@ void run_one(
     auto copy_q = summarize_us(copy_q_us);
     auto copy_start = summarize_us(copy_start_us);
     fmt::print(
-        "FLASH_ATTN_PROFILE_RESULT shape={} variant={} mode={} pipeline={} pipeline_depth={} qk_subblock={} q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} grid_policy={} B={} H={} KVH={} S={} D={} prefill={} q={} k={} page={} "
+        "FLASH_ATTN_PROFILE_RESULT shape={} variant={} experiment={} mode={} pipeline={} pipeline_depth={} qk_subblock={} q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} qk_detail_profile={} q_reader_schedule={} qk_first_body_warmup={} compute_pipeline_schedule={} grid_policy={} B={} H={} KVH={} S={} D={} prefill={} q={} k={} page={} "
         "grid={} iters={} avg_ms={:.3f} best_ms={:.3f} worst_ms={:.3f} call_avg_ms={:.3f} sync_avg_ms={:.3f} "
         "copy_q_avg_ms={:.3f} copy_start_avg_ms={:.3f} cache_entries={}\n",
         shape.name,
         fap::variant_name(variant),
+        fap::experiment_mode_name(options.experiment_mode),
         fap::run_mode_name(mode),
         fap::pipeline_mode_name(options.pipeline_mode),
         options.pipeline_depth,
@@ -1100,6 +1441,10 @@ void run_one(
         copied_dst_sync_label(options.copied_kernel_options),
         qk_softmax_profile_stage_label(options.copied_kernel_options.qk_softmax_profile_stage),
         qk_softmax_schedule_label(options.copied_kernel_options.qk_softmax_schedule),
+        qk_detail_profile_stage_label(options.copied_kernel_options.qk_detail_profile_stage),
+        q_reader_schedule_label(options.copied_kernel_options.q_reader_schedule),
+        qk_first_body_warmup_label(options.copied_kernel_options.qk_first_body_warmup),
+        compute_pipeline_schedule_label(options.copied_kernel_options.compute_pipeline_schedule),
         fap::grid_policy_name(options.grid_policy),
         shape.b,
         shape.nh,
@@ -1147,8 +1492,8 @@ int main(int argc, char** argv) {
         for (const auto& shape : options.shapes) {
             fmt::print(
                 "# FlashAttention profile shape={} B={} H={} KVH={} S={} D={} prefill={} q={} k={} page={} "
-                "warmup={} iters={} high_precision={} pipeline={} pipeline_depth={} qk_subblock={} "
-                "q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} grid_policy={} grid={}\n",
+                "warmup={} iters={} high_precision={} experiment={} pipeline={} pipeline_depth={} qk_subblock={} "
+                "q_buffer_factor={} dst_sync={} qk_softmax_profile={} qk_softmax_schedule={} qk_detail_profile={} q_reader_schedule={} qk_first_body_warmup={} compute_pipeline_schedule={} grid_policy={} grid={}\n",
                 shape.name,
                 shape.b,
                 shape.nh,
@@ -1162,6 +1507,7 @@ int main(int argc, char** argv) {
                 options.warmup_iters,
                 options.measured_iters,
                 options.high_precision ? "true" : "false",
+                fap::experiment_mode_name(options.experiment_mode),
                 fap::pipeline_mode_name(options.pipeline_mode),
                 options.pipeline_depth,
                 copied_qk_subblock_label(options.copied_kernel_options),
@@ -1169,6 +1515,10 @@ int main(int argc, char** argv) {
                 copied_dst_sync_label(options.copied_kernel_options),
                 qk_softmax_profile_stage_label(options.copied_kernel_options.qk_softmax_profile_stage),
                 qk_softmax_schedule_label(options.copied_kernel_options.qk_softmax_schedule),
+                qk_detail_profile_stage_label(options.copied_kernel_options.qk_detail_profile_stage),
+                q_reader_schedule_label(options.copied_kernel_options.q_reader_schedule),
+                qk_first_body_warmup_label(options.copied_kernel_options.qk_first_body_warmup),
+                compute_pipeline_schedule_label(options.copied_kernel_options.compute_pipeline_schedule),
                 fap::grid_policy_name(options.grid_policy),
                 "per-variant");
             auto inputs = make_inputs(shape);
@@ -1179,6 +1529,7 @@ int main(int argc, char** argv) {
                     options.high_precision,
                     mesh_device,
                     options.variants,
+                    options.experiment_mode,
                     options.pipeline_mode,
                     options.pipeline_depth,
                     options.copied_kernel_options,
@@ -1186,9 +1537,10 @@ int main(int argc, char** argv) {
                     options.grid_override);
                 for (const auto& result : correctness_results) {
                     fmt::print(
-                        "FLASH_ATTN_PROFILE_CORRECTNESS shape={} pipeline={} pipeline_depth={} grid_policy={} baseline={} candidate={} elements={} "
+                        "FLASH_ATTN_PROFILE_CORRECTNESS shape={} experiment={} pipeline={} pipeline_depth={} grid_policy={} baseline={} candidate={} elements={} "
                         "max_abs_diff={:.6f} mean_abs_diff={:.6f} tolerance={:.6f} passed={}\n",
                         shape.name,
+                        fap::experiment_mode_name(options.experiment_mode),
                         fap::pipeline_mode_name(options.pipeline_mode),
                         options.pipeline_depth,
                         fap::grid_policy_name(options.grid_policy),
@@ -1208,8 +1560,9 @@ int main(int argc, char** argv) {
                 }
                 if (correctness_results.empty()) {
                     fmt::print(
-                        "FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape={} pipeline={} pipeline_depth={} grid_policy={} reason=\"select both baseline and copied variants to compare\"\n",
+                        "FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape={} experiment={} pipeline={} pipeline_depth={} grid_policy={} reason=\"select both baseline and copied variants to compare\"\n",
                         shape.name,
+                        fap::experiment_mode_name(options.experiment_mode),
                         fap::pipeline_mode_name(options.pipeline_mode),
                         options.pipeline_depth,
                         fap::grid_policy_name(options.grid_policy));

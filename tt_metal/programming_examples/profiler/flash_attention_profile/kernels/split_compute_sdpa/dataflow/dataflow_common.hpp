@@ -1185,7 +1185,7 @@ void write_block(
 // to be source-L1-acked, not for unrelated trids that may be in flight from elsewhere.
 //
 // Caller is responsible for any final NoC barrier (DRAM-arrival).
-template <bool profile_writer_pipeline = false, typename WriteTileFn>
+template <bool profile_writer_pipeline = false, typename WriteTileFn, typename GroupReadyFn>
 void drain_cb_row_grouped(
     const uint32_t cb_out,
     const uint32_t total_rows,
@@ -1193,7 +1193,8 @@ void drain_cb_row_grouped(
     const uint32_t tile_bytes,
     const uint32_t sbh,
     const uint32_t flush_trid,
-    WriteTileFn write_tile) {
+    WriteTileFn write_tile,
+    GroupReadyFn group_ready) {
     const uint32_t num_full_groups = total_rows / sbh;
     const uint32_t remainder_rows = total_rows - num_full_groups * sbh;
     const uint32_t num_groups = num_full_groups + (remainder_rows ? 1 : 0);
@@ -1215,6 +1216,7 @@ void drain_cb_row_grouped(
                 cb_wait_front(cb_out, tiles_this_group);
             }
         }
+        group_ready(rg, rows_this_group, tiles_this_group);
         uint32_t l1_read_addr = get_read_ptr(cb_out);
         {
             DeviceZoneScopedN("FAP_WRITER_STORE_TILES");
@@ -1271,8 +1273,8 @@ void drain_cb_row_grouped(
 // popped but not written. Periodic barrier_threshold flushes guard the NoC ack queue;
 // final noc_async_write_barrier ensures DRAM arrival before return. Single-chip never
 // sets a non-zero trid → drain flushes trid 0 (the default trid all writes here carry).
-template <bool profile_writer_pipeline = false, typename TensorAccessorType>
-void write_block_row_grouped(
+template <bool profile_writer_pipeline = false, typename TensorAccessorType, typename GroupReadyFn>
+void write_block_row_grouped_with_group_ready(
     const TensorAccessorType& out_writer,
     const uint32_t cb_out,
     const uint32_t total_rows,
@@ -1281,7 +1283,8 @@ void write_block_row_grouped(
     const uint32_t out_tile_id,
     const uint32_t tile_bytes,
     const uint32_t sbh,
-    const uint32_t barrier_threshold) {
+    const uint32_t barrier_threshold,
+    GroupReadyFn group_ready) {
     constexpr uint32_t default_trid = 0;
     uint32_t tile_id = out_tile_id;
     uint32_t barrier_count = 0;
@@ -1295,7 +1298,97 @@ void write_block_row_grouped(
                     barrier_count = 0;
                 }
             }
-        });
+        },
+        group_ready);
+    {
+        DeviceZoneScopedN("FAP_WRITER_STORE_BARRIER");
+        noc_async_write_barrier();
+    }
+}
+
+template <bool profile_writer_pipeline = false, typename TensorAccessorType>
+void write_block_row_grouped(
+    const TensorAccessorType& out_writer,
+    const uint32_t cb_out,
+    const uint32_t total_rows,
+    const uint32_t write_rows,
+    const uint32_t cols,
+    const uint32_t out_tile_id,
+    const uint32_t tile_bytes,
+    const uint32_t sbh,
+    const uint32_t barrier_threshold) {
+    write_block_row_grouped_with_group_ready<profile_writer_pipeline>(
+        out_writer,
+        cb_out,
+        total_rows,
+        write_rows,
+        cols,
+        out_tile_id,
+        tile_bytes,
+        sbh,
+        barrier_threshold,
+        [](uint32_t, uint32_t, uint32_t) {});
+}
+
+// Same drain contract as write_block_row_grouped, but the first output row group
+// is owned by a separate consumer core and is therefore absent from cb_out.
+template <bool profile_writer_pipeline = false, typename TensorAccessorType>
+void write_block_row_grouped_skip_first_group(
+    const TensorAccessorType& out_writer,
+    const uint32_t cb_out,
+    const uint32_t total_rows,
+    const uint32_t write_rows,
+    const uint32_t cols,
+    const uint32_t out_tile_id,
+    const uint32_t tile_bytes,
+    const uint32_t sbh,
+    const uint32_t barrier_threshold) {
+    constexpr uint32_t default_trid = 0;
+    const uint32_t num_full_groups = total_rows / sbh;
+    const uint32_t remainder_rows = total_rows - num_full_groups * sbh;
+    const uint32_t num_groups = num_full_groups + (remainder_rows ? 1 : 0);
+    uint32_t barrier_count = 0;
+
+    for (uint32_t rg = 1; rg < num_groups; ++rg) {
+        const uint32_t rows_this_group = (rg < num_full_groups) ? sbh : remainder_rows;
+        const uint32_t tiles_this_group = rows_this_group * cols;
+        {
+            DeviceZoneScopedN("FAP_WRITER_WAIT_OUTPUT");
+            if constexpr (profile_writer_pipeline) {
+                DeviceZoneScopedN("FAP_WRITER_NEXT_GROUP_WAIT_OUTPUT");
+            }
+            cb_wait_front(cb_out, tiles_this_group);
+        }
+        uint32_t l1_read_addr = get_read_ptr(cb_out);
+        {
+            DeviceZoneScopedN("FAP_WRITER_STORE_TILES");
+            if constexpr (profile_writer_pipeline) {
+                DeviceZoneScopedN("FAP_WRITER_NEXT_GROUP_STORE_TILES");
+            }
+            for (uint32_t r = 0; r < rows_this_group; ++r) {
+                const uint32_t row = rg * sbh + r;
+                if (row < write_rows) {
+                    uint32_t tile_id = out_tile_id + row * cols;
+                    for (uint32_t col = 0; col < cols; ++col) {
+                        noc_async_write_tile(tile_id + col, out_writer, l1_read_addr + col * tile_bytes);
+                        if (++barrier_count == barrier_threshold) {
+                            noc_async_write_flushed_with_trid(default_trid);
+                            barrier_count = 0;
+                        }
+                    }
+                }
+                l1_read_addr += cols * tile_bytes;
+            }
+        }
+        {
+            DeviceZoneScopedN("FAP_WRITER_STORE_FLUSH");
+            if constexpr (profile_writer_pipeline) {
+                DeviceZoneScopedN("FAP_WRITER_NEXT_GROUP_STORE_FLUSH");
+            }
+            noc_async_write_flushed_with_trid(default_trid);
+        }
+        cb_pop_front(cb_out, tiles_this_group);
+    }
     {
         DeviceZoneScopedN("FAP_WRITER_STORE_BARRIER");
         noc_async_write_barrier();

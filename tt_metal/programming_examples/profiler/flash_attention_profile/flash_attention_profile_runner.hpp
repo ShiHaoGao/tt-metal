@@ -44,12 +44,22 @@ enum class GridPolicy {
     CopiedBalancedQ,
 };
 
+enum class ExperimentMode {
+    Copied,
+    SplitComputeV1,
+    LlkMicroflowV1,
+};
+
 struct CopiedKernelOptions {
     std::optional<std::pair<uint32_t, uint32_t>> qk_subblock_override = std::nullopt;
     std::optional<uint32_t> q_buffer_factor_override = std::nullopt;
     std::optional<bool> dst_full_sync_override = std::nullopt;
     uint32_t qk_softmax_profile_stage = 0;
     uint32_t qk_softmax_schedule = 0;
+    uint32_t qk_detail_profile_stage = 0;
+    uint32_t q_reader_schedule = 0;
+    uint32_t qk_first_body_warmup = 0;
+    uint32_t compute_pipeline_schedule = 0;
 };
 
 struct ShapeConfig {
@@ -107,11 +117,13 @@ const char* variant_name(Variant variant);
 const char* run_mode_name(RunMode mode);
 const char* pipeline_mode_name(PipelineMode mode);
 const char* grid_policy_name(GridPolicy policy);
+const char* experiment_mode_name(ExperimentMode mode);
 bool variant_is_chunked(Variant variant);
 bool variant_is_copied(Variant variant);
 
 std::optional<tt::tt_metal::CoreCoord> resolve_flash_attention_grid(
     Variant variant,
+    ExperimentMode experiment_mode,
     GridPolicy grid_policy,
     std::optional<tt::tt_metal::CoreCoord> grid_override,
     const ShapeConfig& shape,
@@ -120,6 +132,7 @@ std::optional<tt::tt_metal::CoreCoord> resolve_flash_attention_grid(
 std::unique_ptr<FlashAttentionProfileRunner> prepare_flash_attention_runner(
     Variant variant,
     RunMode mode,
+    ExperimentMode experiment_mode,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
     CopiedKernelOptions copied_kernel_options,
@@ -136,6 +149,7 @@ std::vector<CorrectnessResult> check_flash_attention_correctness(
     bool high_precision,
     const std::shared_ptr<tt::tt_metal::distributed::MeshDevice>& mesh_device,
     const std::vector<Variant>& selected_variants,
+    ExperimentMode experiment_mode,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
     CopiedKernelOptions copied_kernel_options,

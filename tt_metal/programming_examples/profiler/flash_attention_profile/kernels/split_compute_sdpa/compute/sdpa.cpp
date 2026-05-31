@@ -13,7 +13,9 @@
 #include "compute_streaming.hpp"
 
 void kernel_main() {
-    DeviceZoneScopedN("FAP_COMPUTE");
+    DeviceZoneScopedN("FAP_SPLIT_COMPUTE_V1_PRODUCER");
+    {
+        DeviceZoneScopedN("FAP_COMPUTE");
 
     constexpr uint32_t B = get_compile_time_arg_val(0);
     constexpr uint32_t NQH = get_compile_time_arg_val(1);
@@ -154,6 +156,9 @@ void kernel_main() {
                 (phase == 0) ? chunked_q_chunk_offset_phase_1 : chunked_q_chunk_offset_phase_2;
             for (uint32_t nb = local_batch_start; nb < local_batch_end; ++nb) {
                 for (uint32_t nq = local_nh_start; nq < local_nh_end; ++nq) {
+                    const bool split_pv_owner_output_for_this_head =
+                        (compute_pipeline_schedule == 23 || compute_pipeline_schedule == 25) && core_id == 0 &&
+                        nb == 0 && nq == 0;
                     sdpa_standard_v2<
                         Sq_chunk_t,
                         Sk_chunk_t,
@@ -197,7 +202,8 @@ void kernel_main() {
                         phase_chunked_offset,
                         lw_mask,
                         q_num_chunks,
-                        use_zigzag_balancing);
+                        use_zigzag_balancing,
+                        split_pv_owner_output_for_this_head);
                 }
             }
         }
@@ -280,5 +286,6 @@ void kernel_main() {
                 }
             }
         }
+    }
     }
 }

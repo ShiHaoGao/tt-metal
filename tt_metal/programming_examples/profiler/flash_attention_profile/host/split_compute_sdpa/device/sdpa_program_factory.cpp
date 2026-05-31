@@ -17,7 +17,7 @@
 using namespace tt::constants;
 using namespace tt::tt_metal;
 
-namespace ttnn::prim::flash_attention_profile_sdpa {
+namespace ttnn::prim::flash_attention_profile_split_compute_sdpa {
 
 // Chain management structures for KV store-and-forward optimization
 struct CoreHeadWork {
@@ -325,6 +325,31 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
 
     auto core_grid = CoreRange({0, 0}, {grid_size.x - 1, grid_size.y - 1});
     uint32_t num_cores = grid_size.x * grid_size.y;
+    const auto device_grid = device->compute_with_storage_grid_size();
+    TT_FATAL(
+        num_cores < device_grid.x * device_grid.y,
+        "split_compute_v1 reserves one extra compute core for the consumer probe; use a smaller producer grid than "
+        "the device grid");
+    CoreCoord consumer_probe_core{device_grid.x, device_grid.y};
+    for (uint32_t y = 0; y < device_grid.y && consumer_probe_core.x == device_grid.x; ++y) {
+        for (uint32_t x = 0; x < device_grid.x; ++x) {
+            if (x >= grid_size.x || y >= grid_size.y) {
+                consumer_probe_core = CoreCoord{x, y};
+                break;
+            }
+        }
+    }
+    TT_FATAL(
+        consumer_probe_core.x < device_grid.x && consumer_probe_core.y < device_grid.y,
+        "split_compute_v1 could not find a reserved consumer probe core outside producer grid {}x{} on device grid "
+        "{}x{}",
+        grid_size.x,
+        grid_size.y,
+        device_grid.x,
+        device_grid.y);
+    const CoreCoord consumer_probe_physical_core = device->worker_core_from_logical_core(consumer_probe_core);
+    const CoreCoord producer_signal_physical_core = device->worker_core_from_logical_core(CoreCoord{0, 0});
+    const auto consumer_probe_grid = CoreRangeSet(CoreRange(consumer_probe_core, consumer_probe_core));
 
     TT_FATAL(
         num_cores <= device->compute_with_storage_grid_size().x * device->compute_with_storage_grid_size().y,
@@ -627,6 +652,67 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
             valid_semaphore_id);
     }
 
+    const bool split_signal_only = operation_attributes.compute_pipeline_schedule == 9;
+    const bool split_output_stream_signal = operation_attributes.compute_pipeline_schedule == 10;
+    const bool split_l1_ready_signal = operation_attributes.compute_pipeline_schedule == 11;
+    const bool split_state_ready_signal = operation_attributes.compute_pipeline_schedule == 12;
+    const bool split_state_real_p_kt_stream = operation_attributes.compute_pipeline_schedule == 20;
+    const bool split_pv_owner_probe = operation_attributes.compute_pipeline_schedule == 21;
+    const bool split_state_mailbox_ring = operation_attributes.compute_pipeline_schedule == 22;
+    const bool split_pv_owner_output_no_ack = operation_attributes.compute_pipeline_schedule == 25;
+    const bool split_pv_owner_output = operation_attributes.compute_pipeline_schedule == 23 || split_pv_owner_output_no_ack;
+    const bool split_state_real_p_packet_stream = split_state_real_p_kt_stream || split_state_mailbox_ring;
+    const bool split_state_real_p_handoff =
+        operation_attributes.compute_pipeline_schedule == 18 || operation_attributes.compute_pipeline_schedule == 19 ||
+        split_state_real_p_packet_stream || split_pv_owner_probe || split_pv_owner_output;
+    const bool split_state_consumer_probe =
+        (operation_attributes.compute_pipeline_schedule >= 13 && operation_attributes.compute_pipeline_schedule <= 23) ||
+        split_pv_owner_output_no_ack;
+    const uint32_t split_state_consumer_probe_multiplier =
+        operation_attributes.compute_pipeline_schedule == 14 ? 4
+        : operation_attributes.compute_pipeline_schedule >= 15 && operation_attributes.compute_pipeline_schedule <= 19
+            ? 8
+            : 1;
+    const bool split_signal_enabled =
+        split_signal_only || split_output_stream_signal || split_l1_ready_signal || split_state_ready_signal ||
+        split_state_consumer_probe;
+    const uint32_t split_signal_expected_output_chunks =
+        std::min(batch_per_core, B) * std::min(nh_per_core, NQH) * std::min(q_per_core, q_num_chunks);
+    const uint32_t split_owner_q_rows = out_out_subblock_h;
+    const uint32_t split_signal_row_groups_per_output = (Sq_chunk_t + split_owner_q_rows - 1) / split_owner_q_rows;
+    const uint32_t split_real_p_packet_count = split_state_real_p_packet_stream ? (Sk_chunk_t / qk_out_subblock_w) : 1;
+    const uint32_t split_signal_outputs_per_chunk =
+        split_l1_ready_signal ? split_signal_row_groups_per_output : split_real_p_packet_count;
+    const uint32_t split_signal_expected_outputs =
+        (split_signal_only || split_pv_owner_output) ? 1
+                                                     : split_signal_expected_output_chunks *
+                                                           split_signal_outputs_per_chunk;
+    const uint32_t split_real_p_packet_k_tiles = split_state_real_p_packet_stream ? qk_out_subblock_w : Sk_chunk_t;
+    const uint32_t split_owner_sum_tiles = split_pv_owner_output ? split_owner_q_rows : 0;
+    const uint32_t split_real_p_packet_tiles = split_owner_q_rows * split_real_p_packet_k_tiles + split_owner_sum_tiles;
+    const uint32_t split_state_mailbox_slots =
+        split_state_mailbox_ring ? std::min<uint32_t>(4, std::max<uint32_t>(1, split_real_p_packet_count)) : 1;
+    uint32_t split_signal_semaphore_id = 0;
+    CoreRangeSet split_handoff_grid;
+    if (split_signal_enabled) {
+        TT_FATAL(
+            split_signal_expected_output_chunks > 0, "split signal experiments require producer core 0 to own work");
+        split_handoff_grid = CoreRangeSet(
+            std::vector<CoreRange>{core_grid, CoreRange(consumer_probe_core, consumer_probe_core)});
+        split_signal_semaphore_id = CreateSemaphore(program, split_handoff_grid, 0);
+        log_debug(
+            tt::LogOp,
+            "split_signal_only_v1 enabled - handoff semaphore {} from producer grid {}x{} to consumer probe core "
+            "logical ({},{}) physical ({},{})",
+            split_signal_semaphore_id,
+            grid_size.x,
+            grid_size.y,
+            consumer_probe_core.x,
+            consumer_probe_core.y,
+            consumer_probe_physical_core.x,
+            consumer_probe_physical_core.y);
+    }
+
     std::vector<uint32_t> writer_compile_time_args = {
         // interleaved accessor args
         B,
@@ -655,6 +741,14 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         k_partial_col,                                // arg 23: K partial-tile col (0 = no partial)
         static_cast<uint32_t>(use_zigzag_balancing),  // arg 24
         operation_attributes.qk_detail_profile_stage, // arg 25
+        operation_attributes.compute_pipeline_schedule, // arg 26
+        split_signal_semaphore_id,                    // arg 27
+        static_cast<uint32_t>(consumer_probe_physical_core.x), // arg 28
+        static_cast<uint32_t>(consumer_probe_physical_core.y), // arg 29
+        split_signal_only ? 1 : split_signal_expected_outputs, // arg 30
+        split_state_real_p_handoff ? split_real_p_packet_tiles : 1, // arg 31
+        split_state_real_p_handoff ? split_real_p_packet_count : 1, // arg 32
+        split_state_mailbox_slots,                         // arg 33
     };
 
     TensorAccessorArgs(output_tensor.buffer()).append_to(writer_compile_time_args);
@@ -682,10 +776,34 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         "qk_first_body_warmup must be in [0, 2], got {}",
         operation_attributes.qk_first_body_warmup);
     TT_FATAL(
-        operation_attributes.compute_pipeline_schedule <= 4,
-        "compute_pipeline_schedule must be in [0, 4], got {}",
+        operation_attributes.compute_pipeline_schedule <= 4 || split_signal_enabled,
+        "compute_pipeline_schedule must be in [0, 4] for copied schedules, 9 for split_signal_only_v1, 10 for "
+        "split_output_stream_signal_v1, 11 for split_l1_ready_signal_v1, 12 for "
+        "split_state_ready_signal_v1, 13-23 for split_state_consumer schedules, or 25 for "
+        "split_pv_owner_output_no_ack_v1, got {}",
         operation_attributes.compute_pipeline_schedule);
-    if (operation_attributes.compute_pipeline_schedule != 0) {
+    if (split_state_ready_signal || split_state_consumer_probe) {
+        TT_FATAL(
+            use_streaming_compute,
+            "split_state_ready_signal_v1 and split_state_consumer_probe schedules require streaming compute");
+    }
+    if (split_pv_owner_output) {
+        TT_FATAL(is_causal, "split_pv_owner_output_v1 is only defined for causal SDPA");
+        TT_FATAL(!is_chunked, "split_pv_owner_output_v1 is only defined for non-chunked prefill");
+        TT_FATAL(
+            Sq_chunk_t <= Sk_chunk_t,
+            "split_pv_owner_output_v1 only owns q_chunk0 when it has exactly one K chunk; got Sq_chunk_t={} "
+            "Sk_chunk_t={}",
+            Sq_chunk_t,
+            Sk_chunk_t);
+        TT_FATAL(
+            split_owner_q_rows * vDHt <= dst_size,
+            "split_pv_owner_output_v1 requires q_rows*vDHt <= dst_size; got {}*{} > {}",
+            split_owner_q_rows,
+            vDHt,
+            dst_size);
+    }
+    if (operation_attributes.compute_pipeline_schedule != 0 && !split_signal_enabled) {
         TT_FATAL(use_streaming_compute, "compute pipeline experiments require streaming compute");
         TT_FATAL(
             !salad_first_handoff,
@@ -740,7 +858,9 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         operation_attributes.qk_softmax_schedule,      // arg 38
         operation_attributes.qk_detail_profile_stage,  // arg 39
         operation_attributes.qk_first_body_warmup,     // arg 40
-        operation_attributes.compute_pipeline_schedule, // arg 41
+        (split_signal_only || split_output_stream_signal || split_l1_ready_signal)
+            ? 0
+            : operation_attributes.compute_pipeline_schedule, // arg 41
     };
 
     TensorAccessorArgs(output_tensor.buffer()).append_to(compute_compile_time_args);
@@ -910,6 +1030,22 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
                              .set_page_size(tt::CBIndex::c_16, out_tile_size);
 
     CreateCircularBuffer(program, core_grid, c_out0_config);
+
+    if (split_state_ready_signal || split_state_consumer_probe) {
+        if (split_state_real_p_handoff) {
+            auto c_split_state_ready_config =
+                CircularBufferConfig(
+                    split_real_p_packet_tiles * split_state_mailbox_slots * im_tile_size,
+                    {{tt::CBIndex::c_15, im_df}})
+                    .set_page_size(tt::CBIndex::c_15, im_tile_size);
+            CreateCircularBuffer(program, split_handoff_grid, c_split_state_ready_config);
+        } else {
+            auto c_split_state_ready_config =
+                CircularBufferConfig(32, {{tt::CBIndex::c_15, tt::DataFormat::Int32}})
+                    .set_page_size(tt::CBIndex::c_15, 32);
+            CreateCircularBuffer(program, core_grid, c_split_state_ready_config);
+        }
+    }
 
     // Note: Semaphores for KV chain forwarding are now created earlier (before kernel compilation)
     // to ensure the actual semaphore IDs are available in the compile-time args
@@ -1391,19 +1527,19 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
     // Create kernels (deferred until after chain construction for mcast_enabled flag)
     auto reader_kernels_id = CreateKernel(
         program,
-        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/dataflow/reader_interleaved.cpp",
+        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/split_compute_sdpa/dataflow/reader_interleaved.cpp",
         core_grid,
         tt::tt_metal::ReaderDataMovementConfig(reader_compile_time_args, defines));
 
     auto writer_kernels_id = CreateKernel(
         program,
-        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/dataflow/writer_interleaved.cpp",
+        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/split_compute_sdpa/dataflow/writer_interleaved.cpp",
         core_grid,
         tt::tt_metal::WriterDataMovementConfig(writer_compile_time_args, defines));
 
     auto compute_kernels_id = CreateKernel(
         program,
-        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/compute/sdpa.cpp",
+        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/split_compute_sdpa/compute/sdpa.cpp",
         core_grid,
         tt::tt_metal::ComputeConfig{
             .math_fidelity = math_fidelity,
@@ -1412,6 +1548,103 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
             .math_approx_mode = math_approx_mode,
             .compile_args = compute_compile_time_args,
             .defines = defines});
+
+    KernelHandle consumer_probe_kernels_id{};
+    KernelHandle consumer_signal_kernels_id{};
+    const bool split_consumer_compute_enabled = split_state_consumer_probe;
+    if (split_signal_enabled) {
+        const bool split_consumer_token_enabled = split_consumer_compute_enabled && !split_state_real_p_handoff;
+        if (split_consumer_token_enabled) {
+            auto c_split_signal_config =
+                CircularBufferConfig(2 * im_tile_size, {{tt::CBIndex::c_6, im_df}})
+                    .set_page_size(tt::CBIndex::c_6, im_tile_size);
+            CreateCircularBuffer(program, consumer_probe_grid, c_split_signal_config);
+        }
+        if (split_state_consumer_probe) {
+            const uint32_t probe_k_tiles = split_state_real_p_packet_stream ? qk_out_subblock_w : Sk_chunk_t;
+            const uint32_t probe_p_tiles = split_owner_q_rows * probe_k_tiles;
+            const uint32_t probe_v_cols = split_pv_owner_output ? vDHt : out_out_subblock_w;
+            const uint32_t probe_v_tiles = probe_k_tiles * probe_v_cols;
+            const uint32_t probe_out_tiles = split_owner_q_rows * probe_v_cols;
+            auto c_consumer_probe_p_config =
+                CircularBufferConfig(probe_p_tiles * im_tile_size, {{tt::CBIndex::c_1, im_df}})
+                    .set_page_size(tt::CBIndex::c_1, im_tile_size);
+            CreateCircularBuffer(program, consumer_probe_grid, c_consumer_probe_p_config);
+            auto c_consumer_probe_v_config =
+                CircularBufferConfig(probe_v_tiles * v_tile_size, {{tt::CBIndex::c_2, v_df}})
+                    .set_page_size(tt::CBIndex::c_2, v_tile_size);
+            CreateCircularBuffer(program, consumer_probe_grid, c_consumer_probe_v_config);
+            if (split_pv_owner_output) {
+                auto c_consumer_probe_sum_config =
+                    CircularBufferConfig(split_owner_q_rows * stats_tile_size, {{tt::CBIndex::c_3, stats_df}})
+                        .set_page_size(tt::CBIndex::c_3, stats_tile_size);
+                CreateCircularBuffer(program, consumer_probe_grid, c_consumer_probe_sum_config);
+                auto c_consumer_probe_scratch_config =
+                    CircularBufferConfig(1 * im_tile_size, {{tt::CBIndex::c_4, im_df}})
+                        .set_page_size(tt::CBIndex::c_4, im_tile_size);
+                CreateCircularBuffer(program, consumer_probe_grid, c_consumer_probe_scratch_config);
+                auto c_consumer_owner_output_config =
+                    CircularBufferConfig(probe_out_tiles * out_tile_size, {{tt::CBIndex::c_5, out_df}})
+                        .set_page_size(tt::CBIndex::c_5, out_tile_size);
+                CreateCircularBuffer(program, consumer_probe_grid, c_consumer_owner_output_config);
+                auto c_consumer_col_identity_config =
+                    CircularBufferConfig(1 * scalar_tile_size, {{tt::CBIndex::c_7, scalar_df}})
+                    .set_page_size(tt::CBIndex::c_7, scalar_tile_size);
+                CreateCircularBuffer(program, consumer_probe_grid, c_consumer_col_identity_config);
+            }
+            const tt::DataFormat consumer_probe_out_df = split_pv_owner_output ? im_df : out_df;
+            const uint32_t consumer_probe_out_tile_size = split_pv_owner_output ? im_tile_size : out_tile_size;
+            auto c_consumer_probe_out_config =
+                CircularBufferConfig(probe_out_tiles * consumer_probe_out_tile_size, {{tt::CBIndex::c_16, consumer_probe_out_df}})
+                    .set_page_size(tt::CBIndex::c_16, consumer_probe_out_tile_size);
+            CreateCircularBuffer(program, consumer_probe_grid, c_consumer_probe_out_config);
+        }
+        if (split_consumer_compute_enabled) {
+            consumer_probe_kernels_id = CreateKernel(
+                program,
+                "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/split_compute_sdpa/compute/sdpa_consumer_probe.cpp",
+                consumer_probe_grid,
+                tt::tt_metal::ComputeConfig{
+                    .math_fidelity = math_fidelity,
+                    .fp32_dest_acc_en = fp32_dest_acc_en,
+                    .dst_full_sync_en = operation_attributes.dst_full_sync_override.value_or(dst_full_sync_en),
+                    .math_approx_mode = math_approx_mode,
+                    .compile_args = {
+                        operation_attributes.compute_pipeline_schedule,
+                        split_signal_expected_outputs,
+                        split_owner_q_rows,
+                        split_state_real_p_packet_stream ? qk_out_subblock_w : Sk_chunk_t,
+                        split_pv_owner_output ? vDHt : out_out_subblock_w,
+                        split_pv_owner_output ? 1
+                                              : out_in0_num_subblocks * out_in1_num_subblocks *
+                                                    split_state_consumer_probe_multiplier},
+                    .defines = defines});
+        }
+        std::vector<uint32_t> consumer_signal_compile_time_args = {
+            operation_attributes.compute_pipeline_schedule,
+            split_signal_semaphore_id,
+            split_signal_only ? 1 : split_signal_expected_outputs,
+            split_owner_q_rows * (split_state_real_p_packet_stream ? qk_out_subblock_w : Sk_chunk_t),
+                (split_state_real_p_packet_stream ? qk_out_subblock_w : Sk_chunk_t) *
+                (split_pv_owner_output ? vDHt : out_out_subblock_w),
+            im_tile_size,
+            v_tile_size,
+            static_cast<uint32_t>(producer_signal_physical_core.x),
+            static_cast<uint32_t>(producer_signal_physical_core.y),
+            split_state_mailbox_slots,
+            split_pv_owner_output ? split_owner_q_rows : 0,
+            split_pv_owner_output ? split_owner_q_rows * vDHt : 0,
+            out_tile_size,
+            packed_identity_scalar};
+        TensorAccessorArgs(output_tensor.buffer()).append_to(consumer_signal_compile_time_args);
+        TensorAccessorArgs(input_tensor_v.buffer()).append_to(consumer_signal_compile_time_args);
+        consumer_signal_kernels_id = CreateKernel(
+            program,
+            "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/split_compute_sdpa/dataflow/consumer_signal.cpp",
+            consumer_probe_grid,
+            tt::tt_metal::ReaderDataMovementConfig(consumer_signal_compile_time_args, defines));
+        SetRuntimeArgs(program, consumer_signal_kernels_id, consumer_probe_core, {out_addr, v_addr});
+    }
 
     // Set reader rt args
     for (uint32_t i = 0; i < num_cores; ++i) {
@@ -1523,6 +1756,10 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
             .reader_kernels_id = reader_kernels_id,
             .writer_kernels_id = writer_kernels_id,
             .compute_kernels_id = compute_kernels_id,
+            .consumer_probe_kernels_id = consumer_probe_kernels_id,
+            .consumer_signal_kernels_id = consumer_signal_kernels_id,
+            .producer_core_grid = CoreRangeSet({core_grid}),
+            .consumer_probe_core_grid = consumer_probe_grid,
             .grid_size = grid_size,
             .num_cores = num_cores,
             .is_chunked = is_chunked,
@@ -1576,6 +1813,7 @@ void SDPAProgramFactory::override_runtime_arguments(
     auto& reader_args_by_core = GetRuntimeArgs(program, shared_vars.reader_kernels_id);
     auto& writer_args_by_core = GetRuntimeArgs(program, shared_vars.writer_kernels_id);
     auto& compute_args_by_core = GetRuntimeArgs(program, shared_vars.compute_kernels_id);
+    const bool split_signal_enabled = operation_attributes.compute_pipeline_schedule >= 9;
 
     const auto& grid_size = shared_vars.grid_size;
     const auto num_cores = shared_vars.num_cores;
@@ -1603,6 +1841,13 @@ void SDPAProgramFactory::override_runtime_arguments(
         compute_args[8] = use_chunk_start_idx_tensor;
         compute_args[9] = chunked_q_chunk_offset;
     }
+    if (split_signal_enabled) {
+        auto& consumer_signal_args = GetRuntimeArgs(program, shared_vars.consumer_signal_kernels_id);
+        const auto consumer_core = shared_vars.consumer_probe_core_grid.ranges().begin()->start_coord;
+        auto& args = consumer_signal_args[consumer_core.x][consumer_core.y];
+        args[0] = out_addr;
+        args[1] = v_addr;
+    }
 }
 
-}  // namespace ttnn::prim::flash_attention_profile_sdpa
+}  // namespace ttnn::prim::flash_attention_profile_split_compute_sdpa

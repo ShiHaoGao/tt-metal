@@ -11,7 +11,7 @@
 #include <optional>
 #include <utility>
 
-namespace ttnn::prim::flash_attention_profile_sdpa {
+namespace ttnn::prim::flash_attention_profile_split_compute_sdpa {
 
 enum class SDPAPipelineMode : uint32_t {
     Auto = 0,
@@ -55,4 +55,4 @@ struct SDPAInputs {
     std::optional<Tensor> attention_sink;
 };
 
-}  // namespace ttnn::prim::flash_attention_profile_sdpa
+}  // namespace ttnn::prim::flash_attention_profile_split_compute_sdpa

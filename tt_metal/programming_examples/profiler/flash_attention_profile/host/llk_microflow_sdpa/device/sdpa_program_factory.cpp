@@ -17,7 +17,7 @@
 using namespace tt::constants;
 using namespace tt::tt_metal;
 
-namespace ttnn::prim::flash_attention_profile_sdpa {
+namespace ttnn::prim::flash_attention_profile_llk_microflow_sdpa {
 
 // Chain management structures for KV store-and-forward optimization
 struct CoreHeadWork {
@@ -670,8 +670,8 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         "qk_softmax_schedule must be in [0, 2], got {}",
         operation_attributes.qk_softmax_schedule);
     TT_FATAL(
-        operation_attributes.qk_detail_profile_stage <= 13,
-        "qk_detail_profile_stage must be in [0, 13], got {}",
+        operation_attributes.qk_detail_profile_stage <= 14,
+        "qk_detail_profile_stage must be in [0, 14], got {}",
         operation_attributes.qk_detail_profile_stage);
     TT_FATAL(
         operation_attributes.q_reader_schedule <= 2,
@@ -682,8 +682,8 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         "qk_first_body_warmup must be in [0, 2], got {}",
         operation_attributes.qk_first_body_warmup);
     TT_FATAL(
-        operation_attributes.compute_pipeline_schedule <= 4,
-        "compute_pipeline_schedule must be in [0, 4], got {}",
+        operation_attributes.compute_pipeline_schedule <= 8,
+        "compute_pipeline_schedule must be in [0, 8], got {}",
         operation_attributes.compute_pipeline_schedule);
     if (operation_attributes.compute_pipeline_schedule != 0) {
         TT_FATAL(use_streaming_compute, "compute pipeline experiments require streaming compute");
@@ -1391,19 +1391,19 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
     // Create kernels (deferred until after chain construction for mcast_enabled flag)
     auto reader_kernels_id = CreateKernel(
         program,
-        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/dataflow/reader_interleaved.cpp",
+        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/llk_microflow_sdpa/dataflow/reader_interleaved.cpp",
         core_grid,
         tt::tt_metal::ReaderDataMovementConfig(reader_compile_time_args, defines));
 
     auto writer_kernels_id = CreateKernel(
         program,
-        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/dataflow/writer_interleaved.cpp",
+        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/llk_microflow_sdpa/dataflow/writer_interleaved.cpp",
         core_grid,
         tt::tt_metal::WriterDataMovementConfig(writer_compile_time_args, defines));
 
     auto compute_kernels_id = CreateKernel(
         program,
-        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/compute/sdpa.cpp",
+        "tt_metal/programming_examples/profiler/flash_attention_profile/kernels/llk_microflow_sdpa/compute/sdpa.cpp",
         core_grid,
         tt::tt_metal::ComputeConfig{
             .math_fidelity = math_fidelity,
@@ -1605,4 +1605,4 @@ void SDPAProgramFactory::override_runtime_arguments(
     }
 }
 
-}  // namespace ttnn::prim::flash_attention_profile_sdpa
+}  // namespace ttnn::prim::flash_attention_profile_llk_microflow_sdpa

@@ -13,7 +13,7 @@
 #include <variant>
 #include <tt-metalium/constants.hpp>
 
-namespace ttnn::prim::flash_attention_profile_sdpa {
+namespace ttnn::prim::flash_attention_profile_split_compute_sdpa {
 
 struct SDPAOperation {
     using operation_attributes_t = SDPAParams;
@@ -62,4 +62,4 @@ Tensor sdpa(
     uint32_t qk_first_body_warmup = 0,
     uint32_t compute_pipeline_schedule = 0);
 
-}  // namespace ttnn::prim::flash_attention_profile_sdpa
+}  // namespace ttnn::prim::flash_attention_profile_split_compute_sdpa

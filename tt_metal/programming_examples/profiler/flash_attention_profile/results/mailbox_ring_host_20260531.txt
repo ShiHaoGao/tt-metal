@@ -1,0 +1,201 @@
+2026-05-31 11:00:45.591 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 11:00:45.591 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 11:00:45.594 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 11:00:45.595 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 11:00:45.595 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 11:00:45.596 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:225)
+2026-05-31 11:00:45.596 | info     |             UMD | Cluster constructor started. (cluster.cpp:316)
+2026-05-31 11:00:45.596 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 11:00:45.596 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 11:00:45.599 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 11:00:45.600 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 11:00:45.600 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 11:00:45.600 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:269)
+2026-05-31 11:00:45.609 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:160)
+2026-05-31 11:00:45.609 | info     |             UMD | IOMMU: disabled (cluster.cpp:134)
+2026-05-31 11:00:45.609 | info     |             UMD | KMD version: 2.7.0 (cluster.cpp:137)
+2026-05-31 11:00:45.609 | info     |             UMD | Cluster constructor completed. (cluster.cpp:408)
+2026-05-31 11:00:45.610 | info     |             UMD | Starting devices in cluster (cluster.cpp:1015)
+2026-05-31 11:00:45.611 | info     |             UMD | Mapped hugepage 0x140000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:275)
+2026-05-31 11:00:45.613 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1023)
+2026-05-31 11:00:45.652 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-05-31 11:00:45.652 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-05-31 11:00:45.653 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 11:00:45.653 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 11:00:45.653 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 11:00:45.654 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 11:00:45.654 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 11:00:45.655 | warning  |          Always | Unknown motherboard 'ROG STRIX Z790-A GAMING WIFI D4' for chip_id=0 (bus_id=0x1) — defaulting tray_id to 0. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:62)
+2026-05-31 11:00:45.655 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-05-31 11:00:45.655 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:00:45.655 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:00:45.655 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-05-31 11:00:45.655 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:00:45.655 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:00:45.655 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1469)
+2026-05-31 11:00:45.655 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1510)
+2026-05-31 11:00:45.655 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1539)
+2026-05-31 11:00:45.655 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-05-31 11:00:45.655 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1554)
+2026-05-31 11:00:45.655 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1686)
+2026-05-31 11:00:45.659 | info     |    BuildKernels | Using pre-compiled firmware from: /wafer/gsh/wallfacer/third_party/tt-metal/tt_metal/pre-compiled/13758058153021483361/ (build_env_manager.cpp:269)
+2026-05-31 11:00:45.665 | warning  |           Metal | Failed to create shared memory /tt_device_17145521295179956680_memory: Permission denied (memory_stats_shm.cpp:55)
+2026-05-31 11:00:45.711 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+# FlashAttention profile shape=smoke B=1 H=1 KVH=1 S=1024 D=128 prefill=256 q=128 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape=smoke experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default reason="select both baseline and copied variants to compare"
+2026-05-31 11:00:45.712 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:00:45.712 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=smoke variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=1 KVH=1 S=1024 D=128 prefill=256 q=128 k=128 page=128 grid=8x8 iters=3 avg_ms=0.127 best_ms=0.099 worst_ms=0.166 call_avg_ms=0.044 sync_avg_ms=0.078 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_2k B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape=llama_prefill_2k experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default reason="select both baseline and copied variants to compare"
+2026-05-31 11:00:45.725 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:00:45.726 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=128 page=128 grid=8x8 iters=3 avg_ms=0.294 best_ms=0.280 worst_ms=0.315 call_avg_ms=0.030 sync_avg_ms=0.261 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_2k_q128_k128 B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=128 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape=llama_prefill_2k_q128_k128 experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default reason="select both baseline and copied variants to compare"
+2026-05-31 11:00:48.191 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:00:48.191 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k_q128_k128 variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=128 k=128 page=128 grid=8x8 iters=3 avg_ms=0.196 best_ms=0.180 worst_ms=0.224 call_avg_ms=0.028 sync_avg_ms=0.165 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_2k_q256_k256 B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=256 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape=llama_prefill_2k_q256_k256 experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default reason="select both baseline and copied variants to compare"
+2026-05-31 11:00:49.715 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:00:49.715 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k_q256_k256 variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=256 page=128 grid=8x8 iters=3 avg_ms=0.266 best_ms=0.249 worst_ms=0.284 call_avg_ms=0.049 sync_avg_ms=0.212 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_16k_chunked B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape=llama_prefill_16k_chunked experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default reason="select both baseline and copied variants to compare"
+2026-05-31 11:00:51.415 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:00:51.415 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_16k_chunked variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=128 page=128 grid=8x8 iters=3 avg_ms=7.838 best_ms=7.821 worst_ms=7.857 call_avg_ms=0.089 sync_avg_ms=7.739 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_16k_chunked_q128_k128 B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=128 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape=llama_prefill_16k_chunked_q128_k128 experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default reason="select both baseline and copied variants to compare"
+2026-05-31 11:00:53.135 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:00:53.135 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_16k_chunked_q128_k128 variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=128 k=128 page=128 grid=8x8 iters=3 avg_ms=8.459 best_ms=8.442 worst_ms=8.480 call_avg_ms=0.064 sync_avg_ms=8.389 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_16k_chunked_q256_k256 B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=256 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS_SKIP shape=llama_prefill_16k_chunked_q256_k256 experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default reason="select both baseline and copied variants to compare"
+2026-05-31 11:00:54.708 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:00:54.708 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_16k_chunked_q256_k256 variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=256 page=128 grid=8x8 iters=3 avg_ms=6.197 best_ms=6.195 worst_ms=6.199 call_avg_ms=0.124 sync_avg_ms=6.056 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+2026-05-31 11:00:56.372 | info     |    BuildKernels | JIT cache stats: 21/69 hits (30.4%) [21 cached, 0 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-05-31 11:00:56.372 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-05-31 11:00:56.372 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=42, total=19.008ms, min=0.012ms, max=2.015ms, mean=0.453ms (build_cache_telemetry.cpp:246)
+2026-05-31 11:00:56.372 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=69, total=41035.555ms, min=0.286ms, max=1630.291ms, mean=594.718ms (build_cache_telemetry.cpp:246)
+2026-05-31 11:00:56.372 | info     |    BuildKernels | JIT telemetry [jit_build]: count=24, total=7430.857ms, min=0.286ms, max=1037.441ms, mean=309.619ms (build_cache_telemetry.cpp:246)
+2026-05-31 11:00:56.374 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:499)
+2026-05-31 11:00:56.374 | info     |             UMD | Closing devices in cluster (cluster.cpp:1028)
+2026-05-31 11:00:56.494 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1037)
+2026-05-31 11:00:56.494 | info     |             UMD | Cluster destructor started. (cluster.cpp:549)
+2026-05-31 11:00:56.494 | info     |             UMD | Cluster destructor completed. (cluster.cpp:552)
+2026-05-31 11:01:08.938 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 11:01:08.939 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 11:01:08.941 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 11:01:08.942 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 11:01:08.942 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 11:01:08.943 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:225)
+2026-05-31 11:01:08.943 | info     |             UMD | Cluster constructor started. (cluster.cpp:316)
+2026-05-31 11:01:08.943 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 11:01:08.943 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 11:01:08.946 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 11:01:08.947 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 11:01:08.947 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 11:01:08.947 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:269)
+2026-05-31 11:01:08.957 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:160)
+2026-05-31 11:01:08.957 | info     |             UMD | IOMMU: disabled (cluster.cpp:134)
+2026-05-31 11:01:08.957 | info     |             UMD | KMD version: 2.7.0 (cluster.cpp:137)
+2026-05-31 11:01:08.957 | info     |             UMD | Cluster constructor completed. (cluster.cpp:408)
+2026-05-31 11:01:08.958 | info     |             UMD | Starting devices in cluster (cluster.cpp:1015)
+2026-05-31 11:01:08.959 | info     |             UMD | Mapped hugepage 0x140000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:275)
+2026-05-31 11:01:09.015 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1023)
+2026-05-31 11:01:09.049 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-05-31 11:01:09.049 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-05-31 11:01:09.050 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 11:01:09.050 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 11:01:09.050 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 11:01:09.051 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 11:01:09.051 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 11:01:09.052 | warning  |          Always | Unknown motherboard 'ROG STRIX Z790-A GAMING WIFI D4' for chip_id=0 (bus_id=0x1) — defaulting tray_id to 0. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:62)
+2026-05-31 11:01:09.052 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-05-31 11:01:09.052 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:01:09.052 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:01:09.052 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-05-31 11:01:09.052 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:01:09.052 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 11:01:09.052 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1469)
+2026-05-31 11:01:09.052 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1510)
+2026-05-31 11:01:09.052 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1539)
+2026-05-31 11:01:09.052 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-05-31 11:01:09.052 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1554)
+2026-05-31 11:01:09.052 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1686)
+2026-05-31 11:01:09.059 | info     |    BuildKernels | Using pre-compiled firmware from: /wafer/gsh/wallfacer/third_party/tt-metal/tt_metal/pre-compiled/13758058153021483361/ (build_env_manager.cpp:269)
+2026-05-31 11:01:09.066 | warning  |           Metal | Failed to create shared memory /tt_device_17145521295179956680_memory: Permission denied (memory_stats_shm.cpp:55)
+2026-05-31 11:01:09.111 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+# FlashAttention profile shape=smoke B=1 H=1 KVH=1 S=1024 D=128 prefill=256 q=128 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+2026-05-31 11:01:09.112 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:01:09.112 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=smoke variant=copied_chunked experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=1 KVH=1 S=1024 D=128 prefill=256 q=128 k=128 page=128 grid=8x8 iters=3 avg_ms=0.062 best_ms=0.048 worst_ms=0.088 call_avg_ms=0.027 sync_avg_ms=0.034 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_2k B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+2026-05-31 11:01:09.126 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:01:09.126 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k variant=copied_chunked experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=128 page=128 grid=8x8 iters=3 avg_ms=0.330 best_ms=0.305 worst_ms=0.359 call_avg_ms=0.067 sync_avg_ms=0.258 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_2k_q128_k128 B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=128 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+2026-05-31 11:01:10.474 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:01:10.474 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k_q128_k128 variant=copied_chunked experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=128 k=128 page=128 grid=8x8 iters=3 avg_ms=0.194 best_ms=0.183 worst_ms=0.217 call_avg_ms=0.026 sync_avg_ms=0.166 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_2k_q256_k256 B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=256 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+2026-05-31 11:01:11.803 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:01:11.803 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k_q256_k256 variant=copied_chunked experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=256 page=128 grid=8x8 iters=3 avg_ms=0.246 best_ms=0.233 worst_ms=0.269 call_avg_ms=0.030 sync_avg_ms=0.213 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_16k_chunked B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+2026-05-31 11:01:13.144 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:01:13.144 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_16k_chunked variant=copied_chunked experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=128 page=128 grid=8x8 iters=3 avg_ms=0.291 best_ms=0.279 worst_ms=0.313 call_avg_ms=0.025 sync_avg_ms=0.263 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_16k_chunked_q128_k128 B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=128 k=128 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+2026-05-31 11:01:14.587 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:01:14.588 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_16k_chunked_q128_k128 variant=copied_chunked experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=128 k=128 page=128 grid=8x8 iters=3 avg_ms=0.210 best_ms=0.181 worst_ms=0.251 call_avg_ms=0.041 sync_avg_ms=0.166 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+# FlashAttention profile shape=llama_prefill_16k_chunked_q256_k256 B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=256 page=128 warmup=1 iters=3 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default grid=per-variant
+2026-05-31 11:01:16.017 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 11:01:16.017 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_16k_chunked_q256_k256 variant=copied_chunked experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=split_state_mailbox_ring_v1 grid_policy=default B=1 H=8 KVH=1 S=16384 D=128 prefill=2048 q=256 k=256 page=128 grid=8x8 iters=3 avg_ms=0.248 best_ms=0.231 worst_ms=0.272 call_avg_ms=0.031 sync_avg_ms=0.214 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+2026-05-31 11:01:17.426 | info     |    BuildKernels | JIT cache stats: 33/57 hits (57.9%) [33 cached, 6 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-05-31 11:01:17.426 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-05-31 11:01:17.426 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=66, total=31.599ms, min=0.011ms, max=3.124ms, mean=0.479ms (build_cache_telemetry.cpp:246)
+2026-05-31 11:01:17.426 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=57, total=24328.765ms, min=0.276ms, max=1320.050ms, mean=426.820ms (build_cache_telemetry.cpp:246)
+2026-05-31 11:01:17.426 | info     |    BuildKernels | JIT telemetry [jit_build]: count=21, total=3471.141ms, min=0.276ms, max=637.210ms, mean=165.292ms (build_cache_telemetry.cpp:246)
+2026-05-31 11:01:17.427 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:499)
+2026-05-31 11:01:17.427 | info     |             UMD | Closing devices in cluster (cluster.cpp:1028)
+2026-05-31 11:01:17.598 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1037)
+2026-05-31 11:01:17.598 | info     |             UMD | Cluster destructor started. (cluster.cpp:549)
+2026-05-31 11:01:17.598 | info     |             UMD | Cluster destructor completed. (cluster.cpp:552)

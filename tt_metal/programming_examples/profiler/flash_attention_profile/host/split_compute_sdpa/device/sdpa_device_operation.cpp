@@ -14,7 +14,7 @@
 
 using namespace tt::tt_metal;
 
-namespace ttnn::prim::flash_attention_profile_sdpa {
+namespace ttnn::prim::flash_attention_profile_split_compute_sdpa {
 
 void SDPAOperation::validate_on_program_cache_miss(const SDPAParams& attrs, const SDPAInputs& tensors) {
     const bool use_mla = attrs.use_mla;
@@ -499,9 +499,9 @@ SDPAOperation::create_op_performance_model(
         input_tensors, output_tensor, ideal_dev_clock_cycles);
 }
 
-}  // namespace ttnn::prim::flash_attention_profile_sdpa
+}  // namespace ttnn::prim::flash_attention_profile_split_compute_sdpa
 
-namespace ttnn::prim::flash_attention_profile_sdpa {
+namespace ttnn::prim::flash_attention_profile_split_compute_sdpa {
 Tensor sdpa(
     const Tensor& input_tensor_q,
     const Tensor& input_tensor_k,
@@ -530,7 +530,7 @@ Tensor sdpa(
     uint32_t q_reader_schedule,
     uint32_t qk_first_body_warmup,
     uint32_t compute_pipeline_schedule) {
-    using OperationType = ttnn::prim::flash_attention_profile_sdpa::SDPAOperation;
+    using OperationType = ttnn::prim::flash_attention_profile_split_compute_sdpa::SDPAOperation;
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
             .scale = scale,
@@ -564,4 +564,4 @@ Tensor sdpa(
             .attention_sink = attention_sink,
         });
 }
-}  // namespace ttnn::prim::flash_attention_profile_sdpa
+}  // namespace ttnn::prim::flash_attention_profile_split_compute_sdpa

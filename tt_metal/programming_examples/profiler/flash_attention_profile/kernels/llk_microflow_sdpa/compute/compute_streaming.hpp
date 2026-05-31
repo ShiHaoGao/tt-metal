@@ -949,7 +949,13 @@ static void sdpa_inner_loop_step(
     constexpr bool qktv_pipeline_detail_profile = qk_detail_profile_stage == 10;
     constexpr bool first_output_handoff_profile = qk_detail_profile_stage == 12;
     constexpr bool fa3_pipe_detail_profile = qk_detail_profile_stage == 13;
+    constexpr bool llk_microflow_detail_profile = qk_detail_profile_stage == 14;
     constexpr bool fa3_pv_softmax_schedule = compute_pipeline_schedule == 4;
+    constexpr bool llk_drain_exp_before_pv_schedule = compute_pipeline_schedule == 5;
+    constexpr bool llk_prev_exp_after_pv_schedule = compute_pipeline_schedule == 6;
+    constexpr bool llk_salad_before_pv_schedule = compute_pipeline_schedule == 7;
+    constexpr bool llk_v_ready_prefetch_schedule = compute_pipeline_schedule == 8;
+    constexpr bool llk_microflow_profile = fa3_pipe_detail_profile || llk_microflow_detail_profile;
     constexpr bool qktv_body_detail_profile =
         qktv_matmul_detail_profile || qktv_math_detail_profile || qktv_pack_detail_profile;
 
@@ -1003,6 +1009,9 @@ static void sdpa_inner_loop_step(
     static_assert(
         compute_pipeline_schedule != 4 || qktv_q_num_subblocks > 1,
         "fa3_pv_softmax_v1 requires at least two QKTV row groups");
+    static_assert(
+        !llk_salad_before_pv_schedule || qktv_q_num_subblocks > 1,
+        "llk_salad_before_pv_v1 requires at least two QKTV row groups");
 
     const uint32_t out_cb = (save_out_cb != INVALID_CB) ? save_out_cb : cur.out;
     bool qktv_output_reserved = false;
@@ -1340,6 +1349,13 @@ static void sdpa_inner_loop_step(
             q_index_offset += qkt_subblock_h * in0_block_w;
             q_wait_tiles += q_subblock_num_tiles;
 
+            if constexpr (llk_v_ready_prefetch_schedule) {
+                if (q_subblock == 0) {
+                    MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_V_READY_PREFETCH");
+                    ensure_qktv_v_ready();
+                }
+            }
+
             if constexpr (compute_pipeline_schedule == 1) {
                 if (q_subblock > 0) {
                     const uint32_t ready_group = q_subblock - 1;
@@ -1401,6 +1417,36 @@ static void sdpa_inner_loop_step(
             MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_DRAIN_GROUP0");
             const uint32_t matmul_inner = actual_sbw;
             const bool group0_already_computed = early_qktv_groups > 0;
+            if constexpr (llk_drain_exp_before_pv_schedule) {
+                for (uint32_t kt_sub = 0; kt_sub < kt_num_full_subblocks; ++kt_sub) {
+                    {
+                        MaybeDeviceZoneScopedN(qktv_detail_profile, "FAP_COMPUTE_QKTV_DRAIN_SUB_EXP");
+                        MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_GROUP0_SUB_EXP");
+                        MaybeDeviceZoneScopedN(fa3_pipe_detail_profile, "FAP_FA3_SOFTMAX_CUR");
+                        MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_DRAIN_EXP_BEFORE_PV");
+                        sub_exp_block_bcast_cols<scale_fp32>(
+                            cb_qkt_im,
+                            cur.max,
+                            cur.sum,
+                            KT_stride,
+                            q_num_subblocks - 1,
+                            kt_sub * actual_sbw,
+                            qkt_subblock_h,
+                            actual_sbw);
+                    }
+                }
+                if (!group0_already_computed) {
+                    qktv_pack_unpack_barrier();
+                    {
+                        DeviceZoneScopedN("FAP_COMPUTE_QKTV_WAIT_QKT");
+                        cb_wait_front(cb_qkt_im, qktv_in0_wait_tiles);
+                    }
+                    ensure_qktv_v_ready();
+                    MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_GROUP0_MATMUL");
+                    MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_DRAIN_PV_AFTER_EXP");
+                    run_qktv_matmul_group(qktv_in0_index_offset, 0, qktv_h, active_Sk);
+                }
+            }
             if constexpr (compute_pipeline_schedule == 2) {
                 for (uint32_t kt_sub = 0; kt_sub < kt_num_full_subblocks; ++kt_sub) {
                     {
@@ -1429,7 +1475,7 @@ static void sdpa_inner_loop_step(
                     MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_GROUP0_MATMUL");
                     run_qktv_matmul_group(qktv_in0_index_offset, 0, qktv_h, active_Sk);
                 }
-            } else {
+            } else if constexpr (!llk_drain_exp_before_pv_schedule) {
                 // Split-drain: interleave per-column-subblock sub_exp with partial V matmul.
                 // Each kt_sub softmaxes one column chunk of the last row, then multiplies
                 // with the corresponding V rows; partial products accumulate via L1.
@@ -1617,10 +1663,12 @@ static void sdpa_inner_loop_step(
             const uint32_t cur_h = is_remainder_iter ? qktv_remainder_h : qktv_h;
             uint32_t salad_row = q_subblock - 1;
             uint32_t w_salad = salad_row - pushed_rows;
+            bool prev_exp_deferred_until_after_pv = false;
 
             // SALAD for previous group (always a full group, h=qktv_h)
-            if (!is_first_iter) {
+            if (!is_first_iter && !(llk_prev_exp_after_pv_schedule && !is_remainder_iter)) {
                 auto run_exp_max_diff = [&]() {
+                    MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_EXP_MAX_DIFF");
                     MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_EXP_MAX_DIFF");
                     MaybeDeviceZoneScopedN(fa3_pipe_detail_profile, "FAP_FA3_SOFTMAX_STATE_CURRENT");
                     cb_reserve_back(cb_exp_max_diff, qktv_h);
@@ -1638,9 +1686,25 @@ static void sdpa_inner_loop_step(
                 } else {
                     run_exp_max_diff();
                 }
+            } else if (!is_first_iter && llk_prev_exp_after_pv_schedule && !is_remainder_iter) {
+                prev_exp_deferred_until_after_pv = true;
             }
 
             bool prev_group_done_early = false;
+            if constexpr (llk_salad_before_pv_schedule) {
+                if (!is_first_iter && !is_remainder_iter) {
+                    MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_PREV_GROUP_SALAD_BEFORE_PV");
+                    salad_correct_row(salad_row, w_salad, qktv_h);
+                    if (is_last_iter) {
+                        normalize_row(pushed_rows, qktv_h);
+                    } else {
+                        cb_push_back(cur.sum, qktv_h);
+                        cb_push_back(out_cb, qktv_h * vDHt);
+                        pushed_rows++;
+                    }
+                    prev_group_done_early = true;
+                }
+            }
             if constexpr (compute_pipeline_schedule == 3) {
                 if (q_subblock == 1 && !is_first_iter && is_last_iter) {
                     salad_correct_row(salad_row, w_salad, qktv_h);
@@ -1673,6 +1737,7 @@ static void sdpa_inner_loop_step(
                 }
                 ensure_qktv_v_ready();
                 auto run_current_group_matmul = [&]() {
+                    MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_PV_GROUP_MATMUL");
                     MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_MAIN_MATMUL");
                     MaybeDeviceZoneScopedN(fa3_pipe_detail_profile, "FAP_FA3_NEXT_PV_MATMUL");
                     run_qktv_matmul_group(qktv_in0_index_offset, w_q, cur_h, active_Sk);
@@ -1689,6 +1754,16 @@ static void sdpa_inner_loop_step(
                 }
             }
 
+            if constexpr (llk_prev_exp_after_pv_schedule) {
+                if (prev_exp_deferred_until_after_pv) {
+                    MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_EXP_MAX_DIFF_AFTER_PV");
+                    cb_reserve_back(cb_exp_max_diff, qktv_h);
+                    sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
+                        prev.max, cur.max, cb_exp_max_diff, salad_row, qktv_h);
+                    cb_push_back(cb_exp_max_diff, qktv_h);
+                }
+            }
+
             // SALAD corrections for previous group (always full, h=qktv_h) + row-by-row push
             if (!is_first_iter) {
                 // Last main-loop iteration: hoist drain's sub_exp so both salads
@@ -1699,12 +1774,18 @@ static void sdpa_inner_loop_step(
                         has_qktv_remainder ? (qktv_q_num_subblocks * qktv_h) : (qktv_q_num_subblocks - 1);
 
                     cb_reserve_back(cb_exp_max_diff, drain_h);
-                    sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
-                        prev.max, cur.max, cb_exp_max_diff, drain_salad_row, drain_h);
+                    {
+                        MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_DRAIN_EXP_MAX_DIFF");
+                        sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
+                            prev.max, cur.max, cb_exp_max_diff, drain_salad_row, drain_h);
+                    }
                     cb_push_back(cb_exp_max_diff, drain_h);
 
                     if (!prev_group_done_early) {
-                        salad_correct_row(salad_row, w_salad, qktv_h);
+                        {
+                            MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_PREV_GROUP_SALAD");
+                            salad_correct_row(salad_row, w_salad, qktv_h);
+                        }
                         if (is_last_iter) {
                             normalize_row(pushed_rows, qktv_h);
                         } else {
@@ -1716,7 +1797,10 @@ static void sdpa_inner_loop_step(
 
                     const uint32_t drain_w = has_qktv_remainder ? ((qktv_q_num_subblocks - pushed_rows) * qktv_h)
                                                                 : (qktv_q_num_subblocks - 1 - pushed_rows);
-                    salad_correct_row(drain_salad_row, drain_w, drain_h);
+                    {
+                        MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_DRAIN_SALAD");
+                        salad_correct_row(drain_salad_row, drain_w, drain_h);
+                    }
                     if (is_last_iter) {
                         normalize_row(pushed_rows, drain_h);
                     } else {
@@ -1726,7 +1810,10 @@ static void sdpa_inner_loop_step(
                     }
                 } else {
                     if (!prev_group_done_early) {
-                        salad_correct_row(salad_row, w_salad, qktv_h);
+                        {
+                            MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_PREV_GROUP_SALAD");
+                            salad_correct_row(salad_row, w_salad, qktv_h);
+                        }
                         if (is_last_iter) {
                             normalize_row(pushed_rows, qktv_h);
                         } else {
@@ -1758,8 +1845,11 @@ static void sdpa_inner_loop_step(
                 if (!is_first_iter) {
                     constexpr uint32_t drain_salad_row = 0;
                     cb_reserve_back(cb_exp_max_diff, drain_h);
-                    sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
-                        prev.max, cur.max, cb_exp_max_diff, drain_salad_row, drain_h);
+                    {
+                        MaybeDeviceZoneScopedN(llk_microflow_profile, "FAP_LLK_MICROFLOW_SINGLE_GROUP_EXP_MAX_DIFF");
+                        sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
+                            prev.max, cur.max, cb_exp_max_diff, drain_salad_row, drain_h);
+                    }
                     cb_push_back(cb_exp_max_diff, drain_h);
                     salad_correct_row(drain_salad_row, 0, drain_h);
                 }

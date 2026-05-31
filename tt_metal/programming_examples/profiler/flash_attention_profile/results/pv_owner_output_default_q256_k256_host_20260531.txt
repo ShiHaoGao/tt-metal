@@ -1,0 +1,78 @@
+WARNING: set TT_METAL_DEVICE_PROFILER=1 to collect device profiler zones in generated/profiler/.logs/profile_log_device.csv
+2026-05-31 12:02:03.083 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 12:02:03.083 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 12:02:03.087 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 12:02:03.087 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 12:02:03.087 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 12:02:03.088 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:225)
+2026-05-31 12:02:03.089 | info     |             UMD | Cluster constructor started. (cluster.cpp:316)
+2026-05-31 12:02:03.089 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 12:02:03.089 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 12:02:03.091 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 12:02:03.092 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 12:02:03.092 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 12:02:03.092 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:269)
+2026-05-31 12:02:03.101 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:160)
+2026-05-31 12:02:03.101 | info     |             UMD | IOMMU: disabled (cluster.cpp:134)
+2026-05-31 12:02:03.101 | info     |             UMD | KMD version: 2.7.0 (cluster.cpp:137)
+2026-05-31 12:02:03.101 | info     |             UMD | Cluster constructor completed. (cluster.cpp:408)
+2026-05-31 12:02:03.102 | info     |             UMD | Starting devices in cluster (cluster.cpp:1015)
+2026-05-31 12:02:03.103 | info     |             UMD | Mapped hugepage 0x140000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:275)
+2026-05-31 12:02:03.119 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1023)
+2026-05-31 12:02:03.157 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-05-31 12:02:03.157 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-05-31 12:02:03.157 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:75)
+2026-05-31 12:02:03.157 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:92)
+2026-05-31 12:02:03.157 | warning  |             UMD | Low power mode is disabled while UMD holds open file descriptors. The device will return to low power mode once all file descriptors are closed. (topology_discovery.cpp:143)
+2026-05-31 12:02:03.158 | info     |             UMD | Established firmware bundle version: 19.5.0 (topology_discovery.cpp:544)
+2026-05-31 12:02:03.158 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:96)
+2026-05-31 12:02:03.159 | warning  |          Always | Unknown motherboard 'ROG STRIX Z790-A GAMING WIFI D4' for chip_id=0 (bus_id=0x1) — defaulting tray_id to 0. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:62)
+2026-05-31 12:02:03.159 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-05-31 12:02:03.159 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 12:02:03.159 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 12:02:03.159 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-05-31 12:02:03.159 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 12:02:03.159 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:94)
+2026-05-31 12:02:03.159 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1469)
+2026-05-31 12:02:03.159 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1510)
+2026-05-31 12:02:03.159 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1539)
+2026-05-31 12:02:03.159 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-05-31 12:02:03.159 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1554)
+2026-05-31 12:02:03.160 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1686)
+2026-05-31 12:02:03.164 | info     |    BuildKernels | Using pre-compiled firmware from: /wafer/gsh/wallfacer/third_party/tt-metal/tt_metal/pre-compiled/13758058153021483361/ (build_env_manager.cpp:269)
+2026-05-31 12:02:03.170 | warning  |           Metal | Failed to create shared memory /tt_device_17145521295179956680_memory: Permission denied (memory_stats_shm.cpp:55)
+2026-05-31 12:02:03.214 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+# FlashAttention profile shape=llama_prefill_2k_q256_k256 B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=256 page=128 warmup=2 iters=5 high_precision=false experiment=split_compute_v1 pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=default grid_policy=default grid=per-variant
+FLASH_ATTN_PROFILE_CORRECTNESS shape=llama_prefill_2k_q256_k256 experiment=split_compute_v1 pipeline=auto pipeline_depth=2 grid_policy=default baseline=ttnn_sdpa_baseline candidate=copied_sdpa elements=2097152 max_abs_diff=0.000000 mean_abs_diff=0.000000 tolerance=0.125000 passed=true
+2026-05-31 12:02:04.564 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 12:02:04.565 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k_q256_k256 variant=ttnn_sdpa_baseline experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=default grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=256 page=128 grid=8x8 iters=5 avg_ms=0.200 best_ms=0.199 worst_ms=0.203 call_avg_ms=0.011 sync_avg_ms=0.187 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+2026-05-31 12:02:04.586 | info     |           Metal | Disabling and clearing program cache on MeshDevice 1 (mesh_device.cpp:1009)
+2026-05-31 12:02:04.586 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:999)
+FLASH_ATTN_PROFILE_RESULT shape=llama_prefill_2k_q256_k256 variant=copied_sdpa experiment=split_compute_v1 mode=prepared_no_q_copy pipeline=auto pipeline_depth=2 qk_subblock=auto q_buffer_factor=auto dst_sync=auto qk_softmax_profile=none qk_softmax_schedule=before_matmul qk_detail_profile=none q_reader_schedule=default qk_first_body_warmup=none compute_pipeline_schedule=default grid_policy=default B=1 H=8 KVH=1 S=2048 D=128 prefill=2048 q=256 k=256 page=128 grid=8x8 iters=5 avg_ms=0.212 best_ms=0.211 worst_ms=0.215 call_avg_ms=0.011 sync_avg_ms=0.199 copy_q_avg_ms=0.000 copy_start_avg_ms=0.000 cache_entries=1
+2026-05-31 12:02:04.607 | info     |    BuildKernels | JIT cache stats: 11/19 hits (57.9%) [11 cached, 7 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-05-31 12:02:04.607 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-05-31 12:02:04.607 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=22, total=13.053ms, min=0.011ms, max=1.700ms, mean=0.593ms (build_cache_telemetry.cpp:246)
+2026-05-31 12:02:04.607 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=19, total=6856.691ms, min=0.380ms, max=1293.009ms, mean=360.878ms (build_cache_telemetry.cpp:246)
+2026-05-31 12:02:04.607 | info     |    BuildKernels | JIT telemetry [jit_build]: count=7, total=1292.749ms, min=0.380ms, max=707.335ms, mean=184.678ms (build_cache_telemetry.cpp:246)
+2026-05-31 12:02:04.608 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:499)
+2026-05-31 12:02:04.608 | info     |             UMD | Closing devices in cluster (cluster.cpp:1028)
+2026-05-31 12:02:04.700 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1037)
+2026-05-31 12:02:04.700 | info     |             UMD | Cluster destructor started. (cluster.cpp:549)
+2026-05-31 12:02:04.700 | info     |             UMD | Cluster destructor completed. (cluster.cpp:552)

@@ -918,7 +918,8 @@ static void sdpa_inner_loop_step(
     const uint32_t causal_q_start_tile = 0,
     const uint32_t causal_k_start_tile = 0,
     const uint32_t neginf_idx = 0,
-    const uint32_t causal_diag_idx = 0) {
+    const uint32_t causal_diag_idx = 0,
+    const bool split_pv_owner_output_this_q = false) {
     // Callers guarantee active_Sk is evenly divisible by actual_sbw (via largest_factor_le).
     const uint32_t kt_num_full_subblocks = active_Sk / actual_sbw;
     constexpr uint32_t dst_size = compute_kernel_lib::DEST_AUTO_LIMIT;
@@ -950,6 +951,22 @@ static void sdpa_inner_loop_step(
     constexpr bool first_output_handoff_profile = qk_detail_profile_stage == 12;
     constexpr bool fa3_pipe_detail_profile = qk_detail_profile_stage == 13;
     constexpr bool fa3_pv_softmax_schedule = compute_pipeline_schedule == 4;
+    constexpr bool split_state_real_p_kt_stream = compute_pipeline_schedule == 20;
+    constexpr bool split_state_mailbox_ring = compute_pipeline_schedule == 22;
+    constexpr bool split_state_real_p_packet_stream = split_state_real_p_kt_stream || split_state_mailbox_ring;
+    constexpr bool split_pv_owner_probe = compute_pipeline_schedule == 21;
+    constexpr bool split_pv_owner_output = compute_pipeline_schedule == 23 || compute_pipeline_schedule == 25;
+    constexpr bool split_state_real_p_full_handoff =
+        compute_pipeline_schedule == 18 || compute_pipeline_schedule == 19 || split_pv_owner_probe ||
+        split_pv_owner_output;
+    constexpr bool split_state_real_p_handoff =
+        split_state_real_p_full_handoff || split_state_real_p_packet_stream;
+    constexpr bool split_state_ready_signal =
+        compute_pipeline_schedule == 12 || compute_pipeline_schedule == 13 || compute_pipeline_schedule == 14 ||
+        compute_pipeline_schedule == 15 || compute_pipeline_schedule == 16 || compute_pipeline_schedule == 17 ||
+        split_state_real_p_handoff;
+    constexpr bool split_state_token_ready_signal = split_state_ready_signal && !split_state_real_p_handoff;
+    constexpr uint32_t cb_split_state_ready = 15;
     constexpr bool qktv_body_detail_profile =
         qktv_matmul_detail_profile || qktv_math_detail_profile || qktv_pack_detail_profile;
 
@@ -1107,6 +1124,56 @@ static void sdpa_inner_loop_step(
                 reconfig_data_format(cb_v_in, out_cb, cb_qkt_im, out_cb);
             }
         };
+
+    auto push_real_p_handoff_group = [&](uint32_t qktv_in0_index_offset, uint32_t cur_h, uint32_t inner_dim) {
+        if constexpr (split_state_real_p_handoff) {
+            DeviceZoneScopedN("FAP_SPLIT_REAL_P_HANDOFF_PACK");
+            cb_reserve_back(cb_split_state_ready, cur_h * inner_dim);
+            copy_tile_to_dst_init_short(cb_qkt_im);
+            for (uint32_t row = 0; row < cur_h; ++row) {
+                for (uint32_t col = 0; col < inner_dim; ++col) {
+                    acquire_dst();
+                    copy_tile(cb_qkt_im, qktv_in0_index_offset + row * KT_stride + col, 0);
+                    pack_tile(0, cb_split_state_ready);
+                    release_dst();
+                }
+            }
+            cb_push_back(cb_split_state_ready, cur_h * inner_dim);
+        }
+    };
+
+    auto push_real_p_sum_handoff_group = [&](uint32_t qktv_in0_index_offset, uint32_t cur_h, uint32_t inner_dim) {
+        if constexpr (split_pv_owner_output) {
+            DeviceZoneScopedN("FAP_SPLIT_OWNER_P_SUM_HANDOFF_PACK");
+            cb_reserve_back(cb_split_state_ready, cur_h * inner_dim + cur_h);
+            copy_tile_to_dst_init_short(cb_qkt_im);
+            for (uint32_t row = 0; row < cur_h; ++row) {
+                for (uint32_t col = 0; col < inner_dim; ++col) {
+                    acquire_dst();
+                    copy_tile(cb_qkt_im, qktv_in0_index_offset + row * KT_stride + col, 0);
+                    pack_tile(0, cb_split_state_ready);
+                    release_dst();
+                }
+            }
+            copy_tile_to_dst_init_short(cur.sum);
+            for (uint32_t row = 0; row < cur_h; ++row) {
+                acquire_dst();
+                copy_tile(cur.sum, row, 0);
+                pack_tile(0, cb_split_state_ready);
+                release_dst();
+            }
+            cb_push_back(cb_split_state_ready, cur_h * inner_dim + cur_h);
+        }
+    };
+
+    auto discard_local_owner_output_group = [&](uint32_t cur_h) {
+        DeviceZoneScopedN("FAP_SPLIT_OWNER_DISCARD_LOCAL_GROUP0");
+        cb_push_back(cur.sum, cur_h);
+        cb_pop_front(cur.sum, cur_h);
+        cb_push_back(out_cb, cur_h * vDHt);
+        cb_pop_front(out_cb, cur_h * vDHt);
+        ++pushed_rows;
+    };
 
     // ========== PHASE 1: Q@KT directly into cb_qkt_im ==========
     // All matmul output goes to cb_qkt_im at absolute offsets via pack_tile<true>.
@@ -1367,6 +1434,13 @@ static void sdpa_inner_loop_step(
     {
         MaybeDeviceZoneScopedN(phase_timeline_profile, "FAP_TIMELINE_QK_PHASE_DONE");
     }
+    if constexpr (split_state_token_ready_signal) {
+        if (is_last_iter) {
+            DeviceZoneScopedN("FAP_SPLIT_STATE_READY_PUSH");
+            cb_reserve_back(cb_split_state_ready, 1);
+            cb_push_back(cb_split_state_ready, 1);
+        }
+    }
 
     cb_pop_front(cb_kt_in, DHt * KT_stride);
 
@@ -1401,7 +1475,9 @@ static void sdpa_inner_loop_step(
             MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_DRAIN_GROUP0");
             const uint32_t matmul_inner = actual_sbw;
             const bool group0_already_computed = early_qktv_groups > 0;
-            if constexpr (compute_pipeline_schedule == 2) {
+            const bool split_pv_owner_output_group0 =
+                split_pv_owner_output && split_pv_owner_output_this_q && is_last_iter;
+            if constexpr (compute_pipeline_schedule == 2 || split_state_real_p_full_handoff) {
                 for (uint32_t kt_sub = 0; kt_sub < kt_num_full_subblocks; ++kt_sub) {
                     {
                         MaybeDeviceZoneScopedN(qktv_detail_profile, "FAP_COMPUTE_QKTV_DRAIN_SUB_EXP");
@@ -1418,16 +1494,30 @@ static void sdpa_inner_loop_step(
                             actual_sbw);
                     }
                 }
+                qktv_pack_unpack_barrier();
+                if (is_last_iter) {
+                    if constexpr (split_pv_owner_output) {
+                        if (split_pv_owner_output_this_q) {
+                            push_real_p_sum_handoff_group(qktv_in0_index_offset, qktv_h, active_Sk);
+                        }
+                    } else {
+                        push_real_p_handoff_group(qktv_in0_index_offset, qktv_h, active_Sk);
+                    }
+                }
                 if (!group0_already_computed) {
                     // sub_exp writes cb_qkt_im in-place through PACK; QKT@V reads it through UNPACK.
-                    qktv_pack_unpack_barrier();
                     {
                         DeviceZoneScopedN("FAP_COMPUTE_QKTV_WAIT_QKT");
                         cb_wait_front(cb_qkt_im, qktv_in0_wait_tiles);
                     }
-                    ensure_qktv_v_ready();
-                    MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_GROUP0_MATMUL");
-                    run_qktv_matmul_group(qktv_in0_index_offset, 0, qktv_h, active_Sk);
+                    const bool split_skip_local_pv = split_pv_owner_probe || split_pv_owner_output_group0;
+                    if (!split_skip_local_pv) {
+                        ensure_qktv_v_ready();
+                        MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_GROUP0_MATMUL");
+                        run_qktv_matmul_group(qktv_in0_index_offset, 0, qktv_h, active_Sk);
+                    } else {
+                        DeviceZoneScopedN("FAP_SPLIT_PV_OWNER_SKIP_LOCAL_PV");
+                    }
                 }
             } else {
                 // Split-drain: interleave per-column-subblock sub_exp with partial V matmul.
@@ -1453,7 +1543,16 @@ static void sdpa_inner_loop_step(
                     // For q_num_subblocks==1 the cb_wait_front was already satisfied by Phase 1's
                     // cb_push_back_hold_wr_ptr, so it doesn't sync sub_exp's writes; explicit
                     // semaphore handshake required.
-                    if constexpr (q_num_subblocks == 1) {
+                    if constexpr (split_state_real_p_packet_stream) {
+                        qktv_pack_unpack_barrier();
+                        if (is_last_iter) {
+                            DeviceZoneScopedN("FAP_SPLIT_REAL_P_KT_HANDOFF");
+                            push_real_p_handoff_group(
+                                qktv_in0_index_offset + kt_sub * actual_sbw,
+                                qktv_h,
+                                actual_sbw);
+                        }
+                    } else if constexpr (q_num_subblocks == 1 && !split_state_real_p_handoff) {
                         qktv_pack_unpack_barrier();
                     }
                     if (!group0_already_computed && kt_sub == 0) {
@@ -1516,6 +1615,9 @@ static void sdpa_inner_loop_step(
                         PACK((llk_pack_reconfig_l1_acc(0)));
                     }
                 }
+            }
+            if (split_pv_owner_output_group0) {
+                discard_local_owner_output_group(qktv_h);
             }
             qktv_in0_index_offset += qktv_h * KT_stride;
             qktv_in0_wait_tiles += qktv_in0_row_tiles;
@@ -1752,10 +1854,11 @@ static void sdpa_inner_loop_step(
         {
             MaybeDeviceZoneScopedN(qktv_pipeline_detail_profile, "FAP_QKTV_PIPE_FINAL_DRAIN");
             constexpr uint32_t drain_h = has_qktv_remainder ? qktv_remainder_h : qktv_h;
+            const bool local_output_groups_done = pushed_rows >= total_v_row_groups;
             if constexpr (total_v_row_groups == 1) {
                 // Single row group: the main loop never ran, so the drain must
                 // perform the full SALAD correction (sub_exp + correct) here.
-                if (!is_first_iter) {
+                if (!local_output_groups_done && !is_first_iter) {
                     constexpr uint32_t drain_salad_row = 0;
                     cb_reserve_back(cb_exp_max_diff, drain_h);
                     sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
@@ -1763,17 +1866,19 @@ static void sdpa_inner_loop_step(
                     cb_push_back(cb_exp_max_diff, drain_h);
                     salad_correct_row(drain_salad_row, 0, drain_h);
                 }
-                if (is_last_iter) {
-                    normalize_row(pushed_rows, drain_h);
-                } else {
-                    cb_push_back(cur.sum, drain_h);
-                    cb_push_back(out_cb, drain_h * vDHt);
-                    pushed_rows++;
+                if (!local_output_groups_done) {
+                    if (is_last_iter) {
+                        normalize_row(pushed_rows, drain_h);
+                    } else {
+                        cb_push_back(cur.sum, drain_h);
+                        cb_push_back(out_cb, drain_h * vDHt);
+                        pushed_rows++;
+                    }
                 }
             } else {
                 // Drain was hoisted into the last main-loop iteration above.
                 // For is_first_iter (no SALAD), the drain row still needs push/normalize.
-                if (is_first_iter) {
+                if (is_first_iter && !local_output_groups_done) {
                     if (is_last_iter) {
                         normalize_row(pushed_rows, drain_h);
                     } else {
@@ -1786,7 +1891,6 @@ static void sdpa_inner_loop_step(
         }
 
         // All rows pushed individually — no bulk push needed.
-
         cb_pop_front(cb_v_in, KT_stride * vDHt);
         cb_pop_front(cb_qkt_im, Sq_chunk_t * KT_stride);
     }
@@ -1855,7 +1959,8 @@ void sdpa_standard_v2(
     const uint32_t chunked_q_chunk_offset = 0,
     const LightweightMaskContext& lw_mask = {},
     const uint32_t q_num_chunks = 0,
-    const bool use_zigzag_balancing = false) {
+    const bool use_zigzag_balancing = false,
+    const bool split_pv_owner_output_for_this_head = false) {
     // use_padded_mask + is_causal_sdpa is handled at the host level (mutually exclusive).
     static_assert(
         !(use_padded_mask && is_causal_sdpa), "use_padded_mask and is_causal_sdpa are mutually exclusive in v2");
@@ -1910,6 +2015,8 @@ void sdpa_standard_v2(
             const uint32_t limit = (q_start_tile + Sq_chunk_t + Sk_chunk_t - 1) / Sk_chunk_t;
             k_loop_end = limit < k_num_chunks ? limit : k_num_chunks;
         }
+        const bool split_pv_owner_output_for_this_q =
+            split_pv_owner_output_for_this_head && q == 0 && q_chunk_local == 0 && k_loop_end == 1;
 
         auto call_step = [&](auto profiling_tag,
                              bool is_last,
@@ -1970,7 +2077,8 @@ void sdpa_standard_v2(
                 q_start_tile,
                 k_start_tile,
                 lw_mask.neginf_tile_idx,
-                lw_mask.causal_diag_tile_idx);
+                lw_mask.causal_diag_tile_idx,
+                split_pv_owner_output_for_this_q);
         };
 
         for (uint32_t k_chunk = 0; k_chunk < k_loop_end; k_chunk++) {

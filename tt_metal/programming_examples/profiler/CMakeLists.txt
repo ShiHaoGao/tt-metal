@@ -37,6 +37,10 @@ target_sources(
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/flash_attention_profile_runners.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/copied_sdpa/device/sdpa_device_operation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/copied_sdpa/device/sdpa_program_factory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/split_compute_sdpa/device/sdpa_device_operation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/split_compute_sdpa/device/sdpa_program_factory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/llk_microflow_sdpa/device/sdpa_device_operation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/llk_microflow_sdpa/device/sdpa_program_factory.cpp
 )
 
 target_link_libraries(
@@ -56,6 +60,8 @@ target_include_directories(
         ${PROJECT_SOURCE_DIR}/ttnn/api
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/copied_sdpa/device
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/split_compute_sdpa/device
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/llk_microflow_sdpa/device
 )
 
 add_custom_target(profiler_examples DEPENDS ${PROGRAMMING_EXAMPLES_TEST_TARGETS})

@@ -27,6 +27,8 @@
 #include <flash_attention_profile_runner.hpp>
 
 #include "copied_sdpa/device/sdpa_device_operation.hpp"
+#include "llk_microflow_sdpa/device/sdpa_device_operation.hpp"
+#include "split_compute_sdpa/device/sdpa_device_operation.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -36,8 +38,6 @@ namespace flash_attention_profile {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-using SDPAPipelineMode = ttnn::prim::flash_attention_profile_sdpa::SDPAPipelineMode;
-
 template <typename Func>
 uint64_t time_us(Func&& func) {
     const auto start = Clock::now();
@@ -102,10 +102,11 @@ ttnn::operations::transformer::SDPAProgramConfig make_program_config(
     distributed::MeshDevice* device,
     const ShapeConfig& shape,
     Variant variant,
+    ExperimentMode experiment_mode,
     GridPolicy grid_policy,
     std::optional<CoreCoord> grid_override) {
-    const auto resolved_grid =
-        resolve_flash_attention_grid(variant, grid_policy, grid_override, shape, device->compute_with_storage_grid_size());
+    const auto resolved_grid = resolve_flash_attention_grid(
+        variant, experiment_mode, grid_policy, grid_override, shape, device->compute_with_storage_grid_size());
     return ttnn::operations::transformer::SDPAProgramConfig{
         .compute_with_storage_grid_size = resolved_grid.value_or(device->compute_with_storage_grid_size()),
         .sub_core_grids = std::nullopt,
@@ -129,6 +130,7 @@ bool variant_selected(const std::vector<Variant>& selected_variants, Variant var
     return std::find(selected_variants.begin(), selected_variants.end(), variant) != selected_variants.end();
 }
 
+template <typename SDPAPipelineMode>
 SDPAPipelineMode to_copied_pipeline_mode(PipelineMode mode) {
     switch (mode) {
         case PipelineMode::Auto: return SDPAPipelineMode::Auto;
@@ -150,6 +152,7 @@ ttnn::Tensor copied_scaled_dot_product_attention(
     const ttnn::DeviceComputeKernelConfig& compute_kernel_config,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
+    ExperimentMode experiment_mode,
     CopiedKernelOptions copied_kernel_options);
 
 ttnn::Tensor copied_chunked_scaled_dot_product_attention(
@@ -163,6 +166,7 @@ ttnn::Tensor copied_chunked_scaled_dot_product_attention(
     const ttnn::DeviceComputeKernelConfig& compute_kernel_config,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
+    ExperimentMode experiment_mode,
     CopiedKernelOptions copied_kernel_options);
 
 std::vector<float> run_variant_for_correctness(
@@ -173,11 +177,12 @@ std::vector<float> run_variant_for_correctness(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
+    ExperimentMode experiment_mode,
     CopiedKernelOptions copied_kernel_options,
     GridPolicy grid_policy,
     std::optional<CoreCoord> grid_override) {
     distributed::MeshDevice* device = mesh_device.get();
-    auto program_config = make_program_config(device, shape, variant, grid_policy, grid_override);
+    auto program_config = make_program_config(device, shape, variant, experiment_mode, grid_policy, grid_override);
     auto compute_kernel_config = make_compute_kernel_config(device, high_precision);
     const bool chunked = variant_is_chunked(variant);
     const uint32_t q_length = chunked ? shape.prefill : shape.s;
@@ -228,6 +233,7 @@ std::vector<float> run_variant_for_correctness(
             compute_kernel_config,
             pipeline_mode,
             pipeline_depth,
+            experiment_mode,
             copied_kernel_options);
     } else {
         output = copied_chunked_scaled_dot_product_attention(
@@ -241,6 +247,7 @@ std::vector<float> run_variant_for_correctness(
             compute_kernel_config,
             pipeline_mode,
             pipeline_depth,
+            experiment_mode,
             copied_kernel_options);
     }
 
@@ -264,31 +271,56 @@ ttnn::Tensor copied_scaled_dot_product_attention(
     const ttnn::DeviceComputeKernelConfig& compute_kernel_config,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
+    ExperimentMode experiment_mode,
     CopiedKernelOptions copied_kernel_options) {
-    return ttnn::prim::flash_attention_profile_sdpa::sdpa(
-        q,
-        k,
-        v,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        /*is_causal=*/true,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        /*use_mla=*/false,
-        std::nullopt,
-        output_mem_config,
-        std::move(program_config),
-        compute_kernel_config,
-        to_copied_pipeline_mode(pipeline_mode),
-        pipeline_depth,
-        copied_kernel_options.qk_subblock_override,
-        copied_kernel_options.q_buffer_factor_override,
-        copied_kernel_options.dst_full_sync_override,
-        copied_kernel_options.qk_softmax_profile_stage,
-        copied_kernel_options.qk_softmax_schedule);
+    auto call = [&](auto sdpa_fn, auto pipeline_mode_tag) {
+        using PipelineModeType = decltype(pipeline_mode_tag);
+        return sdpa_fn(
+            q,
+            k,
+            v,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            /*is_causal=*/true,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            /*use_mla=*/false,
+            std::nullopt,
+            output_mem_config,
+            std::move(program_config),
+            compute_kernel_config,
+            to_copied_pipeline_mode<PipelineModeType>(pipeline_mode),
+            pipeline_depth,
+            copied_kernel_options.qk_subblock_override,
+            copied_kernel_options.q_buffer_factor_override,
+            copied_kernel_options.dst_full_sync_override,
+            copied_kernel_options.qk_softmax_profile_stage,
+            copied_kernel_options.qk_softmax_schedule,
+            copied_kernel_options.qk_detail_profile_stage,
+            copied_kernel_options.q_reader_schedule,
+            copied_kernel_options.qk_first_body_warmup,
+            copied_kernel_options.compute_pipeline_schedule);
+    };
+    switch (experiment_mode) {
+        case ExperimentMode::Copied:
+            return call(
+                ttnn::prim::flash_attention_profile_sdpa::sdpa,
+                ttnn::prim::flash_attention_profile_sdpa::SDPAPipelineMode::Auto);
+        case ExperimentMode::SplitComputeV1:
+            return call(
+                ttnn::prim::flash_attention_profile_split_compute_sdpa::sdpa,
+                ttnn::prim::flash_attention_profile_split_compute_sdpa::SDPAPipelineMode::Auto);
+        case ExperimentMode::LlkMicroflowV1:
+            return call(
+                ttnn::prim::flash_attention_profile_llk_microflow_sdpa::sdpa,
+                ttnn::prim::flash_attention_profile_llk_microflow_sdpa::SDPAPipelineMode::Auto);
+    }
+    return call(
+        ttnn::prim::flash_attention_profile_sdpa::sdpa,
+        ttnn::prim::flash_attention_profile_sdpa::SDPAPipelineMode::Auto);
 }
 
 ttnn::Tensor copied_chunked_scaled_dot_product_attention(
@@ -302,31 +334,56 @@ ttnn::Tensor copied_chunked_scaled_dot_product_attention(
     const ttnn::DeviceComputeKernelConfig& compute_kernel_config,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
+    ExperimentMode experiment_mode,
     CopiedKernelOptions copied_kernel_options) {
-    return ttnn::prim::flash_attention_profile_sdpa::sdpa(
-        q,
-        k,
-        v,
-        std::nullopt,
-        page_table,
-        std::nullopt,
-        /*is_causal=*/true,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        chunk_start,
-        /*use_mla=*/false,
-        std::nullopt,
-        output_mem_config,
-        std::move(program_config),
-        compute_kernel_config,
-        to_copied_pipeline_mode(pipeline_mode),
-        pipeline_depth,
-        copied_kernel_options.qk_subblock_override,
-        copied_kernel_options.q_buffer_factor_override,
-        copied_kernel_options.dst_full_sync_override,
-        copied_kernel_options.qk_softmax_profile_stage,
-        copied_kernel_options.qk_softmax_schedule);
+    auto call = [&](auto sdpa_fn, auto pipeline_mode_tag) {
+        using PipelineModeType = decltype(pipeline_mode_tag);
+        return sdpa_fn(
+            q,
+            k,
+            v,
+            std::nullopt,
+            page_table,
+            std::nullopt,
+            /*is_causal=*/true,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            chunk_start,
+            /*use_mla=*/false,
+            std::nullopt,
+            output_mem_config,
+            std::move(program_config),
+            compute_kernel_config,
+            to_copied_pipeline_mode<PipelineModeType>(pipeline_mode),
+            pipeline_depth,
+            copied_kernel_options.qk_subblock_override,
+            copied_kernel_options.q_buffer_factor_override,
+            copied_kernel_options.dst_full_sync_override,
+            copied_kernel_options.qk_softmax_profile_stage,
+            copied_kernel_options.qk_softmax_schedule,
+            copied_kernel_options.qk_detail_profile_stage,
+            copied_kernel_options.q_reader_schedule,
+            copied_kernel_options.qk_first_body_warmup,
+            copied_kernel_options.compute_pipeline_schedule);
+    };
+    switch (experiment_mode) {
+        case ExperimentMode::Copied:
+            return call(
+                ttnn::prim::flash_attention_profile_sdpa::sdpa,
+                ttnn::prim::flash_attention_profile_sdpa::SDPAPipelineMode::Auto);
+        case ExperimentMode::SplitComputeV1:
+            return call(
+                ttnn::prim::flash_attention_profile_split_compute_sdpa::sdpa,
+                ttnn::prim::flash_attention_profile_split_compute_sdpa::SDPAPipelineMode::Auto);
+        case ExperimentMode::LlkMicroflowV1:
+            return call(
+                ttnn::prim::flash_attention_profile_llk_microflow_sdpa::sdpa,
+                ttnn::prim::flash_attention_profile_llk_microflow_sdpa::SDPAPipelineMode::Auto);
+    }
+    return call(
+        ttnn::prim::flash_attention_profile_sdpa::sdpa,
+        ttnn::prim::flash_attention_profile_sdpa::SDPAPipelineMode::Auto);
 }
 
 class FlashAttentionRunner : public FlashAttentionProfileRunner {
@@ -334,6 +391,7 @@ public:
     FlashAttentionRunner(
         Variant variant,
         RunMode mode,
+        ExperimentMode experiment_mode,
         PipelineMode pipeline_mode,
         uint32_t pipeline_depth,
         CopiedKernelOptions copied_kernel_options,
@@ -342,9 +400,10 @@ public:
         ShapeConfig shape,
         const HostInputs& inputs,
         bool high_precision,
-        std::shared_ptr<distributed::MeshDevice> mesh_device) :
+    std::shared_ptr<distributed::MeshDevice> mesh_device) :
         variant_(variant),
         mode_(mode),
+        experiment_mode_(experiment_mode),
         pipeline_mode_(pipeline_mode),
         pipeline_depth_(pipeline_depth),
         copied_kernel_options_(copied_kernel_options),
@@ -352,7 +411,7 @@ public:
         inputs_(inputs),
         mesh_device_(std::move(mesh_device)),
         dev_ptr_(mesh_device_.get()),
-        program_config_(make_program_config(dev_ptr_, shape_, variant_, grid_policy, grid_override)),
+        program_config_(make_program_config(dev_ptr_, shape_, variant_, experiment_mode_, grid_policy, grid_override)),
         compute_kernel_config_(make_compute_kernel_config(dev_ptr_, high_precision)) {
         create_host_runtime_tensors();
         create_static_tensors();
@@ -499,6 +558,7 @@ private:
                 compute_kernel_config_,
                 pipeline_mode_,
                 pipeline_depth_,
+                experiment_mode_,
                 copied_kernel_options_);
         }
         return ttnn::transformer::scaled_dot_product_attention(
@@ -527,6 +587,7 @@ private:
                 compute_kernel_config_,
                 pipeline_mode_,
                 pipeline_depth_,
+                experiment_mode_,
                 copied_kernel_options_);
         }
         return ttnn::transformer::chunked_scaled_dot_product_attention(
@@ -591,6 +652,7 @@ private:
 
     Variant variant_;
     RunMode mode_;
+    ExperimentMode experiment_mode_;
     PipelineMode pipeline_mode_;
     uint32_t pipeline_depth_ = 2;
     CopiedKernelOptions copied_kernel_options_;
@@ -653,6 +715,15 @@ const char* grid_policy_name(GridPolicy policy) {
     return "unknown";
 }
 
+const char* experiment_mode_name(ExperimentMode mode) {
+    switch (mode) {
+        case ExperimentMode::Copied: return "copied";
+        case ExperimentMode::SplitComputeV1: return "split_compute_v1";
+        case ExperimentMode::LlkMicroflowV1: return "llk_microflow_v1";
+    }
+    return "unknown";
+}
+
 bool variant_is_chunked(Variant variant) {
     return variant == Variant::TtnnChunkedBaseline || variant == Variant::CopiedChunked;
 }
@@ -698,12 +769,21 @@ std::optional<CoreCoord> rectangular_grid_with_area(uint32_t area, CoreCoord dev
 
 std::optional<CoreCoord> resolve_flash_attention_grid(
     Variant variant,
+    ExperimentMode experiment_mode,
     GridPolicy grid_policy,
     std::optional<CoreCoord> grid_override,
     const ShapeConfig& shape,
     CoreCoord device_grid) {
     if (grid_override.has_value()) {
         return grid_override;
+    }
+    if (experiment_mode == ExperimentMode::SplitComputeV1) {
+        if (device_grid.y > 1) {
+            return CoreCoord{device_grid.x, device_grid.y - 1};
+        }
+        if (device_grid.x > 1) {
+            return CoreCoord{device_grid.x - 1, device_grid.y};
+        }
     }
     if (grid_policy != GridPolicy::CopiedBalancedQ || !variant_is_copied(variant)) {
         return std::nullopt;
@@ -751,6 +831,7 @@ std::optional<CoreCoord> resolve_flash_attention_grid(
 std::unique_ptr<FlashAttentionProfileRunner> prepare_flash_attention_runner(
     Variant variant,
     RunMode mode,
+    ExperimentMode experiment_mode,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
     CopiedKernelOptions copied_kernel_options,
@@ -763,6 +844,7 @@ std::unique_ptr<FlashAttentionProfileRunner> prepare_flash_attention_runner(
     return std::make_unique<FlashAttentionRunner>(
         variant,
         mode,
+        experiment_mode,
         pipeline_mode,
         pipeline_depth,
         copied_kernel_options,
@@ -780,6 +862,7 @@ std::vector<CorrectnessResult> check_flash_attention_correctness(
     bool high_precision,
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
     const std::vector<Variant>& selected_variants,
+    ExperimentMode experiment_mode,
     PipelineMode pipeline_mode,
     uint32_t pipeline_depth,
     CopiedKernelOptions copied_kernel_options,
@@ -801,6 +884,7 @@ std::vector<CorrectnessResult> check_flash_attention_correctness(
                 mesh_device,
                 PipelineMode::Auto,
                 2,
+                ExperimentMode::Copied,
                 CopiedKernelOptions{},
                 grid_policy,
                 grid_override);
@@ -813,6 +897,7 @@ std::vector<CorrectnessResult> check_flash_attention_correctness(
                 mesh_device,
                 pipeline_mode,
                 pipeline_depth,
+                experiment_mode,
                 copied_kernel_options,
                 grid_policy,
                 grid_override);
