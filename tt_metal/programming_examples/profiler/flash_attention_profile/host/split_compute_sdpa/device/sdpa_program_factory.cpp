@@ -4,18 +4,22 @@
 
 #include "sdpa_program_factory.hpp"
 #include "sdpa_subblock_utils.hpp"
+#include <array>
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/constants.hpp>
+#include <tt-metalium/experimental/per_core_allocation/buffer.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/host_api.hpp>
 #include "ttnn/operations/math.hpp"
 #include <tt-metalium/tensor_accessor_args.hpp>
+#include <memory>
 #include <optional>
 #include <string>
 #include <cmath>
 
 using namespace tt::constants;
 using namespace tt::tt_metal;
+namespace per_core_allocation = tt::tt_metal::experimental::per_core_allocation;
 
 namespace ttnn::prim::flash_attention_profile_split_compute_sdpa {
 
@@ -57,6 +61,28 @@ struct CoreChainInfo {
 };
 
 namespace {
+
+std::shared_ptr<Buffer> create_core_local_l1_buffer(
+    IDevice* device, CoreCoord core, uint32_t size_bytes, uint32_t page_size_bytes) {
+    TT_FATAL(page_size_bytes != 0 && size_bytes % page_size_bytes == 0, "L1 mailbox size must be page-aligned");
+    const uint32_t num_pages = size_bytes / page_size_bytes;
+    ShardSpecBuffer shard_spec(
+        CoreRangeSet(CoreRange(core)),
+        std::array<uint32_t, 2>{num_pages, 1},
+        ShardOrientation::ROW_MAJOR,
+        std::array<uint32_t, 2>{1, 1},
+        std::array<uint32_t, 2>{num_pages, 1});
+    BufferShardingArgs sharding_args(shard_spec, TensorMemoryLayout::HEIGHT_SHARDED);
+    per_core_allocation::set_per_core_allocation(sharding_args, true);
+    return Buffer::create(device, size_bytes, page_size_bytes, BufferType::L1, sharding_args, false);
+}
+
+uint32_t core_local_l1_address(const std::shared_ptr<Buffer>& buffer, CoreCoord core) {
+    if (!buffer) {
+        return 0;
+    }
+    return static_cast<uint32_t>(per_core_allocation::get_per_core_address(*buffer, core));
+}
 
 // Select the mask data format: user-provided mask dtype, or Float16_b for streaming (avoids Bfp4_b precision loss),
 // or Bfp4_b for legacy path.
@@ -660,6 +686,7 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
     const bool split_pv_owner_probe = operation_attributes.compute_pipeline_schedule == 21;
     const bool split_state_mailbox_ring = operation_attributes.compute_pipeline_schedule == 22;
     const bool split_pv_owner_output_no_ack = operation_attributes.compute_pipeline_schedule == 25;
+    const bool split_state_ready_mailbox_bridge = operation_attributes.compute_pipeline_schedule == 26;
     const bool split_pv_owner_output = operation_attributes.compute_pipeline_schedule == 23 || split_pv_owner_output_no_ack;
     const bool split_state_real_p_packet_stream = split_state_real_p_kt_stream || split_state_mailbox_ring;
     const bool split_state_real_p_handoff =
@@ -675,7 +702,7 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
             : 1;
     const bool split_signal_enabled =
         split_signal_only || split_output_stream_signal || split_l1_ready_signal || split_state_ready_signal ||
-        split_state_consumer_probe;
+        split_state_consumer_probe || split_state_ready_mailbox_bridge;
     const uint32_t split_signal_expected_output_chunks =
         std::min(batch_per_core, B) * std::min(nh_per_core, NQH) * std::min(q_per_core, q_num_chunks);
     const uint32_t split_owner_q_rows = out_out_subblock_h;
@@ -711,6 +738,15 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
             consumer_probe_core.y,
             consumer_probe_physical_core.x,
             consumer_probe_physical_core.y);
+    }
+
+    constexpr uint32_t split_state_mailbox_bytes = 32;
+    std::shared_ptr<Buffer> split_state_mailbox_l1_buffer;
+    uint32_t split_state_mailbox_l1_addr = 0;
+    if (split_state_ready_mailbox_bridge) {
+        split_state_mailbox_l1_buffer =
+            create_core_local_l1_buffer(device, CoreCoord{0, 0}, split_state_mailbox_bytes, split_state_mailbox_bytes);
+        split_state_mailbox_l1_addr = core_local_l1_address(split_state_mailbox_l1_buffer, CoreCoord{0, 0});
     }
 
     std::vector<uint32_t> writer_compile_time_args = {
@@ -749,6 +785,7 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         split_state_real_p_handoff ? split_real_p_packet_tiles : 1, // arg 31
         split_state_real_p_handoff ? split_real_p_packet_count : 1, // arg 32
         split_state_mailbox_slots,                         // arg 33
+        split_state_mailbox_l1_addr,                       // arg 34
     };
 
     TensorAccessorArgs(output_tensor.buffer()).append_to(writer_compile_time_args);
@@ -779,13 +816,14 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         operation_attributes.compute_pipeline_schedule <= 4 || split_signal_enabled,
         "compute_pipeline_schedule must be in [0, 4] for copied schedules, 9 for split_signal_only_v1, 10 for "
         "split_output_stream_signal_v1, 11 for split_l1_ready_signal_v1, 12 for "
-        "split_state_ready_signal_v1, 13-23 for split_state_consumer schedules, or 25 for "
-        "split_pv_owner_output_no_ack_v1, got {}",
+        "split_state_ready_signal_v1, 13-23 for split_state_consumer schedules, 25 for "
+        "split_pv_owner_output_no_ack_v1, or 26 for split_state_ready_mailbox_bridge_v1, got {}",
         operation_attributes.compute_pipeline_schedule);
-    if (split_state_ready_signal || split_state_consumer_probe) {
+    if (split_state_ready_signal || split_state_consumer_probe || split_state_ready_mailbox_bridge) {
         TT_FATAL(
             use_streaming_compute,
-            "split_state_ready_signal_v1 and split_state_consumer_probe schedules require streaming compute");
+            "split_state_ready_signal_v1, split_state_consumer_probe schedules, and "
+            "split_state_ready_mailbox_bridge_v1 require streaming compute");
     }
     if (split_pv_owner_output) {
         TT_FATAL(is_causal, "split_pv_owner_output_v1 is only defined for causal SDPA");
@@ -861,6 +899,7 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
         (split_signal_only || split_output_stream_signal || split_l1_ready_signal)
             ? 0
             : operation_attributes.compute_pipeline_schedule, // arg 41
+        split_state_mailbox_l1_addr,                  // arg 42
     };
 
     TensorAccessorArgs(output_tensor.buffer()).append_to(compute_compile_time_args);
@@ -1031,7 +1070,7 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
 
     CreateCircularBuffer(program, core_grid, c_out0_config);
 
-    if (split_state_ready_signal || split_state_consumer_probe) {
+    if (split_state_ready_signal || split_state_consumer_probe || split_state_ready_mailbox_bridge) {
         if (split_state_real_p_handoff) {
             auto c_split_state_ready_config =
                 CircularBufferConfig(
@@ -1758,6 +1797,7 @@ SDPAProgramFactory::cached_program_t SDPAProgramFactory::create(
             .compute_kernels_id = compute_kernels_id,
             .consumer_probe_kernels_id = consumer_probe_kernels_id,
             .consumer_signal_kernels_id = consumer_signal_kernels_id,
+            .split_state_mailbox_l1_buffer = split_state_mailbox_l1_buffer,
             .producer_core_grid = CoreRangeSet({core_grid}),
             .consumer_probe_core_grid = consumer_probe_grid,
             .grid_size = grid_size,

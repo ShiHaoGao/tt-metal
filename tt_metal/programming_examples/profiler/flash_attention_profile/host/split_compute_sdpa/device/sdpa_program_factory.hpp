@@ -6,6 +6,10 @@
 
 #include "sdpa_device_operation_types.hpp"
 
+#include <memory>
+
+#include <tt-metalium/buffer.hpp>
+
 #include "ttnn/device_operation.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operation.hpp"
@@ -19,6 +23,7 @@ struct SDPASharedVariables {
     tt::tt_metal::KernelHandle compute_kernels_id{};
     tt::tt_metal::KernelHandle consumer_probe_kernels_id{};
     tt::tt_metal::KernelHandle consumer_signal_kernels_id{};
+    std::shared_ptr<tt::tt_metal::Buffer> split_state_mailbox_l1_buffer{};
     tt::tt_metal::CoreRangeSet producer_core_grid;
     tt::tt_metal::CoreRangeSet consumer_probe_core_grid;
     tt::tt_metal::CoreCoord grid_size;

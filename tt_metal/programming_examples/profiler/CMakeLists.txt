@@ -11,6 +11,7 @@ set(PROFILER_EXAMPLES_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/test_device_api_debugger/test_device_api_debugger.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/matmul_variants_profile/matmul_variants_profile.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/flash_attention_profile.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/primitive_probe/flash_attention_primitive_probe.cpp
 )
 
 CREATE_PGM_EXAMPLES_EXE("${PROFILER_EXAMPLES_SRCS}" "profiler")
@@ -62,6 +63,23 @@ target_include_directories(
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/copied_sdpa/device
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/split_compute_sdpa/device
         ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile/host/llk_microflow_sdpa/device
+)
+
+target_link_libraries(
+    flash_attention_primitive_probe
+    PUBLIC
+        tt_metal
+        m
+        pthread
+)
+
+target_include_directories(
+    flash_attention_primitive_probe
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/ttnn/cpp
+        ${PROJECT_SOURCE_DIR}/ttnn/api
+        ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_profile
 )
 
 add_custom_target(profiler_examples DEPENDS ${PROGRAMMING_EXAMPLES_TEST_TARGETS})

@@ -65,7 +65,7 @@ void kernel_main() {
     constexpr bool split_signal_only = compute_pipeline_schedule == 9;
     constexpr bool split_output_stream_signal = compute_pipeline_schedule == 10;
     constexpr bool split_l1_ready_signal = compute_pipeline_schedule == 11;
-    constexpr bool split_state_ready_signal = compute_pipeline_schedule == 12;
+    constexpr bool split_state_ready_signal = compute_pipeline_schedule == 12 || compute_pipeline_schedule == 26;
     constexpr bool split_state_consumer_probe =
         compute_pipeline_schedule == 13 || compute_pipeline_schedule == 14 || compute_pipeline_schedule == 15 ||
         compute_pipeline_schedule == 16 || compute_pipeline_schedule == 17 || compute_pipeline_schedule == 18 ||

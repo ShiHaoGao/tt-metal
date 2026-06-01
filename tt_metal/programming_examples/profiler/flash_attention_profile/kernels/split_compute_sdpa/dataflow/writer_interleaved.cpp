@@ -45,8 +45,9 @@ void kernel_main() {
     constexpr uint32_t split_state_ready_tiles = get_compile_time_arg_val(31);
     constexpr uint32_t split_state_ready_packets = get_compile_time_arg_val(32);
     constexpr uint32_t split_state_mailbox_slots = get_compile_time_arg_val(33);
+    constexpr uint32_t split_state_mailbox_l1_addr = get_compile_time_arg_val(34);
 
-    constexpr auto out_args = TensorAccessorArgs<34>();
+    constexpr auto out_args = TensorAccessorArgs<35>();
 
     const uint32_t out_addr = get_arg_val<uint32_t>(0);
     const uint32_t core_id = get_arg_val<uint32_t>(1);
@@ -95,8 +96,9 @@ void kernel_main() {
         compute_pipeline_schedule == 15 || compute_pipeline_schedule == 16 || compute_pipeline_schedule == 17 ||
         compute_pipeline_schedule == 18 || compute_pipeline_schedule == 19 || compute_pipeline_schedule == 20 ||
         compute_pipeline_schedule == 21 || compute_pipeline_schedule == 22 || compute_pipeline_schedule == 23 ||
-        compute_pipeline_schedule == 25;
+        compute_pipeline_schedule == 25 || compute_pipeline_schedule == 26;
     constexpr bool split_state_mailbox_ring = compute_pipeline_schedule == 22;
+    constexpr bool split_state_ready_mailbox_bridge = compute_pipeline_schedule == 26;
     constexpr bool split_pv_owner_output_no_ack = compute_pipeline_schedule == 25;
     constexpr bool split_pv_owner_output = compute_pipeline_schedule == 23 || split_pv_owner_output_no_ack;
     constexpr bool split_state_real_p_handoff =
@@ -106,6 +108,7 @@ void kernel_main() {
         split_signal_only || split_output_stream_signal || split_l1_ready_signal || split_state_ready_signal;
     bool split_signal_output_sent = false;
     uint32_t split_signal_outputs_sent = 0;
+    [[maybe_unused]] uint32_t split_state_mailbox_expected_seq = 0;
     auto send_split_signal = [&]() {
         const uint32_t split_signal_semaphore_addr = get_semaphore(split_signal_semaphore_id);
         const uint64_t split_signal_remote_addr =
@@ -133,6 +136,15 @@ void kernel_main() {
     if constexpr (split_signal_enabled) {
         if (core_id == 0) {
             DeviceZoneScopedN("FAP_SPLIT_SIGNAL_START_SEND");
+            if constexpr (split_state_ready_mailbox_bridge) {
+                auto* split_state_mailbox =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(split_state_mailbox_l1_addr);
+                split_state_mailbox[0] = 0xfa320001u;
+                split_state_mailbox[1] = 0;
+                split_state_mailbox[2] = 0;
+                split_state_mailbox[3] = 0;
+                split_state_mailbox[4] = 0;
+            }
             send_split_signal();
         }
     }
@@ -207,7 +219,25 @@ void kernel_main() {
                     uint32_t out_tile_id = out_tile_shape.id_of(nb, nq, write_offset + out_row_start_tile, 0);
                     if constexpr (split_state_ready_signal) {
                         if (!split_pv_owner_output || split_pv_owner_output_chunk) {
-                            if constexpr (split_state_mailbox_ring) {
+                            if constexpr (split_state_ready_mailbox_bridge) {
+                                if (core_id == 0) {
+                                    auto* split_state_mailbox =
+                                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(split_state_mailbox_l1_addr);
+                                    ++split_state_mailbox_expected_seq;
+                                    uint32_t mailbox_loops = 0;
+                                    {
+                                        DeviceZoneScopedN("FAP_SPLIT_STATE_READY_MAILBOX_WAIT");
+                                        while (split_state_mailbox[1] < split_state_mailbox_expected_seq) {
+                                            ++mailbox_loops;
+                                        }
+                                    }
+                                    split_state_mailbox[3] = mailbox_loops;
+                                    split_state_mailbox[4] = 0xfa320002u;
+                                    DeviceZoneScopedN("FAP_SPLIT_SIGNAL_STATE_READY_SEND");
+                                    send_split_signal();
+                                    ++split_signal_outputs_sent;
+                                }
+                            } else if constexpr (split_state_mailbox_ring) {
                                 uint32_t packets_drained = 0;
                                 while (packets_drained < split_state_ready_packets) {
                                     const uint32_t remaining_packets = split_state_ready_packets - packets_drained;

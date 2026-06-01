@@ -62,6 +62,7 @@ void kernel_main() {
     constexpr uint32_t qk_detail_profile_stage = get_compile_time_arg_val(39);
     constexpr uint32_t qk_first_body_warmup = get_compile_time_arg_val(40);
     constexpr uint32_t compute_pipeline_schedule = get_compile_time_arg_val(41);
+    constexpr uint32_t split_state_mailbox_l1_addr = get_compile_time_arg_val(42);
 
     const uint32_t core_id = get_arg_val<uint32_t>(0);
     const uint32_t local_batch_start = get_arg_val<uint32_t>(1);
@@ -203,7 +204,8 @@ void kernel_main() {
                         lw_mask,
                         q_num_chunks,
                         use_zigzag_balancing,
-                        split_pv_owner_output_for_this_head);
+                        split_pv_owner_output_for_this_head,
+                        core_id == 0 ? split_state_mailbox_l1_addr : 0);
                 }
             }
         }

@@ -65,6 +65,16 @@ chunked/paged prefill 也通过同一个 copied
 cmake --build build_Release --target flash_attention_profile --parallel $(nproc)
 ```
 
+独立原语 micro-probe：
+
+```bash
+cmake --build build_Release --target flash_attention_primitive_probe --parallel $(nproc)
+./build_Release/programming_examples/profiler/flash_attention_primitive_probe \
+  --primitive dataflow_sem_inc
+./build_Release/programming_examples/profiler/flash_attention_primitive_probe \
+  --primitive manual_mailbox_bridge --max-loops 100000000
+```
+
 如果机器上的 `/tmp` 空间不足，OpenMPI 可能会在启动前失败。此时给运行命令加上：
 
 ```bash
@@ -297,6 +307,13 @@ TT_METAL_PROFILER_CPP_POST_PROCESS=1 \
     发出 state-ready 后不再等待 consumer ACK，consumer remote-read `P/sum`
     后也不回 ACK。它用于验证 `c_15` handoff 的 ack/backpressure 是否还值得优化；
     当前 q128/k128 correctness 已通过，但它不是最快配置。
+  - `split_state_ready_mailbox_bridge_v1`：`split_compute_v1` 专用，不使用
+    `c_15` CB 做 state-ready 控制 token。producer compute 的 `TRISC_PACK`
+    路径写 per-core L1 mailbox，producer writer/dataflow RV 轮询该 mailbox 后
+    用 `noc_semaphore_inc` 转发给 consumer。它只桥接 state-ready token，不搬
+    `P/V/sum` tile 数据；当前实现需要
+    `TT_METAL_ALLOCATOR_MODE_HYBRID=1`，因为 mailbox 是 host 分配的 per-core
+    L1 buffer。
   - 除 `split_*` 信号实验外，这个模式只允许 streaming compute、默认
     SALAD handoff，并要求 `QKTV` row group height 等于 QK row group height；
     不满足条件时直接报错，不做 fallback。
@@ -400,6 +417,21 @@ copied default / TTNN baseline，因此 current fastest 仍不变。
 consumer；real-P schedules 不再额外依赖 dummy token CB，而是直接等真实 `P/V/sum`
 CB。no-ack 版本 correctness 通过，host avg 比 schedule 23 好，但 device critical
 path 没有下降；ack/backpressure 不是当前主瓶颈，因此 current fastest 仍不变。
+2026-06-01 09:19-09:36 继续做 direct state-ready 和 consumer-owned state
+前置实验。direct compute-to-consumer semaphore 方案在 JIT 阶段失败，原因是 compute
+kernel 不能直接 include/use 当前 dataflow NOC API；相关可执行 schedule 没有保留。
+q256/k128 的 real-P kt-stream 细 profile 显示 packet 化没有降低 critical path，
+q256/k256 的 owner-output/no-ack 细 profile 显示 consumer `PV`/output 仍落在尾部路径。
+因此 current fastest 仍不变。
+2026-06-01 10:28-10:38 继续做独立 primitive micro-probe，并参考
+`tt_metal/programming_examples/NoC_tile_transfer` 的 dataflow semaphore 方式。
+dataflow producer -> remote consumer semaphore 链路通过；TRISC raw atomic / inline
+write 的当前 probe 写法均 timeout，因此不保留这些无效可执行入口，只在下文记录负结果。
+2026-06-01 11:49-12:00 把通过的 primitive 接进 FA 主路径，新增
+`split_state_ready_mailbox_bridge_v1`。它在 q256/k128 correctness 通过，并证明
+“TRISC 写 L1 mailbox + dataflow RV 转发 semaphore”可以在 FA schedule 内稳定运行；
+但它只改变 state-ready 控制 token，不搬真实 tile 数据，host/device profile 没有显示
+稳定性能收益。因此 current fastest 仍不变。
 
 相对官方 TTNN tuned baseline，主要看 device critical path：
 
@@ -935,6 +967,174 @@ device profiler 对照，`llama_prefill_2k_q128_k128 grid=8x8 warmup=0 iters=1`�
 - `/wafer/gsh/tmp/fa_profile_20260531_split_owner_2k_q128_k128_device.csv`
 - `/wafer/gsh/tmp/fa_profile_20260531_split_owner_no_ack_2k_q128_k128_device.csv`
 - `/wafer/gsh/tmp/fa_profile_20260531_split_owner_no_ack_correctness.log`
+
+### 2026-06-01 direct state-ready / consumer-owned state 前置实验
+
+本轮继续验证两个问题：
+
+1. producer compute 能否在 softmax state ready 后直接唤醒 consumer，绕过
+   writer-mediated state-ready。
+2. 在更大 q chunk 或单 K chunk owner-output 上，consumer 接管 `P@V` 是否已经有
+   可隐藏窗口。
+
+网上资料和本地技术报告对照：
+
+- FA3 的核心启发不是“把整段 `PV` 提前塞进去”，而是用更细粒度 producer-consumer
+  pipeline，把 matmul 和 softmax 的等待隐藏在不同执行资源/执行流之间：
+  <https://arxiv.org/abs/2407.08608>。
+- FA4 继续强调 attention kernel 需要 algorithm/kernel pipeline co-design，而不是只调
+  一个局部 kernel 参数：<https://arxiv.org/abs/2603.05451>。
+- 本地 Tenstorrent FlashAttention tech report 明确写到 TT-Metal 的 reader/writer/compute
+  RISCs 并发、Q/K/V double buffer，以及未来方向包括在不同 compute units 上 pipeline
+  matmul 和 softmax。对应文件：
+  `third_party/tt-metal/tech_reports/FlashAttention/FlashAttention.md`。
+
+#### 实验 1：direct compute-to-consumer state-ready v0
+
+尝试内容：
+
+- 临时新增 `split_pv_owner_output_direct_state_v1`。
+- producer compute 在 `cb_split_state_ready` push 后尝试直接对 consumer semaphore
+  做 `noc_semaphore_inc`，目标是绕过 writer 转发。
+
+结果：
+
+| 项目 | 结果 |
+| --- | --- |
+| build target | `cmake --build build_Release --target flash_attention_profile --parallel $(nproc)` 通过 |
+| runtime/JIT | 失败，`trisc0/trisc1/trisc2 build failed` |
+| 直接原因 | compute kernel include `api/dataflow/dataflow_api.h` 后，`NOC_INDEX` 未定义，且 `get_arg_val` / `get_common_arg_val` 等 compute API 与 dataflow API 重定义 |
+| 当前代码状态 | 可执行 schedule 已删除；不保留不可运行入口或兼容分支 |
+
+关键日志：
+
+- `/wafer/gsh/tmp/fa_profile_20260601_direct_state_q128_k128_correctness.log`
+
+判断：
+
+- 当前 TT-Metal compute kernel API 边界下，不能直接把 dataflow NOC semaphore API
+  塞进 TRISC compute kernel。
+- 这不证明硬件绝对不能做 compute-side signal；它证明“用现有 public dataflow API
+  直接 include 到 compute kernel”这条路不成立。
+- 下一步如果要继续 direct signal，必须先找到 TRISC 可用的更底层 NOC/LLK primitive；
+  找不到之前，不应该保留 public schedule。更现实的近期路线是做 producer-side
+  dataflow bridge：让 writer/另一个 dataflow path 更早、更专门地转发 state-ready，
+  而不是把普通 output writer 继续当作桥。
+
+#### 实验 2A：q256/k128 real-P kt-stream 多 K chunk profile
+
+命令范围：
+
+- shape：`llama_prefill_2k`，即 `q=256,k=128`
+- variant：`copied_sdpa`
+- experiment：`split_compute_v1`
+- mode：`prepared_no_q_copy`
+- grid：`8x8`
+- profiler：`TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_MID_RUN_DUMP=1 TT_METAL_PROFILER_CPP_POST_PROCESS=1`
+
+host 对照，单位 ms：
+
+| schedule | avg | best | worst | call avg | sync avg | 判断 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| default | 0.304 | 0.270 | 0.416 | 0.048 | 0.251 | split fork 默认对照 |
+| `split_state_real_p_kt_stream_v1` | 0.319 | 0.288 | 0.431 | 0.049 | 0.267 | 慢约 0.015 ms，sync 增加约 0.016 ms |
+| `split_pv_owner_output_no_ack_v1` | - | - | - | - | - | 非法 shape：该 schedule 只覆盖单 K chunk，`Sq_chunk_t=8, Sk_chunk_t=4` 触发 guard |
+
+device CSV 手工解析，单位 us：
+
+| zone | default critical | kt-stream critical | 差值 | 判断 |
+| --- | ---: | ---: | ---: | --- |
+| `FAP_WRITER` | 247.196 | 260.375 | +13.179 | writer critical 变长 |
+| `FAP_COMPUTE` | 246.321 | 259.601 | +13.280 | producer compute 也变长 |
+| `FAP_READER` | 214.161 | 224.951 | +10.790 | reader 不是主要收益点 |
+| `FAP_WRITER_WAIT_OUTPUT` | 236.250 | 3.754 | -232.496 | final output wait 被消掉，但只是换位置 |
+| `FAP_SPLIT_STATE_READY_LOCAL_WAIT` | - | 245.603 | +245.603 | writer 现在主要等 state-ready |
+| `FAP_SPLIT_COMPUTE_V1_CONSUMER_PROBE` | - | 38.501 | +38.501 | consumer probe 进入尾部路径 |
+| `FAP_SPLIT_CONSUMER_PROBE_WAIT_INPUTS` | - | 34.726 | +34.726 | consumer 拿到 `P/V/sum` 太晚 |
+| `FAP_SPLIT_SIGNAL_OUTPUT_WAIT` | - | 32.661 | +32.661 | consumer 等 signal 的窗口仍在 |
+| `FAP_SPLIT_REAL_P_KT_HANDOFF` | - | 1.378 | +1.378 | packet handoff 本身小，但不是 free |
+| `FAP_SPLIT_REAL_P_REMOTE_READ` | - | 0.416 | +0.416 | remote read 不是主瓶颈 |
+| `FAP_SPLIT_REAL_P_ACK_WAIT` | - | 0.470 | +0.470 | ack 很小，不是关键等待 |
+| `FAP_COMPUTE_QK_MATMUL_BODY` | 9.132 | 8.221 | -0.910 | QK body 没变坏 |
+| `FAP_COMPUTE_QK_SOFTMAX_EXP_SUM` | 2.852 | 2.855 | +0.003 | softmax 单段也不是新增慢点 |
+| `FAP_COMPUTE_QKV_PHASE` | 3.650 | 3.643 | -0.007 | 本地 `PV` body 没有恶化 |
+
+判断：
+
+- kt-stream 确实把 writer 的 `WAIT_OUTPUT` 从 236 us 降到约 4 us，但这不是性能收益，
+  因为等待被替换成 `FAP_SPLIT_STATE_READY_LOCAL_WAIT` 的 246 us。
+- 新增 `P_kt` packet handoff 没有让 consumer 与 producer 形成有效 overlap；
+  consumer 的 `WAIT_INPUTS`/`PV_GROUP` 在时间线上仍晚到，最终 device critical path
+  反而增加约 13 us。
+- q256/k128 是多 K chunk 形状，`split_pv_owner_output_no_ack_v1` 明确不能跑。这个
+  guard 是正确的：当前 owner-output 版本只接管单 K chunk 的 q_chunk0 row group，
+  不是跨 K chunk online state。
+
+#### 实验 2B：q256/k256 owner-output/no-ack 单 K chunk profile
+
+命令范围同上，shape 改为 `llama_prefill_2k_q256_k256`。这个 shape 满足 owner-output
+单 K chunk guard。
+
+host 对照，单位 ms：
+
+| schedule | avg | best | worst | call avg | sync avg | 判断 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| default | 0.255 | 0.223 | 0.366 | 0.052 | 0.199 | split fork 默认对照 |
+| `split_pv_owner_output_no_ack_v1` | 0.265 | 0.232 | 0.382 | 0.050 | 0.212 | 慢约 0.010 ms，sync 增加约 0.013 ms |
+
+device CSV 手工解析，单位 us：
+
+| zone | default critical | no-ack critical | 差值 | 判断 |
+| --- | ---: | ---: | ---: | --- |
+| `FAP_WRITER` | 196.011 | 205.063 | +9.052 | writer critical 变长 |
+| `FAP_COMPUTE` | 195.194 | 204.331 | +9.137 | producer compute 变长 |
+| `FAP_READER` | 148.987 | 155.600 | +6.613 | reader 随整体变慢 |
+| `FAP_WRITER_WAIT_OUTPUT` | 183.434 | 192.553 | +9.119 | no-ack 没有降低 writer 尾部等待 |
+| `FAP_SPLIT_STATE_READY_LOCAL_WAIT` | - | 23.804 | +23.804 | 单 K chunk 也仍需要晚 state-ready |
+| `FAP_SPLIT_SIGNAL_OUTPUT_WAIT` | - | 24.831 | +24.831 | consumer 等 state/output signal |
+| `FAP_SPLIT_COMPUTE_V1_CONSUMER_PROBE` | - | 31.389 | +31.389 | consumer 的真实 `PV`/normalize/output 进入尾部 |
+| `FAP_SPLIT_CONSUMER_PROBE_WAIT_INPUTS` | - | 28.197 | +28.197 | 等输入比 remote read 大得多 |
+| `FAP_SPLIT_CONSUMER_PROBE_PV_GROUP` | - | 31.209 | +31.209 | 接管 row group 的 `PV` 没被隐藏 |
+| `FAP_SPLIT_REAL_P_REMOTE_READ` | - | 1.367 | +1.367 | remote read 仍很小 |
+| `FAP_SPLIT_OWNER_OUTPUT_WRITE` | - | 3.644 | +3.644 | output write 有成本但不是最大项 |
+| `FAP_COMPUTE_QK_MATMUL_BODY` | 12.101 | 11.532 | -0.570 | QK body 不是新增慢点 |
+| `FAP_COMPUTE_QKTV_MATMUL_PACK` | 2.041 | 4.241 | +2.200 | 局部 `PV` work shape 变差，但不是 9 us 全部 |
+
+判断：
+
+- 单 K chunk 下 owner-output/no-ack 仍慢，说明问题不是 ACK，也不是 real-`P`
+  remote read。
+- 慢点集中在“consumer 什么时候拿到 input”和“consumer `PV`/output 是否能藏进
+  producer 窗口”。当前实现仍然等 producer 基本完成后才让 consumer 做有用 work，
+  所以它只是把 work 迁到另一个 core，而没有形成有效流水。
+
+本轮结论：
+
+- direct compute signal 的 public dataflow API 路径已被证伪，并且代码已删除。
+- kt-stream packet 化本身不贵，但它没有改变 state-ready 到达时间；writer 等待只是
+  从 output wait 换成 state-ready wait。
+- owner-output/no-ack 在单 K chunk 下也没有赢，因为 consumer `PV`/output 没有和
+  producer QK/softmax 形成足够 overlap。
+- 下一步不应该继续扫 ACK、mailbox ring、或只扩大 owner-output 范围。真正要做的是
+  correctness-capable 的 consumer-owned online state：consumer 必须拥有某个 row
+  group 跨所有 K chunks 的 max/sum/partial `P@V` accumulation，并且 producer 要在
+  每个 `P_kt` 可用时更早交付，而不是等完整 row group/state 尾部。
+- 如果继续研究 direct signal，先做最小 TRISC NOC primitive 可用性实验；如果没有
+  compute-side primitive，就做 producer dataflow bridge，让 state-ready 的转发路径
+  独立于普通 writer output drain。
+
+结果文件：
+
+- `/wafer/gsh/tmp/fa_profile_20260601_direct_state_q128_k128_correctness.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k128_default_midrun_prof.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k128_kt_stream_prof.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k128_no_ack_prof.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k128_default_midrun_device.csv`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k128_kt_stream_device.csv`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k256_default_prof.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k256_no_ack_prof.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k256_default_device.csv`
+- `/wafer/gsh/tmp/fa_profile_20260601_q256_k256_no_ack_device.csv`
 
 ## 2026-05-29 实验记录
 
@@ -3772,8 +3972,185 @@ raw logs：
     实验；不要再把完整 `PV` matmul 塞进 QK phase。
 14. split owner-output 方向已经证明 ACK/backpressure 不是瓶颈：
     `split_pv_owner_output_no_ack_v1` 去掉 ACK 后，host avg 变好但 device critical
-    path 不降。下一步应做 direct compute-to-consumer state-ready：producer compute
-    在某个 row group softmax state ready 后直接唤醒 consumer，而不是等 writer
-    转发；随后做 consumer-owned online state 版本，让 consumer 跨 K chunk 维护
-    max/sum/partial output。先保持一个 row group 的 correctness-capable 路径，不再
-    重启 all-groups ownership 或 mailbox ring。
+    path 不降。2026-06-01 继续验证后，direct compute-to-consumer state-ready 的
+    public dataflow API 方案也被证伪：compute kernel 不能直接 include 当前
+    `api/dataflow/dataflow_api.h`。下一步不保留 direct schedule，而是二选一：
+    先找 TRISC 可用的更底层 NOC/LLK primitive；或者做 producer dataflow bridge，
+    让 state-ready 转发独立于普通 output writer drain。并行推进
+    consumer-owned online state：consumer 跨 K chunk 维护 max/sum/partial output，
+    producer 按 `P_kt` 更早交付，而不是等完整 row group/state 尾部。先保持一个
+    row group 的 correctness-capable 路径，不再重启 all-groups ownership 或 mailbox ring。
+
+## 2026-06-01 原语 micro-probe
+
+本轮问题：用户指出不能因为一次 direct signal 失败就判断底层不支持。因此把实验从
+FA 主 schedule 中拆出来，建立独立 `flash_attention_primitive_probe`，只测最小
+producer-consumer semaphore 链路。FA 主 kernel 不保留任何会 timeout 或 correctness
+不成立的 raw schedule。
+
+参考代码：
+
+- `tt_metal/programming_examples/NoC_tile_transfer/noc_tile_transfer.cpp`
+- `tt_metal/programming_examples/NoC_tile_transfer/kernels/dataflow/writer0.cpp`
+- `tt_metal/programming_examples/NoC_tile_transfer/kernels/dataflow/reader1.cpp`
+
+保留的可执行 probe：
+
+| primitive | producer | consumer | result | loops | elapsed ms | 结论 |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| `dataflow_sem_inc` | dataflow writer, `noc_semaphore_inc` | dataflow reader poll + DRAM result writeback | pass | 13 | 1.063 avg | NoC/dataflow semaphore 链路正常 |
+| `manual_mailbox_bridge` | compute 写 L1 mailbox；producer dataflow RV 轮询 mailbox 后 `noc_semaphore_inc` | dataflow reader poll + DRAM result writeback | pass | 18 | 1.863 avg | 控制同步链路可以不用 TT-Metal CB：TRISC 写 L1 token，dataflow RV 负责 NoC/semaphore 转发 |
+
+`manual_mailbox_bridge` 的关键修正是 mailbox L1 buffer 的 bank/core 对齐：
+producer core 不能写死为 `{0, 0}`，而要使用
+`mesh_device->allocator()->get_logical_core_from_bank_id(0)`。前面 timeout 的一个直接原因是
+L1 mailbox 地址和执行 core 不一定对应；bank 对齐后，compute 写出的
+`mailbox0=0xfa310001`、`mailbox1=1`、`mailbox2=0xfa310101` 能被 producer dataflow
+kernel 看到，bridge 写回 `mailbox4=0xfa310002`，remote consumer semaphore 也能被触发。
+
+三次重复结果：
+
+| primitive | elapsed ms run1 | run2 | run3 | avg | 关键观测 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `dataflow_sem_inc` | 1.051 | 0.993 | 1.146 | 1.063 | consumer poll loops 均为 13 |
+| `manual_mailbox_bridge` | 1.854 | 1.812 | 1.924 | 1.863 | consumer poll loops 均为 18，mailbox bridge poll loops 为 0 |
+
+这里的 elapsed 是独立 workload 的端到端 device section 时间，只能说明这个控制桥是稳定可运行的；
+它不是 FA 主 kernel 内部 token latency。后续进入 FA schedule 时，要看它是否能消掉
+phase boundary 或 writer drain 等待，而不是单独比较这个 micro-probe 的毫秒数。
+本 probe 的控制同步链路没有使用 CB；`consumer_poll.cpp` 里仍然用一个小 result CB
+把诊断结果写回 DRAM，这只服务于 host 检查，不参与 producer-consumer 控制协议。
+
+已尝试但不保留为可执行入口的 raw/compute probe：
+
+| probe | 结果 | 说明 |
+| --- | --- | --- |
+| compute include `api/dataflow/dataflow_api.h` | JIT compile/link 失败 | public dataflow API 不能直接搬到 compute kernel 使用 |
+| compute `sem_l1_base` 本地写 semaphore | JIT link 失败，`sem_l1_base` unresolved | 这个 include/符号组合不可作为 TRISC 本地 semaphore 基础 |
+| compute mailbox helper 本地写 semaphore | 30s timeout，无 result writeback | 当前写法不能证明 TRISC 本地 semaphore store 可用 |
+| compute raw atomic, dynamic cmd buffer 1 | 20s timeout，无 result writeback | 当前 `noc_fast_atomic_increment<DM_DYNAMIC_NOC>` 组合不成立 |
+| compute raw atomic, dynamic cmd buffer 3 | 15s timeout，无 result writeback | 换 cmd buffer 仍不成立 |
+| compute raw inline write, dynamic cmd buffer 0 | 15s timeout，无 result writeback | 当前 `noc_fast_write_dw_inline` 组合不成立 |
+| compute raw inline write, dynamic cmd buffer 2 | 15s timeout，无 result writeback | 换 cmd buffer 仍不成立 |
+
+解释要严格限定：这些结果说明“当前 probe 写法 / cmd buffer 组合 / 同步拓扑不成立”，
+不能推出硬件不支持 TRISC 侧更底层信号。相反，dataflow probe 证明
+`NoC_tile_transfer` 风格的 semaphore 链路稳定可用；`manual_mailbox_bridge`
+进一步证明“TRISC 本地写 L1 token + dataflow RV 发 NoC/semaphore”这条控制桥可行。
+如果下一步要继续推进 split compute，短期应优先走这个 mailbox bridge，而不是把未经验证的
+raw TRISC NoC 写入 FA 主路径。
+
+后续实验：
+
+1. `state_ready_mailbox_bridge_v1` 已经进入 FA 主 schedule，结果见下一节。
+2. 做 online state consumer：consumer 不等完整 row group `P`，而是按
+   `P_kt`/softmax-state packet 维护 max、sum、partial output，验证能否把
+   `PV` 消化进 producer 后续 QK 窗口。
+3. 若继续 raw TRISC primitive，只放在独立 micro-probe 中，先找到一个不会 timeout、
+   会把结果写回 DRAM 的最小成功样例，再讨论是否进入 FA schedule。
+
+raw logs：
+
+- `/wafer/gsh/tmp/fa_primitive_20260601_dataflow_sem_inc_bankfix.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_dataflow_sem_inc_bankfix_3x.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_manual_mailbox_bridge_bankfix.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_manual_mailbox_bridge_bankfix_3x.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_dataflow_sem_inc_final.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_compute_local_sem_store.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_compute_local_sem_store_v2.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_compute_local_sem_store_v3.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_raw_atomic_cmd1.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_raw_atomic_cmd3.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_raw_inline_cmd0.log`
+- `/wafer/gsh/tmp/fa_primitive_20260601_raw_inline_cmd2.log`
+
+## 2026-06-01 FA 内 state-ready mailbox bridge 实验
+
+本轮问题：既然独立 `manual_mailbox_bridge` 已经证明“TRISC 写 L1 token，
+dataflow RV 发 NoC/semaphore”可行，就把这条控制桥接进 FA 主 schedule，验证它能否替代
+state-ready CB token，并观察是否减少 writer/output 等待。
+
+实现边界：
+
+- 新增 `split_state_ready_mailbox_bridge_v1`，编号 26。
+- host 为 producer core0 分配 32B per-core L1 mailbox，并把 L1 address 作为 compile-time
+  arg 传给 compute 和 writer。
+- compute 只在 `TRISC_PACK` 路径写 mailbox，避免三个 TRISC 重复写同一个 sequence
+  counter。之前未加限制时 device zone 显示 store count=3，已修正为 count=1。
+- writer/dataflow RV 轮询 mailbox sequence，看到 state-ready 后用现有
+  `noc_semaphore_inc` 链路通知 consumer。
+- 这条路径只传 state-ready token，不传 `P/V/sum` tile 数据；producer 仍执行原始
+  `PV`/normalize/output 路径，所以它不是 FA3-style online consumer。
+- 该 schedule 需要 `TT_METAL_ALLOCATOR_MODE_HYBRID=1`。不设置时启动会在 host 分配阶段
+  失败：`Per-core allocation requires AllocatorMode::HYBRID when opening the device`。
+- 曾尝试把 `c_15` 当作 raw L1 地址复用，但 compute kernel 没有可用的
+  `get_write_ptr(c_15)`，JIT 直接失败；因此没有保留这条兼容路径。
+
+Correctness：
+
+| shape | baseline | candidate | max abs diff | mean abs diff | 结论 |
+| --- | --- | --- | ---: | ---: | --- |
+| 2K full q256/k128 | TTNN SDPA baseline | `split_state_ready_mailbox_bridge_v1` | 0 | 0 | pass |
+
+host no-profiler 对比，均为 `TT_METAL_ALLOCATOR_MODE_HYBRID=1`、
+`prepared_no_q_copy`、`warmup=2`、`iters=5`，单位 ms：
+
+| shape | default avg | mailbox avg | default sync | mailbox sync | 结论 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| smoke, prepared | 0.121 | 0.122 | 0.078 | 0.079 | 噪声级持平 |
+| 2K full q128/k128 | 0.179 | 0.200 | 0.159 | 0.159 | sync 持平，host call 侧更慢 |
+| 2K full q256/k128 | 0.272 | 0.278 | 0.249 | 0.248 | sync 噪声级持平 |
+| 2K full q256/k256 | 0.221 | 0.222 | 0.201 | 0.202 | 持平 |
+| 16K chunked q256/k128 | 0.273 | 0.278 | 0.251 | 0.251 | 持平或略慢 |
+
+q256/k128 device profiler 关键 zone，单位 us：
+
+| zone | default critical | mailbox critical | 观察 |
+| --- | ---: | ---: | --- |
+| `FAP_COMPUTE` | 246.262 | 246.041 | compute critical 不变 |
+| `FAP_WRITER` | 247.239 | 247.006 | writer critical 不变 |
+| `FAP_WRITER_WAIT_OUTPUT` | 236.164 | 235.983 | final output 等待没有下降 |
+| `FAP_READER` | 215.501 | 215.406 | reader 不受影响 |
+| `FAP_COMPUTE_QK_PHASE` | 18.057 | 17.959 | QK phase 不受影响 |
+| `FAP_COMPUTE_QKV_PHASE` | 3.537 | 3.602 | `QKT@V` phase 不受影响 |
+| `FAP_SPLIT_STATE_READY_MAILBOX_STORE` | n/a | 0.036 | TRISC_PACK 本地写 token 很小 |
+| `FAP_SPLIT_STATE_READY_MAILBOX_WAIT` | n/a | 28.959 | writer 在等 compute 到达 state-ready |
+| `FAP_SPLIT_SIGNAL_STATE_READY_SEND` | n/a | 0.164 | dataflow semaphore 发送很小 |
+| `FAP_SPLIT_SIGNAL_OUTPUT_WAIT` | n/a | 31.661 | consumer 等 state-ready 的窗口约 32 us |
+
+结论：
+
+- mailbox bridge 本身可用，并且控制路径没有使用 TT-Metal CB；CB 只保留在正常
+  output/data tile 路径上。
+- 但这一步没有把 `P/V/sum` 数据交给 consumer，也没有让 producer 少做任何
+  `PV`/normalize/output，所以 `FAP_WRITER_WAIT_OUTPUT` 和 compute/writer critical path
+  基本不变。
+- mailbox wait 的 28-32 us 不是新的底层 NoC 成本，而是 writer/consumer 在等 producer
+  compute 到达 state-ready 的时间。也就是说，控制桥已经足够轻，真正问题仍然是
+  compute 产出节奏和 state/data ownership。
+- 因此 `split_state_ready_mailbox_bridge_v1` 只作为后续 split consumer 的同步基础设施，
+  不升级为 current fastest。
+
+下一步：
+
+1. 把 mailbox 从单个 state-ready token 扩展为 `P_kt`/softmax-state packet ready，
+   但 consumer 必须真正维护 max/sum/partial output，并最终写回 output。
+2. 重新划分 producer/consumer core：producer 继续做下一段 QK，consumer 接管上一段
+   online `PV`/normalize，验证是否能减少 producer `PV` 尾部而不是只多发一个 token。
+3. raw TRISC NoC/TTI 方向继续留在 `flash_attention_primitive_probe` 中验证；只有当
+   最小 probe 能稳定写回 DRAM，再考虑接入 FA 主路径。
+
+raw logs：
+
+- `/wafer/gsh/tmp/fa_profile_20260601_mailbox_bridge_default_allocator_expected_fail.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_split_default_hybrid_2k_q128_k128_5x_rerun.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_mailbox_bridge_packonly_hybrid_2k_q128_k128_5x_rerun.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_split_default_hybrid_2k_q256_k128_5x_rerun.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_mailbox_bridge_packonly_hybrid_2k_q256_k128_5x.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_split_default_hybrid_2k_q256_k256_5x.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_mailbox_bridge_packonly_hybrid_2k_q256_k256_5x.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_split_default_hybrid_16k_chunked_q256_k128_5x.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_mailbox_bridge_packonly_hybrid_16k_chunked_q256_k128_5x.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_split_default_hybrid_2k_q256_k128_profile.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_mailbox_bridge_packonly_hybrid_2k_q256_k128_profile.log`
+- `/wafer/gsh/tmp/fa_profile_20260601_mailbox_bridge_packonly_hybrid_2k_q256_k128_correctness.log`

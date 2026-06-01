@@ -919,7 +919,8 @@ static void sdpa_inner_loop_step(
     const uint32_t causal_k_start_tile = 0,
     const uint32_t neginf_idx = 0,
     const uint32_t causal_diag_idx = 0,
-    const bool split_pv_owner_output_this_q = false) {
+    const bool split_pv_owner_output_this_q = false,
+    const uint32_t split_state_mailbox_l1_addr = 0) {
     // Callers guarantee active_Sk is evenly divisible by actual_sbw (via largest_factor_le).
     const uint32_t kt_num_full_subblocks = active_Sk / actual_sbw;
     constexpr uint32_t dst_size = compute_kernel_lib::DEST_AUTO_LIMIT;
@@ -953,6 +954,7 @@ static void sdpa_inner_loop_step(
     constexpr bool fa3_pv_softmax_schedule = compute_pipeline_schedule == 4;
     constexpr bool split_state_real_p_kt_stream = compute_pipeline_schedule == 20;
     constexpr bool split_state_mailbox_ring = compute_pipeline_schedule == 22;
+    constexpr bool split_state_ready_mailbox_bridge = compute_pipeline_schedule == 26;
     constexpr bool split_state_real_p_packet_stream = split_state_real_p_kt_stream || split_state_mailbox_ring;
     constexpr bool split_pv_owner_probe = compute_pipeline_schedule == 21;
     constexpr bool split_pv_owner_output = compute_pipeline_schedule == 23 || compute_pipeline_schedule == 25;
@@ -964,7 +966,7 @@ static void sdpa_inner_loop_step(
     constexpr bool split_state_ready_signal =
         compute_pipeline_schedule == 12 || compute_pipeline_schedule == 13 || compute_pipeline_schedule == 14 ||
         compute_pipeline_schedule == 15 || compute_pipeline_schedule == 16 || compute_pipeline_schedule == 17 ||
-        split_state_real_p_handoff;
+        split_state_real_p_handoff || split_state_ready_mailbox_bridge;
     constexpr bool split_state_token_ready_signal = split_state_ready_signal && !split_state_real_p_handoff;
     constexpr uint32_t cb_split_state_ready = 15;
     constexpr bool qktv_body_detail_profile =
@@ -1436,9 +1438,23 @@ static void sdpa_inner_loop_step(
     }
     if constexpr (split_state_token_ready_signal) {
         if (is_last_iter) {
-            DeviceZoneScopedN("FAP_SPLIT_STATE_READY_PUSH");
-            cb_reserve_back(cb_split_state_ready, 1);
-            cb_push_back(cb_split_state_ready, 1);
+            if constexpr (split_state_ready_mailbox_bridge) {
+#if defined(TRISC_PACK)
+                if (split_state_mailbox_l1_addr != 0) {
+                    DeviceZoneScopedN("FAP_SPLIT_STATE_READY_MAILBOX_STORE");
+                    auto* split_state_mailbox =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(split_state_mailbox_l1_addr);
+                    split_state_mailbox[0] = 0xfa320001u;
+                    split_state_mailbox[2] = 0xfa320101u;
+                    asm volatile("fence" ::: "memory");
+                    split_state_mailbox[1] = split_state_mailbox[1] + 1;
+                }
+#endif
+            } else {
+                DeviceZoneScopedN("FAP_SPLIT_STATE_READY_PUSH");
+                cb_reserve_back(cb_split_state_ready, 1);
+                cb_push_back(cb_split_state_ready, 1);
+            }
         }
     }
 
@@ -1960,7 +1976,8 @@ void sdpa_standard_v2(
     const LightweightMaskContext& lw_mask = {},
     const uint32_t q_num_chunks = 0,
     const bool use_zigzag_balancing = false,
-    const bool split_pv_owner_output_for_this_head = false) {
+    const bool split_pv_owner_output_for_this_head = false,
+    const uint32_t split_state_mailbox_l1_addr = 0) {
     // use_padded_mask + is_causal_sdpa is handled at the host level (mutually exclusive).
     static_assert(
         !(use_padded_mask && is_causal_sdpa), "use_padded_mask and is_causal_sdpa are mutually exclusive in v2");
@@ -2078,7 +2095,8 @@ void sdpa_standard_v2(
                 k_start_tile,
                 lw_mask.neginf_tile_idx,
                 lw_mask.causal_diag_tile_idx,
-                split_pv_owner_output_for_this_q);
+                split_pv_owner_output_for_this_q,
+                split_state_mailbox_l1_addr);
         };
 
         for (uint32_t k_chunk = 0; k_chunk < k_loop_end; k_chunk++) {

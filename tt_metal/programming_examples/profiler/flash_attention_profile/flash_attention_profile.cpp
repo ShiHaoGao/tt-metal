@@ -938,6 +938,9 @@ std::optional<uint32_t> parse_compute_pipeline_schedule(std::string_view value) 
     if (value == "split_pv_owner_output_no_ack_v1" || value == "25") {
         return 25;
     }
+    if (value == "split_state_ready_mailbox_bridge_v1" || value == "26") {
+        return 26;
+    }
     return std::nullopt;
 }
 
@@ -968,6 +971,7 @@ std::string compute_pipeline_schedule_label(uint32_t schedule) {
         case 22: return "split_state_mailbox_ring_v1";
         case 23: return "split_pv_owner_output_v1";
         case 25: return "split_pv_owner_output_no_ack_v1";
+        case 26: return "split_state_ready_mailbox_bridge_v1";
         default: return fmt::format("unknown_{}", schedule);
     }
 }
@@ -1132,7 +1136,7 @@ Options parse_options(int argc, char** argv) {
             auto schedule = parse_compute_pipeline_schedule(require_value(arg));
             if (!schedule.has_value()) {
                 TT_THROW(
-                    "--compute-pipeline-schedule expects default, partial_handoff_v1, qktv_drain_all_then_matmul, group0_early_push_v1, fa3_pv_softmax_v1, llk_drain_exp_before_pv_v1, llk_prev_exp_after_pv_v1, llk_salad_before_pv_v1, llk_v_ready_prefetch_v1, split_signal_only_v1, split_output_stream_signal_v1, split_l1_ready_signal_v1, split_state_ready_signal_v1, split_state_consumer_probe_v1, split_state_consumer_probe_x4_v1, split_state_consumer_probe_x8_v1, split_state_consumer_vprefetch_x8_v1, split_state_consumer_vafter_state_x8_v1, split_state_real_p_vprefetch_x8_v1, split_state_real_p_vafter_state_x8_v1, split_state_real_p_kt_stream_v1, split_pv_owner_probe_v1, split_state_mailbox_ring_v1, split_pv_owner_output_v1, or split_pv_owner_output_no_ack_v1");
+                    "--compute-pipeline-schedule expects default, partial_handoff_v1, qktv_drain_all_then_matmul, group0_early_push_v1, fa3_pv_softmax_v1, llk_drain_exp_before_pv_v1, llk_prev_exp_after_pv_v1, llk_salad_before_pv_v1, llk_v_ready_prefetch_v1, split_signal_only_v1, split_output_stream_signal_v1, split_l1_ready_signal_v1, split_state_ready_signal_v1, split_state_consumer_probe_v1, split_state_consumer_probe_x4_v1, split_state_consumer_probe_x8_v1, split_state_consumer_vprefetch_x8_v1, split_state_consumer_vafter_state_x8_v1, split_state_real_p_vprefetch_x8_v1, split_state_real_p_vafter_state_x8_v1, split_state_real_p_kt_stream_v1, split_pv_owner_probe_v1, split_state_mailbox_ring_v1, split_pv_owner_output_v1, split_pv_owner_output_no_ack_v1, or split_state_ready_mailbox_bridge_v1");
             }
             options.copied_kernel_options.compute_pipeline_schedule = *schedule;
         } else if (arg == "--preset") {
@@ -1213,7 +1217,7 @@ Options parse_options(int argc, char** argv) {
                 "[--device-profiler-by-risc] "
                 "[--q-reader-schedule default|first_before_k|first_during_k_read] "
                 "[--qk-first-body-warmup none|tiny_matmul|same_config_init] "
-                "[--compute-pipeline-schedule default|partial_handoff_v1|qktv_drain_all_then_matmul|group0_early_push_v1|fa3_pv_softmax_v1|llk_drain_exp_before_pv_v1|llk_prev_exp_after_pv_v1|llk_salad_before_pv_v1|llk_v_ready_prefetch_v1|split_signal_only_v1|split_output_stream_signal_v1|split_l1_ready_signal_v1|split_state_ready_signal_v1|split_state_consumer_probe_v1|split_state_consumer_probe_x4_v1|split_state_consumer_probe_x8_v1|split_state_consumer_vprefetch_x8_v1|split_state_consumer_vafter_state_x8_v1|split_state_real_p_vprefetch_x8_v1|split_state_real_p_vafter_state_x8_v1|split_state_real_p_kt_stream_v1|split_pv_owner_probe_v1|split_state_mailbox_ring_v1|split_pv_owner_output_v1|split_pv_owner_output_no_ack_v1] "
+                "[--compute-pipeline-schedule default|partial_handoff_v1|qktv_drain_all_then_matmul|group0_early_push_v1|fa3_pv_softmax_v1|llk_drain_exp_before_pv_v1|llk_prev_exp_after_pv_v1|llk_salad_before_pv_v1|llk_v_ready_prefetch_v1|split_signal_only_v1|split_output_stream_signal_v1|split_l1_ready_signal_v1|split_state_ready_signal_v1|split_state_consumer_probe_v1|split_state_consumer_probe_x4_v1|split_state_consumer_probe_x8_v1|split_state_consumer_vprefetch_x8_v1|split_state_consumer_vafter_state_x8_v1|split_state_real_p_vprefetch_x8_v1|split_state_real_p_vafter_state_x8_v1|split_state_real_p_kt_stream_v1|split_pv_owner_probe_v1|split_state_mailbox_ring_v1|split_pv_owner_output_v1|split_pv_owner_output_no_ack_v1|split_state_ready_mailbox_bridge_v1] "
                 "[--grid X,Y] [--warmup N] [--iters N] [--device-id N] "
                 "[--high-precision] [--check-correctness] [--no-device-profiler-read]\n");
             std::exit(0);
