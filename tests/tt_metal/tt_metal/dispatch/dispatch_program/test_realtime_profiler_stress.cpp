@@ -77,7 +77,7 @@ constexpr uint32_t kNumProgramsInTrace = 4096;
 constexpr size_t kTraceRegionSize = 64 * 1024 * 1024;
 
 // Programs in the trace use this runtime_id so every record we receive can
-// be attributed to this test (records with program_id == 0 are reserved for
+// be attributed to this test (records with runtime_id == 0 are reserved for
 // infrastructure traffic and dropped host-side).
 constexpr uint32_t kStressRuntimeId = 0xBEEFu;
 
@@ -147,9 +147,6 @@ distributed::MeshWorkload build_blank_kernel_workload(const std::shared_ptr<dist
 }
 
 TEST(RealtimeProfilerStress, RingBufferOverflowFromTrace) {
-    // Skipped due to issue #44657: real-time profiler is disabled by default
-    // (TT_METAL_ENABLE_REALTIME_PROFILER kill switch).
-    GTEST_SKIP() << "Real-time profiler disabled by default — see issue #44657";
     constexpr int kDeviceId = 0;
 
     auto mesh_device = distributed::MeshDevice::create_unit_mesh(
@@ -225,7 +222,7 @@ TEST(RealtimeProfilerStress, RingBufferOverflowFromTrace) {
     // hooked up.
     uint32_t stress_records = 0;
     for (const auto& rec : collected) {
-        if (rec.program_id == kStressRuntimeId) {
+        if (rec.runtime_id == kStressRuntimeId) {
             ++stress_records;
         }
     }
@@ -259,7 +256,7 @@ TEST(RealtimeProfilerStress, RingBufferOverflowFromTrace) {
     uint32_t implausible_duration = 0;
     int64_t worst_negative_delta = 0;
     for (const auto& rec : collected) {
-        if (rec.program_id != kStressRuntimeId) {
+        if (rec.runtime_id != kStressRuntimeId) {
             continue;
         }
         if (rec.end_timestamp < rec.start_timestamp) {

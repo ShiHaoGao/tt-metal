@@ -10,8 +10,9 @@ import torch
 import ttnn
 
 
-from models.common.utility_functions import pad_by_zero, torch2tt_tensor, run_for_blackhole
+from models.common.utility_functions import torch2tt_tensor, run_for_blackhole
 from tests.ttnn.utils_for_testing import assert_numeric_metrics
+from tests.ttnn.nightly.unit_tests.operations.fused.utility_functions import ttnn_layer_norm, ttnn_rms_norm
 
 TEST_PADDING_VALUE = -42
 
@@ -50,8 +51,8 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
             gamma = torch.rand(test_shape[3]) * 2 - 1
             beta = torch.rand(test_shape[3]) * 2.0 - 1.1
 
-        gamma_t = pad_by_zero(gamma, device, in0_mem_config, gamma_dtype)[0]
-        beta_t = pad_by_zero(beta, device, in0_mem_config, gamma_dtype)[0]
+        gamma_t = torch2tt_tensor(gamma, device, tt_memory_config=in0_mem_config, tt_dtype=gamma_dtype)
+        beta_t = torch2tt_tensor(beta, device, tt_memory_config=in0_mem_config, tt_dtype=gamma_dtype)
 
         compute_kernel_config = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -61,7 +62,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
         )
 
         if test_id == 0:
-            ttz = ttnn.layer_norm(
+            ttz = ttnn_layer_norm(
                 in0_t,
                 residual_input_tensor=in1_t,
                 epsilon=epsf,
@@ -69,7 +70,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 1:
-            ttz = ttnn.layer_norm(
+            ttz = ttnn_layer_norm(
                 in0_t,
                 residual_input_tensor=in1_t,
                 epsilon=epsf,
@@ -78,7 +79,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 2:
-            ttz = ttnn.layer_norm(
+            ttz = ttnn_layer_norm(
                 in0_t,
                 residual_input_tensor=in1_t,
                 epsilon=epsf,
@@ -88,7 +89,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 3:
-            ttz = ttnn.rms_norm(
+            ttz = ttnn_rms_norm(
                 in0_t,
                 residual_input_tensor=in1_t,
                 epsilon=epsf,
@@ -96,7 +97,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 4:
-            ttz = ttnn.rms_norm(
+            ttz = ttnn_rms_norm(
                 in0_t,
                 residual_input_tensor=in1_t,
                 epsilon=epsf,
@@ -105,7 +106,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 5:
-            ttz = ttnn.rms_norm(
+            ttz = ttnn_rms_norm(
                 in0_t,
                 residual_input_tensor=in1_t,
                 epsilon=epsf,
@@ -115,11 +116,11 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 6:
-            ttz = ttnn.layer_norm(
+            ttz = ttnn_layer_norm(
                 in0_t, epsilon=epsf, memory_config=out_mem_config, compute_kernel_config=compute_kernel_config
             )
         if test_id == 7:
-            ttz = ttnn.layer_norm(
+            ttz = ttnn_layer_norm(
                 in0_t,
                 epsilon=epsf,
                 weight=gamma_t,
@@ -127,7 +128,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 8:
-            ttz = ttnn.layer_norm(
+            ttz = ttnn_layer_norm(
                 in0_t,
                 epsilon=epsf,
                 weight=gamma_t,
@@ -136,11 +137,11 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 9:
-            ttz = ttnn.rms_norm(
+            ttz = ttnn_rms_norm(
                 in0_t, epsilon=epsf, memory_config=out_mem_config, compute_kernel_config=compute_kernel_config
             )
         if test_id == 10:
-            ttz = ttnn.rms_norm(
+            ttz = ttnn_rms_norm(
                 in0_t,
                 epsilon=epsf,
                 weight=gamma_t,
@@ -148,7 +149,7 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
         if test_id == 11:
-            ttz = ttnn.rms_norm(
+            ttz = ttnn_rms_norm(
                 in0_t,
                 epsilon=epsf,
                 weight=gamma_t,
@@ -157,6 +158,12 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
                 compute_kernel_config=compute_kernel_config,
             )
 
+        # BFLOAT8_B tensors are TILE-only (shared exponent in 16-elem sub-blocks
+        # is undefined under ROW_MAJOR). Round-trip via BFLOAT16 for host inspection.
+        # Pre-PR #42770, fill_implicit_tile_padding leaked BFLOAT16 on rank-4 BFP8
+        # inputs, silently upcasting in0_t and producing BFLOAT16 layer_norm output.
+        if ttz.dtype == ttnn.bfloat8_b:
+            ttz = ttnn.typecast(ttz, ttnn.bfloat16)
         tt_got_back = ttz.cpu().to(ttnn.ROW_MAJOR_LAYOUT).to_torch()
 
         pt_in = in0 + in1 if test_id <= 5 else in0
@@ -167,13 +174,24 @@ def run_layernorm_mix_precision_tests(test_id, in_dtype, gamma_dtype, in0_mem_co
 
         ref_lnorm = ref_fn(pt_in, gamma.flatten(), beta.flatten(), epsf)
 
+        # BFLOAT8_B layer_norm uses a shared exponent per 16-element sub-block, so its
+        # accuracy on small inner dims (e.g. width=42 padded to tile=64, ~1k elements)
+        # is fundamentally lower than BFLOAT16/FLOAT32. Worst observed across the 12
+        # (test_id, shape) cases: ATOL=0.86, relFro=0.186, PCC=0.984. Pre-PR #42770
+        # these never triggered because the fill_implicit_tile_padding dtype leak
+        # silently ran the norm in BFLOAT16.
+        if in_dtype == ttnn.bfloat8_b:
+            pcc_threshold, atol, frobenius_threshold = 0.98, 1.0, 0.22
+        else:
+            pcc_threshold, atol, frobenius_threshold = 0.999, 0.098, 0.016
+
         assert_numeric_metrics(
             ref_lnorm,
             tt_got_back,
-            pcc_threshold=0.999,
+            pcc_threshold=pcc_threshold,
             rtol=3.266,
-            atol=0.098,
-            frobenius_threshold=0.016,
+            atol=atol,
+            frobenius_threshold=frobenius_threshold,
         )
 
 
@@ -287,7 +305,7 @@ def test_layer_norm_block_sharded_height_pad(device, grid_end, shard_orientation
         fp32_dest_acc_en=True,
     )
 
-    out = ttnn.layer_norm(
+    out = ttnn_layer_norm(
         x,
         weight=weight,
         bias=bias,
@@ -332,7 +350,7 @@ def test_layer_norm_4D_llama(device, h, w, num_chunks):
     weight = ttnn.from_torch(torch_weight, layout=ttnn.TILE_LAYOUT, device=device)
     bias = ttnn.from_torch(torch_bias, layout=ttnn.TILE_LAYOUT, device=device)
 
-    output_tensor = ttnn.layer_norm(input_tensor, weight=weight, bias=bias)
+    output_tensor = ttnn_layer_norm(input_tensor, weight=weight, bias=bias)
     output_tensor = ttnn.to_layout(output_tensor, ttnn.ROW_MAJOR_LAYOUT)
     output_tensor = ttnn.from_device(output_tensor)
     output_tensor = ttnn.to_torch(output_tensor)

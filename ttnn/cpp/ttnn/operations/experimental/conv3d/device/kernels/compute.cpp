@@ -6,9 +6,9 @@
 #include <algorithm>
 #include <tt-metalium/constants.hpp>
 
-#include "api/compute/untilize.h"
 #include "api/compute/tilize.h"
 #include "api/compute/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/bcast.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/tile_move_copy.h"
@@ -35,7 +35,7 @@ void matmul_blocks(
     // precondition: in1_cb has K*N produced
     // postcondition: in0_cb is full, in1_cb is empty
     // postcondition: out_cb has M*N produced
-    mm_block_init_short(
+    matmul_block_init(
         in0_cb, in1_cb, transpose /*transpose*/, subblock_w /*ct_dim*/, subblock_h /*rt_dim*/, in0_block_w /*kt_dim*/);
 
     uint32_t output_num_tiles = M * N;
@@ -146,7 +146,8 @@ void untilize_block() {
         out_cb,
         compute_kernel_lib::untilize_config::InitUninitMode::InitAndUninit,
         compute_kernel_lib::untilize_config::WaitMode::WaitUpfront,
-        untilize_reconfig_mode>(rows);
+        untilize_reconfig_mode,
+        compute_kernel_lib::untilize_config::RemapMode::AssumeConfigured>(rows);
 }
 
 template <
@@ -242,7 +243,9 @@ void kernel_main() {
     constexpr uint32_t batch_tiles = subblock_h * matmul_K_t;
     constexpr uint32_t subblock_tiles = subblock_h * matmul_N_t;
 
-    mm_init(cb_vol2col_tiled, cb_weight_tiled, cb_matmul_interm_tiled);
+    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_vol2col_tiled, cb_weight_tiled, cb_matmul_interm_tiled);
+    matmul_init(cb_vol2col_tiled, cb_weight_tiled);
+    MATH((llk_math_reconfig_remap(true)));
 
     // Load range parameters
     uint32_t argidx = 0;
@@ -299,7 +302,10 @@ void kernel_main() {
                                             compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
                                             compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
                                             compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::
-                                                NoReconfigure>(1, patches_this_row);
+                                                NoReconfigure,
+                                            compute_kernel_lib::tilize_config::Fp32Mode::Fast,
+                                            compute_kernel_lib::tilize_config::RemapMode::AssumeConfigured>(
+                                            1, patches_this_row);
                                         patches_left -= patches_this_row;
                                     }
 
@@ -354,7 +360,9 @@ void kernel_main() {
                                             cb_matmul_result_rm,
                                             compute_kernel_lib::untilize_config::InitUninitMode::InitAndUninit,
                                             compute_kernel_lib::untilize_config::WaitMode::WaitUpfront,
-                                            untilize_reconfig_mode_sb>(subblock_h);
+                                            untilize_reconfig_mode_sb,
+                                            compute_kernel_lib::untilize_config::RemapMode::AssumeConfigured>(
+                                            subblock_h);
                                     }
                                 }
                             }
