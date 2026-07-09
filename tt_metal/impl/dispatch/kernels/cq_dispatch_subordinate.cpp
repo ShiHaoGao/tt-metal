@@ -334,6 +334,9 @@ void process_go_signal_mcast_cmd() {
         invalidate_l1_cache();
         // Update dispatch_d with the latest num_workers
         update_worker_completion_count_on_dispatch_d();
+#if DEVICE_PRINT_DISPATCH_ENABLED
+        device_print_dispatcher.execute();
+#endif
     }
     mcasts_sent++;  // Go signal sent -> update counter
 
@@ -415,7 +418,8 @@ void process_go_signal_mcast_cmd() {
 
     if (telemetry_enabled) {
         static uint32_t local_launch_seq_counter = 0;
-        const uint32_t stream_index = cmd->mcast.wait_stream - first_stream_used;
+        const uint32_t stream_index = wait_stream - first_stream_used;
+        ASSERT(stream_index < max_num_worker_sems);
         auto dispatch_telemetry =
             reinterpret_cast<volatile tt_l1_ptr tt::tt_metal::DispatchCoreTelemetry*>(dispatch_telemetry_base);
 
@@ -589,10 +593,11 @@ void kernel_main() {
         volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
         DeviceTimestampedData("process_cmd_d_dispatch_subordinate", (uint32_t)cmd->base.cmd_id);
         if (rt_profiler_enabled) {
-            uint32_t buffer_id = (cmd->base.cmd_id == CQ_DISPATCH_CMD_SEND_GO_SIGNAL)
-                                     ? popped_pid
-                                     : static_cast<uint32_t>(REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID);
-            write_buffer_id(rt_profiler_msg, buffer_id);
+            const bool is_profiled_cmd = cmd->base.cmd_id == CQ_DISPATCH_CMD_SEND_GO_SIGNAL ||
+                                         cmd->base.cmd_id == CQ_DISPATCH_CMD_RT_PROFILER_FLUSH;
+            write_buffer_id(
+                rt_profiler_msg,
+                is_profiled_cmd ? popped_pid : static_cast<uint32_t>(REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID));
         }
         switch (cmd->base.cmd_id) {
             case CQ_DISPATCH_CMD_SEND_GO_SIGNAL: process_go_signal_mcast_cmd(); break;
@@ -606,6 +611,10 @@ void kernel_main() {
                     dispatch_telemetry_base);
                 break;
             case CQ_DISPATCH_CMD_WAIT: process_dispatch_s_wait_cmd(); break;
+            case CQ_DISPATCH_CMD_RT_PROFILER_FLUSH:
+                wait_for_workers(cmd->rt_profiler_flush.wait_count, cmd->rt_profiler_flush.wait_stream);
+                cmd_ptr += sizeof(CQDispatchCmd);
+                break;
             case CQ_DISPATCH_CMD_TERMINATE:
                 if (rt_profiler_enabled) {
                     signal_realtime_profiler_and_switch(rt_profiler_msg);
