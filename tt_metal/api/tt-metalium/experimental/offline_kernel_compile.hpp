@@ -33,6 +33,15 @@ namespace tt::tt_metal::experimental {
  *       API (work in progress).
  */
 struct OfflineKernelCompileParams {
+    struct ExplicitEnvironment {
+        /// Installed TT-Metal root containing tt_metal/core_descriptors and
+        /// the device support files used by JIT generation.
+        std::filesystem::path root_dir;
+        /// Invocation-owned build/cache directory.  It is never taken from
+        /// TT_METAL_CACHE or another process-global setting.
+        std::filesystem::path cache_dir;
+    };
+
     /**
      * Compile-time configuration for one circular buffer index.
      *
@@ -48,8 +57,17 @@ struct OfflineKernelCompileParams {
     /// Compile for every product/device configuration supported by this API.
     struct AllSupportedProducts {};
 
+    /// Compile only the explicitly named offline product descriptors.  The
+    /// descriptor files are SDK-owned inputs under ExplicitEnvironment::root_dir;
+    /// no product enumeration or ambient target discovery occurs.
+    struct ExplicitProduct {
+        ARCH arch = ARCH::Invalid;
+        std::string core_descriptor;
+        std::string soc_descriptor;
+    };
+
     /// Offline compile target-selection mode.
-    using Mode = std::variant<AllSupportedProducts>;
+    using Mode = std::variant<AllSupportedProducts, ExplicitProduct>;
 
     /// Target-selection mode. Default: all supported products.
     Mode mode = AllSupportedProducts{};
@@ -58,6 +76,10 @@ struct OfflineKernelCompileParams {
     std::filesystem::path output_dir;
     /// Per-CB compile configuration used to populate compile metadata.
     std::vector<CBCompileConfig> cb_compile_configs;
+    /// Optional explicit environment for hermetic compiler invocations.  A
+    /// production caller must provide it; an omitted value retains the
+    /// legacy all-products API behavior for existing TT-Metal tests/tools.
+    std::optional<ExplicitEnvironment> environment;
 };
 
 /**

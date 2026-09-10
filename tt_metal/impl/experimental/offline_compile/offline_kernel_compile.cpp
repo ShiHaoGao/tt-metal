@@ -54,6 +54,20 @@ void validate_output_dir(const std::filesystem::path& output_dir) {
     }
 }
 
+void validate_environment(
+    const std::optional<OfflineKernelCompileParams::ExplicitEnvironment>& environment) {
+    if (!environment)
+        return;
+    if (environment->root_dir.empty() || !std::filesystem::is_directory(environment->root_dir)) {
+        throw std::invalid_argument(
+            "OfflineKernelCompileParams::environment.root_dir must name an existing directory");
+    }
+    if (environment->cache_dir.empty()) {
+        throw std::invalid_argument(
+            "OfflineKernelCompileParams::environment.cache_dir must be non-empty");
+    }
+}
+
 void validate_cb_compile_configs(const std::vector<CBCompileConfig>& cb_compile_configs) {
     std::unordered_set<uint8_t> seen_cb_indices;
     for (const auto& config : cb_compile_configs) {
@@ -204,17 +218,16 @@ void CompileKernelOffline(
     std::visit([](const auto& cfg) { validate_kernel_config_defines(cfg.defines); }, config);
     validate_cb_compile_configs(params.cb_compile_configs);
     validate_output_dir(params.output_dir);
+    validate_environment(params.environment);
 
     // Mode is presently a single-alternative variant (AllSupportedProducts). std::visit + the
     // static_assert below let future alternatives be added without silently bypassing this body.
     std::visit(
         [&](const auto& mode) {
             using ModeT = std::decay_t<decltype(mode)>;
-            static_assert(
-                std::is_same_v<ModeT, OfflineKernelCompileParams::AllSupportedProducts>,
-                "Unhandled OfflineKernelCompileParams::Mode alternative");
-
-            // Build one Kernel instance and reuse it across every enumerated JitDeviceConfig.
+            // Build one Kernel instance and reuse it across every selected
+            // JitDeviceConfig.  ExplicitProduct keeps the target set owned by
+            // the invocation instead of silently compiling every SDK product.
             // The kernel's content (source, compile args, defines) is identical per config; the
             // per-config state (build options, full name, hash) is stored on JitBuildOptions and
             // refreshed on the kernel via set_full_name() each iteration.
@@ -222,8 +235,11 @@ void CompileKernelOffline(
             const CoreRangeSet placeholder_core_range_set(CoreRange{CoreCoord{0, 0}, CoreCoord{0, 0}});
             const std::shared_ptr<Kernel> kernel = make_offline_kernel(kernel_src, placeholder_core_range_set, config);
 
-            llrt::RunTimeOptions rtoptions;
-            enumerate_offline_compile_device_configs(rtoptions, [&](const JitDeviceConfig& jit_device_config) {
+            llrt::RunTimeOptions rtoptions = params.environment
+                ? llrt::RunTimeOptions(llrt::RunTimeOptions::ExplicitBuildOptions{
+                      params.environment->root_dir.string(), params.environment->cache_dir.string()})
+                : llrt::RunTimeOptions();
+            auto compile_one = [&](const JitDeviceConfig& jit_device_config) {
                 BuildEnvManager build_env_manager(*jit_device_config.hal);
                 build_env_manager.add_build_env(0, jit_device_config, rtoptions);
                 const DeviceBuildEnv& device_build_env = build_env_manager.get_device_build_env(0);
@@ -243,7 +259,25 @@ void CompileKernelOffline(
 
                 copy_generated_elfs_to_output_dir(
                     kernel, build_env_manager, device_build_env, *jit_device_config.hal, params.output_dir);
-            });
+            };
+            if constexpr (std::is_same_v<ModeT, OfflineKernelCompileParams::AllSupportedProducts>) {
+                enumerate_offline_compile_device_configs(rtoptions, compile_one);
+            } else if constexpr (std::is_same_v<ModeT, OfflineKernelCompileParams::ExplicitProduct>) {
+                if (mode.arch == ARCH::Invalid || mode.core_descriptor.empty() || mode.soc_descriptor.empty())
+                    throw std::invalid_argument(
+                        "OfflineKernelCompileParams::ExplicitProduct requires arch and descriptor names");
+                const std::filesystem::path root = params.environment
+                    ? params.environment->root_dir
+                    : std::filesystem::path(rtoptions.get_root_dir());
+                enumerate_jit_device_configs(
+                    mode.arch,
+                    (root / "tt_metal" / "core_descriptors" / mode.core_descriptor).string(),
+                    (root / "tt_metal" / "soc_descriptors" / mode.soc_descriptor).string(),
+                    compile_one);
+            } else {
+                static_assert(std::is_same_v<ModeT, OfflineKernelCompileParams::AllSupportedProducts>,
+                              "Unhandled OfflineKernelCompileParams::Mode alternative");
+            }
         },
         params.mode);
 }

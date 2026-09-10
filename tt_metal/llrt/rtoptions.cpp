@@ -363,6 +363,28 @@ RunTimeOptions::RunTimeOptions() : system_kernel_dir("/usr/share/tenstorrent/ker
         "Cannot enable both debug printing and profiling");
 }
 
+RunTimeOptions::RunTimeOptions(ExplicitBuildOptions options)
+    : system_kernel_dir("/usr/share/tenstorrent/kernels/") {
+    if (options.root_dir.empty()) {
+        TT_THROW("explicit offline build options require a non-empty root_dir");
+    }
+    std::filesystem::path root(options.root_dir);
+    if (!std::filesystem::is_directory(root)) {
+        TT_THROW("explicit offline build root does not exist: {}", root.string());
+    }
+    root /= "";
+    root_dir = root.string();
+    if (options.cache_dir) {
+        if (options.cache_dir->empty()) {
+            TT_THROW("explicit offline build options require a non-empty cache_dir");
+        }
+        cache_dir_ = *options.cache_dir;
+        is_cache_dir_env_var_set = true;
+    }
+    // Deliberately do not call InitializeFromEnvVars().  Every remaining
+    // option retains its typed default and the caller owns these paths.
+}
+
 void RunTimeOptions::set_root_dir(const std::string& root_dir) {
     std::call_once(g_root_once, [&] { g_root_dir = root_dir; });
 }

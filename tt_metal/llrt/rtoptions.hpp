@@ -391,7 +391,17 @@ class RunTimeOptions {
     SanitizerSettings sanitizer_settings;
 
 public:
+    struct ExplicitBuildOptions {
+        std::string root_dir;
+        std::optional<std::string> cache_dir;
+    };
+
     RunTimeOptions();
+    // Construct the subset of runtime options needed by offline compilation
+    // without consulting process environment variables, the current working
+    // directory, or the process-global root override.  This is the only
+    // construction path suitable for a hermetic compiler invocation.
+    explicit RunTimeOptions(ExplicitBuildOptions options);
     RunTimeOptions(const RunTimeOptions&) = delete;
     RunTimeOptions& operator=(const RunTimeOptions&) = delete;
 

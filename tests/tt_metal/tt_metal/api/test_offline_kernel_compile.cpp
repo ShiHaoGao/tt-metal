@@ -180,6 +180,26 @@ TEST_F(OfflineKernelCompileMockFixture, CompileKernelOfflineRejectsEmptyOutputDi
     EXPECT_THROW(experimental::CompileKernelOffline(kReaderKernelPath, kReaderDmConfig, params), std::invalid_argument);
 }
 
+TEST_F(OfflineKernelCompileMockFixture, CompileKernelOfflineRejectsIncompleteExplicitEnvironment) {
+    using Params = experimental::OfflineKernelCompileParams;
+    Params params{
+        .mode = Params::ExplicitProduct{
+            .arch = ARCH::BLACKHOLE,
+            .core_descriptor = "blackhole_140_arch.yaml",
+            .soc_descriptor = "blackhole_140_arch.yaml",
+        },
+        .output_dir = fs::temp_directory_path() / "trex-explicit-env-output",
+        .cb_compile_configs = {},
+        .environment = Params::ExplicitEnvironment{
+            .root_dir = fs::path("/tmp/tt-metal-root-that-does-not-exist"),
+            .cache_dir = fs::temp_directory_path() / "trex-explicit-env-cache",
+        },
+    };
+    EXPECT_THROW(
+        experimental::CompileKernelOffline(kReaderKernelPath, kReaderDmConfig, params),
+        std::invalid_argument);
+}
+
 // Returns the number of subdirectories directly under `dir` whose names parse as decimal digits
 // (i.e. compile-hash buckets). Returns 0 if `dir` does not exist.
 size_t count_compile_hash_subdirs(const fs::path& dir) {
