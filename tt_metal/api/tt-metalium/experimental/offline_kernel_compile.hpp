@@ -180,6 +180,12 @@ std::vector<OfflineKernelCompileParams::CBCompileConfig> CBCompileConfigsFromPro
  *
  * This API validates compile parameters and writes binaries under
  * `params.output_dir` for the selected compile mode. `params.output_dir` must be non-empty.
+ * Kernel construction uses local HAL/options and never initializes MetalContext.
+ * Matching SDK precompiled firmware is used when available; otherwise firmware is
+ * built in this invocation's cache before compiling kernels. A selected bundle
+ * with missing or malformed firmware ELF files is rejected before kernel compilation.
+ * Failed parallel build batches finish all submitted tasks before propagating
+ * their first exception, so invocation-owned build state can be safely released.
  *
  * @param file_name Kernel source file path.
  * @param config    Kernel config: DataMovementConfig or ComputeConfig.

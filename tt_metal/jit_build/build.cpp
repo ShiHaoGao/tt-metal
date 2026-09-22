@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -916,8 +917,20 @@ void launch_build_step(const std::function<void()>& build_func, std::vector<std:
 }
 
 void sync_build_steps(std::vector<std::shared_future<void>>& events) {
+    std::exception_ptr first_failure;
     for (auto& event : events) {
-        event.get();
+        try {
+            event.get();
+        } catch (...) {
+            if (!first_failure) {
+                first_failure = std::current_exception();
+            }
+        }
+    }
+    // Sibling tasks may still reference build state owned by the caller. Drain
+    // every task before propagating failure and allowing that state to unwind.
+    if (first_failure) {
+        std::rethrow_exception(first_failure);
     }
 }
 

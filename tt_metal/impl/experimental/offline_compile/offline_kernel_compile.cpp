@@ -18,11 +18,13 @@
 #include "jit_build/jit_device_config.hpp"
 #include "llrt/hal.hpp"
 #include "llrt/rtoptions.hpp"
+#include "llrt/tt_elffile.hpp"
 
 #include <hostdevcommon/kernel_structs.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <elf.h>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -86,16 +88,20 @@ void validate_cb_compile_configs(const std::vector<CBCompileConfig>& cb_compile_
 }
 
 std::shared_ptr<Kernel> make_offline_kernel(
+    const KernelBuildContext& build_context,
     const KernelSource& kernel_src,
     const CoreRangeSet& core_range_set,
     const std::variant<DataMovementConfig, ComputeConfig>& config) {
+    TT_FATAL(
+        !build_context.options.get_watcher_enabled() || build_context.options.watcher_assert_disabled(),
+        "Offline kernel compilation does not support watcher assertions");
     return std::visit(
         [&](const auto& cfg) -> std::shared_ptr<Kernel> {
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, DataMovementConfig>) {
-                return std::make_shared<DataMovementKernel>(kernel_src, core_range_set, cfg);
+                return std::make_shared<DataMovementKernel>(build_context, kernel_src, core_range_set, cfg);
             } else {
-                return std::make_shared<ComputeKernel>(kernel_src, core_range_set, cfg);
+                return std::make_shared<ComputeKernel>(build_context, kernel_src, core_range_set, cfg);
             }
         },
         config);
@@ -105,6 +111,19 @@ void apply_cb_compile_configs(JitBuildOptions& build_options, const std::vector<
     for (const auto& cb_compile_config : cb_compile_configs) {
         build_options.set_cb_data_fmt_and_tile(
             static_cast<CBIndex>(cb_compile_config.cb_index), cb_compile_config.data_format, cb_compile_config.tile);
+    }
+}
+
+void validate_offline_firmware(const JitBuildState& build) {
+    const auto& path = build.get_weakened_firmware_name();
+    try {
+        if (!std::filesystem::is_regular_file(path) || std::filesystem::file_size(path) < sizeof(Elf64_Ehdr)) {
+            throw std::runtime_error("missing or truncated ELF");
+        }
+        ll_api::ElfFile image;
+        image.ReadImage(path);
+    } catch (const std::exception& error) {
+        throw std::runtime_error("offline firmware " + path + ": " + error.what());
     }
 }
 
@@ -220,29 +239,54 @@ void CompileKernelOffline(
     validate_output_dir(params.output_dir);
     validate_environment(params.environment);
 
-    // Mode is presently a single-alternative variant (AllSupportedProducts). std::visit + the
-    // static_assert below let future alternatives be added without silently bypassing this body.
+    // Explicit calls never use the runtime source/include path resolver.
+    if (params.environment) {
+        if (!std::filesystem::path(file_name).is_absolute())
+            throw std::invalid_argument("explicit offline source path must be absolute");
+        std::visit([](const auto& cfg) {
+            for (const auto& path : cfg.compiler_include_paths)
+                if (!path.is_absolute())
+                    throw std::invalid_argument("explicit offline include paths must be absolute");
+        }, config);
+    }
+
     std::visit(
         [&](const auto& mode) {
             using ModeT = std::decay_t<decltype(mode)>;
-            // Build one Kernel instance and reuse it across every selected
-            // JitDeviceConfig.  ExplicitProduct keeps the target set owned by
-            // the invocation instead of silently compiling every SDK product.
-            // The kernel's content (source, compile args, defines) is identical per config; the
-            // per-config state (build options, full name, hash) is stored on JitBuildOptions and
-            // refreshed on the kernel via set_full_name() each iteration.
             const KernelSource kernel_src(file_name, KernelSource::FILE_PATH);
             const CoreRangeSet placeholder_core_range_set(CoreRange{CoreCoord{0, 0}, CoreCoord{0, 0}});
-            const std::shared_ptr<Kernel> kernel = make_offline_kernel(kernel_src, placeholder_core_range_set, config);
 
             llrt::RunTimeOptions rtoptions = params.environment
                 ? llrt::RunTimeOptions(llrt::RunTimeOptions::ExplicitBuildOptions{
                       params.environment->root_dir.string(), params.environment->cache_dir.string()})
                 : llrt::RunTimeOptions();
             auto compile_one = [&](const JitDeviceConfig& jit_device_config) {
+                const std::shared_ptr<Kernel> kernel = make_offline_kernel(
+                    {*jit_device_config.hal, rtoptions, nullptr}, kernel_src, placeholder_core_range_set, config);
                 BuildEnvManager build_env_manager(*jit_device_config.hal);
                 build_env_manager.add_build_env(0, jit_device_config, rtoptions);
                 const DeviceBuildEnv& device_build_env = build_env_manager.get_device_build_env(0);
+
+                // A local build environment has no device initialization step
+                // to prepare the firmware symbols consumed by kernel linking.
+                // Build in this invocation's cache when no matching bundle is
+                // installed. The process-wide build-once cache cannot certify
+                // firmware in a different invocation's output directory.
+                if (!device_build_env.firmware_precompiled) {
+                    jit_build_subset(device_build_env.firmware_build_states, nullptr);
+                }
+
+                const auto core_type = jit_device_config.hal->get_programmable_core_type_index(
+                    kernel->get_kernel_programmable_core_type());
+                const auto processor_class = static_cast<uint32_t>(kernel->get_kernel_processor_class());
+                if (kernel->get_kernel_processor_class() == HalProcessorClassType::COMPUTE) {
+                    for (const auto& build : build_env_manager.get_kernel_build_states(0, core_type, processor_class)) {
+                        validate_offline_firmware(build);
+                    }
+                } else {
+                    validate_offline_firmware(build_env_manager.get_kernel_build_state(
+                        0, core_type, processor_class, kernel->get_kernel_processor_type(0)));
+                }
 
                 JitBuildOptions build_options(device_build_env.build_env);
                 kernel->set_build_options(build_options);

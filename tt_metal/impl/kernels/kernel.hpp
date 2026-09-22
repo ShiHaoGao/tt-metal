@@ -30,6 +30,16 @@ namespace tt::tt_metal {
 
 class JitBuildOptions;
 
+// Borrowed only while constructing a Kernel. Offline compilation supplies its
+// own HAL/options and no watcher; it must not initialize a runtime context.
+struct KernelBuildContext {
+    const Hal& hal;
+    const llrt::RunTimeOptions& options;
+    WatcherServer* watcher = nullptr;
+
+    static KernelBuildContext from_runtime();
+};
+
 enum Eth : uint8_t {
     SENDER = 0,
     RECEIVER = 1,
@@ -287,7 +297,8 @@ protected:
         const std::vector<std::string>& runtime_arg_names = {},
         const std::vector<std::string>& common_runtime_arg_names = {},
         const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
-        const KernelCrtaLayout& crta_layout = {});
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelBuildContext& build_context = KernelBuildContext::from_runtime());
 
     HalProgrammableCoreType programmable_core_type_;
     HalProcessorClassType processor_class_;
@@ -344,11 +355,18 @@ protected:
     std::vector<std::string> file_paths(const IDevice& device, const std::string& binary_root) const;
 
 private:
-    void register_kernel_with_watcher();
+    void register_kernel_with_watcher(WatcherServer* watcher);
 };
 
 class DataMovementKernel : public Kernel {
 public:
+    DataMovementKernel(
+        const KernelBuildContext& build_context,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const DataMovementConfig& config) :
+        DataMovementKernel(kernel_src, cr_set, config, false, {}, {}, {}, {}, {}, {}, build_context) {}
+
     DataMovementKernel(
         const KernelSource& kernel_src,
         const CoreRangeSet& cr_set,
@@ -360,7 +378,8 @@ public:
         const std::vector<std::string>& runtime_arg_names = {},
         const std::vector<std::string>& common_runtime_arg_names = {},
         const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
-        const KernelCrtaLayout& crta_layout = {}) :
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelBuildContext& build_context = KernelBuildContext::from_runtime()) :
         Kernel(
             HalProgrammableCoreType::TENSIX,
             HalProcessorClassType::DM,
@@ -375,10 +394,11 @@ public:
             runtime_arg_names,
             common_runtime_arg_names,
             tensor_binding_handles,
-            crta_layout),
+            crta_layout,
+            build_context),
         config_(config) {
         TT_FATAL(
-            MetalContext::instance().get_cluster().arch() != ARCH::QUASAR,
+            build_context.hal.get_arch() != ARCH::QUASAR,
             "DataMovementKernel is not supported on Quasar. Use QuasarDataMovementKernel instead.");
         this->set_compiler_include_paths(config_.compiler_include_paths);
     }
@@ -487,6 +507,13 @@ private:
 class ComputeKernel : public Kernel {
 public:
     ComputeKernel(
+        const KernelBuildContext& build_context,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const ComputeConfig& config) :
+        ComputeKernel(kernel_src, cr_set, config, false, {}, {}, {}, {}, {}, {}, build_context) {}
+
+    ComputeKernel(
         const KernelSource& kernel_src,
         const CoreRangeSet& cr_set,
         const ComputeConfig& config,
@@ -497,7 +524,8 @@ public:
         const std::vector<std::string>& runtime_arg_names = {},
         const std::vector<std::string>& common_runtime_arg_names = {},
         const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
-        const KernelCrtaLayout& crta_layout = {}) :
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelBuildContext& build_context = KernelBuildContext::from_runtime()) :
         Kernel(
             HalProgrammableCoreType::TENSIX,
             HalProcessorClassType::COMPUTE,
@@ -512,10 +540,11 @@ public:
             runtime_arg_names,
             common_runtime_arg_names,
             tensor_binding_handles,
-            crta_layout),
+            crta_layout,
+            build_context),
         config_(config) {
         TT_FATAL(
-            MetalContext::instance().get_cluster().arch() != ARCH::QUASAR,
+            build_context.hal.get_arch() != ARCH::QUASAR,
             "ComputeKernel is not supported on Quasar. Use QuasarComputeKernel instead.");
         this->set_compiler_include_paths(config_.compiler_include_paths);
     }

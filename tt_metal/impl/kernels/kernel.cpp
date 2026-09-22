@@ -119,6 +119,15 @@ KernelSource::KernelSource(const std::string& source, const SourceType& source_t
     }
 };
 
+KernelBuildContext KernelBuildContext::from_runtime() {
+    auto& context = MetalContext::instance();
+    auto* watcher = context.watcher_server().get();
+    TT_FATAL(
+        watcher || context.get_cluster().is_mock_or_emulated(),
+        "Watcher server is unavailable, and the target is not a mock or emulated device");
+    return {context.hal(), context.rtoptions(), watcher};
+}
+
 Kernel::Kernel(
     HalProgrammableCoreType programmable_core_type,
     HalProcessorClassType processor_class,
@@ -133,7 +142,8 @@ Kernel::Kernel(
     const std::vector<std::string>& runtime_arg_names,
     const std::vector<std::string>& common_runtime_arg_names,
     const std::vector<TensorBindingHandle>& tensor_binding_handles,
-    const KernelCrtaLayout& crta_layout) :
+    const KernelCrtaLayout& crta_layout,
+    const KernelBuildContext& build_context) :
     programmable_core_type_(programmable_core_type),
     processor_class_(processor_class),
     kernel_src_(kernel_src),
@@ -151,10 +161,9 @@ Kernel::Kernel(
     core_with_max_runtime_args_({0, 0}),
     defines_(defines),
     watcher_assert_enabled_(
-        tt::tt_metal::MetalContext::instance().rtoptions().get_watcher_enabled() &&
-        !tt::tt_metal::MetalContext::instance().rtoptions().watcher_assert_disabled()),
+        build_context.options.get_watcher_enabled() && !build_context.options.watcher_assert_disabled()),
     watcher_count_word_offset_(watcher_assert_enabled_ ? 1 : 0) {
-    this->register_kernel_with_watcher();
+    this->register_kernel_with_watcher(build_context.watcher);
 
     size_t max_x = 0, max_y = 0;
     for (auto core_range : this->core_range_set_.ranges()) {
@@ -179,13 +188,9 @@ Kernel::Kernel(
     }
 }
 
-void Kernel::register_kernel_with_watcher() {
-    auto& watcher = MetalContext::instance().watcher_server();
+void Kernel::register_kernel_with_watcher(WatcherServer* watcher) {
     if (!watcher) {
-        // Null for mock and emulated targets (no watcher created); nothing to register.
-        TT_FATAL(
-            MetalContext::instance().get_cluster().is_mock_or_emulated(),
-            "Watcher server is unavailable, and the target is not a mock or emulated device");
+        // Offline and mock/emulated runtime construction can omit the watcher.
         this->watcher_kernel_id_ = -1;
         return;
     }

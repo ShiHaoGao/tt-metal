@@ -378,7 +378,9 @@ RunTimeOptions::RunTimeOptions(ExplicitBuildOptions options)
         if (options.cache_dir->empty()) {
             TT_THROW("explicit offline build options require a non-empty cache_dir");
         }
-        cache_dir_ = *options.cache_dir;
+        std::filesystem::path cache(*options.cache_dir);
+        cache /= "";
+        cache_dir_ = cache.string();
         is_cache_dir_env_var_set = true;
     }
     // Deliberately do not call InitializeFromEnvVars().  Every remaining
