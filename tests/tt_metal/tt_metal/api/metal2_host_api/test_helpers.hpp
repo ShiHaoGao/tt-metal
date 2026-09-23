@@ -18,9 +18,11 @@
 #include <tt-metalium/experimental/metal2_host_api/kernel_spec.hpp>
 #include <tt-metalium/experimental/metal2_host_api/node_coord.hpp>
 #include <tt-metalium/experimental/metal2_host_api/tensor_parameter.hpp>
-#include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
-#include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
+#include <tt-metalium/tensor/spec/tensor_spec.hpp>
+#include <tt-metalium/tensor/spec/layout/tensor_layout.hpp>
 #include <tt-metalium/work_split.hpp>
+#include "experimental/metal2_host_api/data_movement_hardware_config.hpp"
+#include "kernel_types.hpp"
 
 // This file contains shortcut helper functions to create minimal valid ProgramSpec
 // objects for unit tests. This cuts boilerplate in a unit testing context.
@@ -76,15 +78,12 @@ inline constexpr const char* MINIMAL_KERNEL_SOURCE = "void kernel_main() {}";
 // Placement is stated on WorkUnitSpec; pass node sets to MakeMinimalWorkUnit instead.
 
 // Helper to create a minimal valid KernelSpec for data movement (Gen2/Quasar)
-inline KernelSpec MakeMinimalDMKernel(const std::string& name, uint32_t num_threads = 1) {
+inline KernelSpec MakeMinimalGen2DMKernel(std::string name, uint32_t num_threads = 1) {
     return KernelSpec{
-        .unique_id = KernelSpecName{name},
+        .unique_id = KernelSpecName{std::move(name)},
         .source = KernelSpec::SourceCode{MINIMAL_KERNEL_SOURCE},
         .num_threads = num_threads,
-        .hw_config =
-            DataMovementHardwareConfig{
-                .gen2_config = DataMovementHardwareConfig::Gen2Config{},
-            },
+        .hw_config = DataMovementGen2Config{},
     };
 }
 
@@ -95,71 +94,77 @@ inline KernelSpec MakeMinimalDMKernel(const std::string& name, uint32_t num_thre
 // two dedicated-NOC DM kernels sharing a NOC hang the device (validation rejects it), so a helper
 // that always defaulted to NOC_0 would produce a pair that fails validation.
 inline KernelSpec MakeMinimalGen1DMKernel(
-    const std::string& name,
-    tt::tt_metal::DataMovementProcessor processor = tt::tt_metal::DataMovementProcessor::RISCV_0) {
+    std::string name, tt::tt_metal::DataMovementProcessor processor = tt::tt_metal::DataMovementProcessor::RISCV_0) {
     const tt::tt_metal::NOC noc = (processor == tt::tt_metal::DataMovementProcessor::RISCV_0)
                                       ? tt::tt_metal::NOC::NOC_0
                                       : tt::tt_metal::NOC::NOC_1;
     return KernelSpec{
-        .unique_id = KernelSpecName{name},
+        .unique_id = KernelSpecName{std::move(name)},
         .source = KernelSpec::SourceCode{MINIMAL_KERNEL_SOURCE},
         .num_threads = 1,
-        .hw_config =
-            DataMovementHardwareConfig{
-                .gen1_config =
-                    DataMovementHardwareConfig::Gen1Config{
-                        .processor = processor,
-                        .noc = noc,
-                    },
-            },
+        .hw_config = DataMovementGen1Config{.processor = processor, .noc = noc}};
+}
+
+// Helper to create a minimal valid KernelSpec for data movement whose Gen1 config is built
+// from the READER role via CreateReaderGen1DataMovementConfig (Gen1/WH/BH).
+inline KernelSpec MakeMinimalReaderDMKernel(std::string name) {
+    return KernelSpec{
+        .unique_id = KernelSpecName{std::move(name)},
+        .source = KernelSpec::SourceCode{MINIMAL_KERNEL_SOURCE},
+        .num_threads = 1,
+        .hw_config = CreateReaderGen1DataMovementConfig(),
     };
 }
 
-// Helper to create a minimal valid KernelSpec for data movement that relies on a
-// Gen1 role hint (READER/WRITER) to fill in the hardware config, rather than
-// supplying an explicit Gen1Config (Gen1/WH/BH).
-inline KernelSpec MakeMinimalRoleDMKernel(const std::string& name, DataMovementRoleHint role) {
+// Helper to create a minimal valid KernelSpec for data movement whose Gen1 config is built
+// from the WRITER role via CreateWriterGen1DataMovementConfig (Gen1/WH/BH).
+inline KernelSpec MakeMinimalWriterDMKernel(std::string name) {
     return KernelSpec{
-        .unique_id = KernelSpecName{name},
+        .unique_id = KernelSpecName{std::move(name)},
         .source = KernelSpec::SourceCode{MINIMAL_KERNEL_SOURCE},
         .num_threads = 1,
-        .hw_config =
-            DataMovementHardwareConfig{
-                .role = role,
-            },
+        .hw_config = CreateWriterGen1DataMovementConfig(),
     };
 }
 
-// Helper to create a minimal valid KernelSpec for compute
-inline KernelSpec MakeMinimalComputeKernel(const std::string& name, uint32_t num_threads = 1) {
+// Helper to create a minimal valid KernelSpec for compute (Gen2/Quasar)
+inline KernelSpec MakeMinimalGen2ComputeKernel(std::string name, uint32_t num_threads = 1) {
     return KernelSpec{
-        .unique_id = KernelSpecName{name},
+        .unique_id = KernelSpecName{std::move(name)},
         .source = KernelSpec::SourceCode{MINIMAL_KERNEL_SOURCE},
         .num_threads = num_threads,
-        .hw_config = ComputeHardwareConfig{},
+        .hw_config = ComputeGen2Config{},
+    };
+}
+
+// Helper to create a minimal valid KernelSpec for compute (Gen1/WH/BH)
+inline KernelSpec MakeMinimalGen1ComputeKernel(std::string name, uint32_t num_threads = 1) {
+    return KernelSpec{
+        .unique_id = KernelSpecName{std::move(name)},
+        .source = KernelSpec::SourceCode{MINIMAL_KERNEL_SOURCE},
+        .num_threads = num_threads,
+        .hw_config = ComputeGen1Config{},
     };
 }
 
 // Helper to create a minimal valid DataflowBufferSpec
-inline DataflowBufferSpec MakeMinimalDFB(
-    const std::string& name, uint32_t entry_size = 1024, uint32_t num_entries = 2) {
+inline DataflowBufferSpec MakeMinimalDFB(std::string name, uint32_t entry_size = 1024, uint32_t num_entries = 2) {
     return DataflowBufferSpec{
-        .unique_id = DFBSpecName{name},
+        .unique_id = DFBSpecName{std::move(name)},
         .entry_size = entry_size,
         .num_entries = num_entries,
     };
 }
 
 // Helper to create a minimal valid WorkUnitSpec
-inline WorkUnitSpec MakeMinimalWorkUnit(
-    const std::string& name, const Nodes& nodes, const std::vector<std::string>& kernels) {
+inline WorkUnitSpec MakeMinimalWorkUnit(std::string name, const Nodes& nodes, const std::vector<std::string>& kernels) {
     std::vector<KernelSpecName> kernel_names;
     kernel_names.reserve(kernels.size());
     for (const auto& kernel : kernels) {
         kernel_names.emplace_back(kernel);
     }
     return WorkUnitSpec{
-        .name = name,
+        .name = std::move(name),
         .kernels = std::move(kernel_names),
         .target_nodes = nodes,
     };
@@ -170,23 +175,23 @@ inline WorkUnitSpec MakeMinimalWorkUnit(
 // works on any mock device (alignment + virtualized cores resolved by MakeProgramFromSpec).
 // buffer_type defaults to DRAM; pass BufferType::L1 for an SRAM-resident parameter.
 inline TensorParameter MakeMinimalTensorParameter(
-    const std::string& name, tt::tt_metal::BufferType buffer_type = tt::tt_metal::BufferType::DRAM) {
+    std::string name, tt::tt_metal::BufferType buffer_type = tt::tt_metal::BufferType::DRAM) {
     auto page_config = tt::tt_metal::PageConfig(tt::tt_metal::Layout::ROW_MAJOR);
     auto memory_config = tt::tt_metal::MemoryConfig{tt::tt_metal::TensorMemoryLayout::INTERLEAVED, buffer_type};
     auto tensor_layout = tt::tt_metal::TensorLayout(tt::tt_metal::DataType::BFLOAT16, page_config, memory_config);
     auto spec = tt::tt_metal::TensorSpec(tt::tt_metal::Shape{1, 32}, tensor_layout);
     return TensorParameter{
-        .unique_id = TensorParamName{name},
+        .unique_id = TensorParamName{std::move(name)},
         .spec = std::move(spec),
     };
 }
 
 // Helper to add a TensorBinding to a kernel.
 inline void BindTensorParameterToKernel(
-    KernelSpec& kernel, const std::string& tensor_parameter_name, const std::string& accessor_name) {
+    KernelSpec& kernel, std::string tensor_parameter_name, std::string accessor_name) {
     kernel.tensor_bindings.push_back(TensorBinding{
-        .tensor_parameter_name = TensorParamName{tensor_parameter_name},
-        .accessor_name = accessor_name,
+        .tensor_parameter_name = TensorParamName{std::move(tensor_parameter_name)},
+        .accessor_name = std::move(accessor_name),
     });
 }
 
@@ -196,20 +201,59 @@ inline void BindTensorParameterToKernel(
 // Defaults give a simple legal layout: BFLOAT16 tile-layout tensor of `logical_shape`,
 // sharded across the first `num_cores` cores of the worker grid with shard shape
 // `shard_shape`. Caller is responsible for choosing a shape that fits the grid.
+//
+// Pass Layout::ROW_MAJOR to build a row-major sharded parameter. Note the two layouts pad
+// differently: a tile tensor's physical shape is rounded up in both dims, while a row-major
+// sharded tensor aligns on width only (create_default_alignment_rm), so its height is never
+// padded up to the shard height and the tensor may legally be smaller than one of its shards.
 inline TensorParameter MakeShardedTensorParameter(
-    const std::string& name,
+    std::string name,
     const tt::tt_metal::Shape& logical_shape,
     const std::array<uint32_t, 2>& shard_shape,
-    uint32_t num_cores) {
+    uint32_t num_cores,
+    tt::tt_metal::Layout layout = tt::tt_metal::Layout::TILE) {
     auto shard_grid = tt::tt_metal::num_cores_to_corerangeset(num_cores, CoreCoord{num_cores, 1}, /*row_wise=*/true);
     tt::tt_metal::ShardSpec shard_spec{
         shard_grid, {shard_shape[0], shard_shape[1]}, tt::tt_metal::ShardOrientation::ROW_MAJOR};
     tt::tt_metal::MemoryConfig memory_config{
         tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED, tt::tt_metal::BufferType::L1, shard_spec};
-    auto page_config = tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE);
+    auto page_config = tt::tt_metal::PageConfig(layout);
     auto tensor_layout = tt::tt_metal::TensorLayout(tt::tt_metal::DataType::BFLOAT16, page_config, memory_config);
     return TensorParameter{
-        .unique_id = TensorParamName{name},
+        .unique_id = TensorParamName{std::move(name)},
+        .spec = tt::tt_metal::TensorSpec(logical_shape, std::move(tensor_layout)),
+    };
+}
+
+// ND-sharded counterpart of MakeShardedTensorParameter, built from an NdShardSpec rather than a 2D
+// ShardSpec. This is the layout that routes compute_consumed_memory_bytes_per_bank through its
+// buffer_distribution_spec branch (max_num_dev_pages_per_core) instead of the shard_spec one.
+//
+// The default strategy is CONTIGUOUS_1D because that is what keeps the tensor ND-sharding-only.
+// TensorSpec::populate_sharding_specs back-fills an equivalent legacy 2D shard_spec whenever the ND
+// spec can be flattened, and a populated shard_spec sends the size computation down the 2D branch
+// instead. CONTIGUOUS_1D packs adjacent shards onto one bank, which no legacy WIDTH/HEIGHT/
+// BLOCK_SHARDED layout expresses, so populate_legacy_shard_spec_from_nd declines to fabricate one.
+inline TensorParameter MakeNdShardedTensorParameter(
+    std::string name,
+    const tt::tt_metal::Shape& logical_shape,
+    const tt::tt_metal::Shape& shard_shape,
+    uint32_t num_cores,
+    tt::tt_metal::Layout layout = tt::tt_metal::Layout::ROW_MAJOR,
+    tt::tt_metal::ShardDistributionStrategy shard_distribution_strategy =
+        tt::tt_metal::ShardDistributionStrategy::CONTIGUOUS_1D) {
+    auto shard_grid = tt::tt_metal::num_cores_to_corerangeset(num_cores, CoreCoord{num_cores, 1}, /*row_wise=*/true);
+    tt::tt_metal::NdShardSpec nd_shard_spec{
+        .shard_shape = shard_shape,
+        .grid = shard_grid,
+        .orientation = tt::tt_metal::ShardOrientation::ROW_MAJOR,
+        .shard_distribution_strategy = shard_distribution_strategy,
+    };
+    tt::tt_metal::MemoryConfig memory_config{tt::tt_metal::BufferType::L1, nd_shard_spec};
+    auto tensor_layout =
+        tt::tt_metal::TensorLayout(tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::PageConfig(layout), memory_config);
+    return TensorParameter{
+        .unique_id = TensorParamName{std::move(name)},
         .spec = tt::tt_metal::TensorSpec(logical_shape, std::move(tensor_layout)),
     };
 }
@@ -222,7 +266,7 @@ inline ProgramSpec MakeMinimalGen1ValidProgramSpec() {
     spec.name = "test_program";
 
     auto dm_kernel = MakeMinimalGen1DMKernel("dm_kernel", tt::tt_metal::DataMovementProcessor::RISCV_0);
-    auto compute_kernel = MakeMinimalComputeKernel("compute_kernel");
+    auto compute_kernel = MakeMinimalGen1ComputeKernel("compute_kernel");
 
     auto dfb = MakeMinimalDFB("dfb_0");
     dfb.data_format_metadata = tt::DataFormat::Float16_b;
@@ -245,8 +289,8 @@ inline ProgramSpec MakeMinimalValidProgramSpec() {
     spec.name = "test_program";
 
     // Create a DM kernel (producer) and compute kernel (consumer)
-    auto dm_kernel = MakeMinimalDMKernel("dm_kernel");
-    auto compute_kernel = MakeMinimalComputeKernel("compute_kernel");
+    auto dm_kernel = MakeMinimalGen2DMKernel("dm_kernel");
+    auto compute_kernel = MakeMinimalGen2ComputeKernel("compute_kernel");
 
     // Create a DFB with data format (required for compute endpoint)
     auto dfb = MakeMinimalDFB("dfb_0");

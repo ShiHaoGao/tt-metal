@@ -13,11 +13,6 @@ on:
         type: string
         default: ./tests/pipeline_reorg/fabric_cpu_only_unit_tests.yaml
         description: "Pipeline reorg test matrix YAML (e.g. fabric_cpu_only_smoke_merge_gate_tests.yaml for merge gate)."
-      test-category:
-        required: false
-        type: string
-        default: unit
-        description: "Time-budget workflow key passed to verify_time_budget.py (unit for fabric CPU-only tests)."
       build-artifact-name:
         required: true
         type: string
@@ -27,10 +22,9 @@ on:
       wheel-artifact-name:
         required: true
         type: string
-
 jobs:
   load-test-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     outputs:
       matrix: ${{ steps.build-matrix.outputs.matrix }}
     env:
@@ -46,26 +40,20 @@ jobs:
           sparse-checkout-cone-mode: true
       - name: Install dependencies
         run: pip3 install PyYAML
-      - name: Verify test timeouts against budget
-        run: |
-          set -e
-          echo "Verifying that timeouts defined in tests.yaml are within the allowed limits..."
-          python3 .github/scripts/utils/verify_time_budget.py \
-            ${{ env.TESTS_YAML_PATH }} \
-            ./.github/time_budget.yaml \
-            "${{ inputs.test-category }}"
       - name: Build unified test matrix based on enabled SKUs
         id: build-matrix
         run: |
           python3 .github/scripts/utils/prepare_test_matrix.py \
             ${{ env.TESTS_YAML_PATH }} \
             "${{ inputs.runs-on-sku }}" \
-            ./.github/sku_config.yaml
+            ./.github/sku_config.yaml \
+            --event "${{ github.event_name }}"
 
   fabric-cpu-unit-tests:
     needs: load-test-matrix
     if: ${{ needs.load-test-matrix.outputs.matrix != '[]' }}
     strategy:
+      # Keep every shard running even if another shard fails or times out.
       fail-fast: false
       matrix:
         test-group: ${{ fromJson(needs.load-test-matrix.outputs.matrix) }}

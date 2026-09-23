@@ -253,7 +253,8 @@ void CompileKernelOffline(
     std::visit(
         [&](const auto& mode) {
             using ModeT = std::decay_t<decltype(mode)>;
-            const KernelSource kernel_src(file_name, KernelSource::FILE_PATH);
+            // Explicit environments require an absolute path; this factory then never consults MetalContext.
+            const KernelSource kernel_src = KernelSource::from_path(DEFAULT_CONTEXT_ID, file_name);
             const CoreRangeSet placeholder_core_range_set(CoreRange{CoreCoord{0, 0}, CoreCoord{0, 0}});
 
             llrt::RunTimeOptions rtoptions = params.environment

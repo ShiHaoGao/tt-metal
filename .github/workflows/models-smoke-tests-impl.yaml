@@ -25,10 +25,9 @@ on:
         type: boolean
         default: true
         description: "Set to false to allow write access to MLPerf mount"
-
 jobs:
   load-test-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     outputs:
       matrix: ${{ steps.build-matrix.outputs.matrix }}
     env:
@@ -46,13 +45,6 @@ jobs:
       - name: Install dependencies
         run: pip3 install PyYAML
 
-      - name: Verify test timeouts against budget
-        run: |
-          set -e
-          python3 .github/scripts/utils/verify_time_budget.py \
-            "${{ env.TESTS_YAML_PATH }}" \
-            ./.github/time_budget.yaml \
-            merge_gate
 
       - name: Build test matrix based on enabled SKUs
         id: build-matrix
@@ -77,7 +69,8 @@ jobs:
           python3 .github/scripts/utils/prepare_test_matrix.py \
             "${{ env.TESTS_YAML_PATH }}" \
             "${{ inputs.enabled-skus }}" \
-            ./.github/sku_config.yaml
+            ./.github/sku_config.yaml \
+            --event "${{ github.event_name }}"
 
   models-smoke-tests:
     needs: load-test-matrix

@@ -17,6 +17,7 @@
 #include <tt-metalium/tt_align.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
+#include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
 
 using namespace tt::constants;
 using namespace tt::tt_metal;
@@ -87,7 +88,6 @@ ttnn::device_operation::ProgramArtifacts ReshardSameWidthFactory<local_is_output
     if (remote_unit_size_padded != unit_size || local_unit_size_padded != unit_size) {
         unaligned = true;
     }
-    const uint32_t total_size = local_units_per_shard * unit_size;
 
     // The scratch DFB / unaligned staging path only exists in the reader kernel source.
     const bool use_scratch = local_is_output && unaligned;
@@ -126,7 +126,7 @@ ttnn::device_operation::ProgramArtifacts ReshardSameWidthFactory<local_is_output
             uint32_t local_units_to_transfer = std::min(local_units_per_core, local_units_per_kernel);
             if (local_units_to_transfer != 0) {
                 pa.local_offset = local_start_offset;
-                local_start_offset += local_units_to_transfer * unit_size;
+                local_start_offset += local_units_to_transfer * local_unit_size_padded;
                 while (local_units_to_transfer > 0) {
                     if (remote_core_units_rem == 0) {
                         remote_core_idx++;
@@ -162,29 +162,49 @@ ttnn::device_operation::ProgramArtifacts ReshardSameWidthFactory<local_is_output
     const char* count_name = local_is_output ? "num_reads" : "num_writes";
     const char* kernel_path = local_is_output ? kSWReaderKernelPath : kSWWriterKernelPath;
 
-    KernelSpec::CompileTimeArgs compile_time_args = {
+    const KernelSpec::CompileTimeArgs compile_time_args = {
         {"interface_with_dram", static_cast<uint32_t>(interface_with_dram)},
         {"unit_size", unit_size},
+        {"local_unit_size_padded", local_unit_size_padded},
+        {"remote_unit_size_padded", remote_unit_size_padded},
     };
-    if constexpr (local_is_output) {
-        compile_time_args.emplace("remote_unit_size_padded", remote_unit_size_padded);
-    }
 
-    const auto make_worker = [&](const char* name, DataMovementRoleHint role, DFBEndpointType endpoint) {
+    auto make_cta = [&](uint32_t is_reader) {
+        KernelSpec::CompileTimeArgs cta = compile_time_args;
+        if (use_scratch) {
+            cta.emplace("is_reader", is_reader);
+            cta.emplace("remote_units_per_shard", remote_units_per_shard);
+        }
+        return cta;
+    };
+
+    const auto make_worker = [&](const char* name,
+                                 const DataMovementHardwareConfig& hw_config,
+                                 DFBEndpointType endpoint,
+                                 uint32_t is_reader) {
         KernelSpec k{
             .unique_id = KernelSpecName{name},
             .source = std::filesystem::path(kernel_path),
-            .hw_config = DataMovementHardwareConfig{.role = role},
+            .dfb_bindings = {DFBBinding{
+                .dfb_spec_name = DFBSpecName{kSWShardDfbName},
+                .accessor_name = kSWShardDfbName,
+                .endpoint_type = endpoint,
+            }},
+            .tensor_bindings =
+                {TensorBinding{
+                     .tensor_parameter_name = TensorParamName{kSWRemoteTensorParam},
+                     .accessor_name = kSWRemoteTensorParam},
+                 TensorBinding{
+                     .tensor_parameter_name = TensorParamName{kSWLocalTensorParam},
+                     .accessor_name = kSWLocalTensorParam}},
+            .compile_time_args = make_cta(is_reader),
+            .runtime_arg_schema = {.runtime_arg_names = {off_name, count_name}},
+            .hw_config = hw_config,
+            .advanced_options = {.num_runtime_varargs = num_varargs},
         };
-        k.tensor_bindings.push_back(TensorBinding{
-            .tensor_parameter_name = TensorParamName{kSWRemoteTensorParam}, .accessor_name = kSWRemoteTensorParam});
-        k.tensor_bindings.push_back(TensorBinding{
-            .tensor_parameter_name = TensorParamName{kSWLocalTensorParam}, .accessor_name = kSWLocalTensorParam});
-        k.dfb_bindings.push_back(DFBBinding{
-            .dfb_spec_name = DFBSpecName{kSWShardDfbName},
-            .accessor_name = kSWShardDfbName,
-            .endpoint_type = endpoint,
-        });
+        if (unaligned) {
+            k.compiler_options.defines.emplace("UNALIGNED", "1");
+        }
         if (use_scratch) {
             k.dfb_bindings.push_back(DFBBinding{
                 .dfb_spec_name = DFBSpecName{kSWScratchDfbName},
@@ -192,33 +212,46 @@ ttnn::device_operation::ProgramArtifacts ReshardSameWidthFactory<local_is_output
                 .endpoint_type = endpoint,
             });
         }
-        k.compile_time_args = compile_time_args;
-        if (use_scratch) {
-            k.compiler_options.defines.emplace("UNALIGNED", "1");
-        }
-        k.runtime_arg_schema.runtime_arg_names = {off_name, count_name};
-        k.advanced_options.num_runtime_varargs = num_varargs;
         return k;
     };
 
-    KernelSpec k0 = make_worker("reader", DataMovementRoleHint::READER, DFBEndpointType::PRODUCER);
-    KernelSpec k1 = make_worker("writer", DataMovementRoleHint::WRITER, DFBEndpointType::CONSUMER);
+    KernelSpec k0 = make_worker(
+        "reader",
+        ttnn::create_reader_datamovement_config(device->arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        DFBEndpointType::PRODUCER,
+        /*is_reader=*/1);
+    KernelSpec k1 = make_worker(
+        "writer",
+        ttnn::create_writer_datamovement_config(device->arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        DFBEndpointType::CONSUMER,
+        /*is_reader=*/0);
 
+    // Borrowed DFB size is checked against TensorSpec packed bytes (no Buffer at spec time), so
+    // clamp advertised bytes rather than the full padded shard. The DFB is only an address source.
+    // If packed < one padded row, shrink entry_size so num_entries stays >= 1 (ProgramSpec rejects 0).
+    const uint32_t shard_dfb_bytes = local_units_per_shard * local_unit_size_padded;
+    const uint32_t local_packed_bytes =
+        static_cast<uint32_t>(local_tensor.tensor_spec().compute_packed_buffer_size_bytes());
+    uint32_t shard_dfb_entry_size = local_unit_size_padded;
+    uint32_t shard_dfb_num_entries = std::min(shard_dfb_bytes, local_packed_bytes) / shard_dfb_entry_size;
+    if (shard_dfb_num_entries == 0 && local_packed_bytes > 0) {
+        shard_dfb_entry_size = local_packed_bytes;
+        shard_dfb_num_entries = 1;
+    }
     DataflowBufferSpec shard_dfb{
         .unique_id = DFBSpecName{kSWShardDfbName},
-        .entry_size = unit_size,
-        .num_entries = local_units_per_shard,
+        .entry_size = shard_dfb_entry_size,
+        .num_entries = shard_dfb_num_entries,
         .data_format_metadata = data_format,
         .borrowed_from = TensorParamName{kSWLocalTensorParam},
     };
-    (void)total_size;  // == entry_size * num_entries; kept for parity with the legacy CB total_size.
 
     spec.kernels = {k0, k1};
     if (use_scratch) {
         DataflowBufferSpec scratch_dfb{
             .unique_id = DFBSpecName{kSWScratchDfbName},
             .entry_size = remote_unit_size_padded,
-            .num_entries = remote_units_per_shard,
+            .num_entries = 2 * remote_units_per_shard,
             .data_format_metadata = data_format,
         };
         spec.dataflow_buffers = {shard_dfb, scratch_dfb};
@@ -240,9 +273,15 @@ ttnn::device_operation::ProgramArtifacts ReshardSameWidthFactory<local_is_output
     // ------------------------------------------------------------------
     const auto build_kernel_run_args = [&](const char* name, const std::vector<SameWidthPerNodeArgs>& per_node) {
         KernelRunArgs run_args{.kernel = KernelSpecName{name}};
+        KernelRunArgs::RuntimeArgValues& run_args_rtas = run_args.runtime_arg_values;
         for (const auto& pa : per_node) {
-            run_args.runtime_arg_values.push_back(
-                {pa.node, {{off_name, pa.local_offset}, {count_name, pa.num_transfers}}});
+            AddRuntimeArgsForNode(
+                run_args_rtas,
+                pa.node,
+                {
+                    {off_name, pa.local_offset},
+                    {count_name, pa.num_transfers},
+                });
             AdvancedKernelRunArgs::Varargs varargs(num_varargs, 0u);
             std::copy(pa.tail.begin(), pa.tail.end(), varargs.begin());
             run_args.advanced_options.runtime_varargs.emplace(pa.node, std::move(varargs));

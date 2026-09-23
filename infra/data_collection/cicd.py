@@ -3,13 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from typing import Optional
 
 from loguru import logger
 
 from infra.data_collection import pydantic_models
 from infra.data_collection.github.utils import (
     get_data_pipeline_datetime_from_datetime,
+    get_datetime_from_github_datetime,
     get_job_rows_from_github_info,
+    get_jobs_that_started_,
     get_pipeline_row_from_github_info,
 )
 from infra.data_collection.github.workflows import (
@@ -34,12 +37,26 @@ def create_cicd_json_for_data_analysis(
     github_runner_environment,
     github_pipeline_json_filename,
     github_jobs_json_filename,
-):
+) -> Optional[pydantic_models.Pipeline]:
+    """
+    Returns None when the analysed run has nothing to report, so the caller can skip the upload
+    instead of writing a pipeline row with no jobs behind it.
+    """
     with open(github_pipeline_json_filename) as github_pipeline_json_file:
         github_pipeline_json = json.load(github_pipeline_json_file)
 
     with open(github_jobs_json_filename) as github_jobs_json_file:
         github_jobs_json = json.load(github_jobs_json_file)
+
+    # A run that its concurrency group cancelled before any job started has no job logs, no test
+    # reports and no job rows, so every timing and log lookup below would fail on it. That is a
+    # normal shape for a cancelled run, not a data error, so report it and stop here.
+    if not get_jobs_that_started_(github_pipeline_json, github_jobs_json):
+        logger.info(
+            f"Pipeline {github_pipeline_json['id']} (conclusion: {github_pipeline_json['conclusion']}) has no jobs "
+            f"that started after it was submitted, so there is nothing to analyse. Skipping this pipeline."
+        )
+        return None
 
     raw_pipeline = get_pipeline_row_from_github_info(github_runner_environment, github_pipeline_json, github_jobs_json)
 
@@ -78,13 +95,16 @@ def create_cicd_json_for_data_analysis(
             logger.info(f"Job id:{github_job_id} is skipped. Skipping job upload.")
             continue
 
+        # Used as the fallback test timestamp when a report carries gtest's not-run epoch sentinel.
+        job_start_timestamp = get_datetime_from_github_datetime(raw_job["job_start_ts"])
+
         test_report_exists = github_job_id in github_job_id_to_test_reports
         if test_report_exists:
             tests = []
             test_reports = github_job_id_to_test_reports[github_job_id]
             for test_report_path in test_reports:
                 logger.info(f"Job id:{github_job_id} Analyzing test report {test_report_path}")
-                tests += get_tests_from_test_report_path(test_report_path)
+                tests += get_tests_from_test_report_path(test_report_path, job_start_timestamp)
             tests = deduplicate_tests_by_full_name(tests)
         else:
             tests = []

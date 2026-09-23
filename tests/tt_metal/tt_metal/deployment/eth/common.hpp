@@ -2,12 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#ifndef _ETH_COMMON_HPP
-#define _ETH_COMMON_HPP
+#ifndef ETH_COMMON_HPP
+#define ETH_COMMON_HPP
 
+#include <algorithm>
 #include <chrono>
 
 #include "tt_metal/tt_metal/deployment/deployment_common.hpp"
+#include "impl/program/program_impl.hpp"
 #include "tt_metal/api/tt-metalium/experimental/fabric/control_plane.hpp"
 
 #include "tt_metal/test_utils/stimulus.hpp"
@@ -20,7 +22,7 @@
     do {                                                                                      \
         double delta_ms = std::chrono::duration<double, std::milli>(NOW() - (start)).count(); \
         log_info(tt::LogTest, "      {} done in {} ms", (s), delta_ms);                       \
-        start = NOW();                                                                        \
+        (start) = NOW();                                                                      \
     } while (0)
 
 namespace tt::tt_metal {
@@ -286,7 +288,7 @@ static void wait_to_finish_eth_timeout_cores(
     }
 
     for (const auto& [dev, workload] : devices) {
-        detail::CompileProgram(dev->get_devices()[0], *programs[dev]);
+        programs[dev]->impl().compile(dev.get());
         devices[dev]->add_program(device_range, std::move(*programs[dev]));
     }
 
@@ -697,14 +699,10 @@ static bool tensix_compare_dram_banks(
 
             if (errors) {
                 uint32_t t = read_l1_u32(device, core, first_error_addr);
-                if (t < first_error) {
-                    first_error = t;
-                }
+                first_error = std::min(t, first_error);
 
                 t = read_l1_u32(device, core, last_error_addr);
-                if (t > last_error) {
-                    last_error = t;
-                }
+                last_error = std::max(t, last_error);
             }
         }
     }
@@ -728,7 +726,7 @@ static bool tensix_compare_dram_banks(
 static bool test_check_cores(std::span<struct core_setup> cores) {
     bool pass = true;
 
-    std::string prev = "";
+    std::string prev;
     for (const auto& cs : cores) {
         if (prev != cs.locinfo) {
             log_info(tt::LogTest, "core_check: {}", cs.locinfo);
@@ -746,7 +744,7 @@ static bool test_check_cores(std::span<struct core_setup> cores) {
 
 [[maybe_unused]]
 static void print_summary(std::span<struct LinkError> errors) {
-    if (!errors.size()) {
+    if (errors.empty()) {
         return;
     }
 
@@ -860,9 +858,24 @@ static std::string get_connector(IDevice* sdev, CoreCoord score) {
                 return "ExaMAX";
             }
             break;
+        default: break;
     }
 
     return "unknown";
+}
+
+// Returns true if the ethernet core connects to another chip within this cluster (i.e. it is safe to
+// call get_connected_ethernet_core on it). Cross-host cores (e.g. QSFP cables wired to another
+// Galaxy) show up as active/linked-up but live in the remote-device connection map, so calling
+// get_connected_ethernet_core on them fatals with "connects to a remote mmio device".
+[[maybe_unused]]
+static bool eth_core_connects_within_cluster(IDevice* device, const CoreCoord& logical_core) {
+    const auto& cluster = MetalContext::instance().get_cluster();
+    const auto& soc_desc = cluster.get_soc_desc(device->id());
+    EthernetChannel eth_chan = soc_desc.logical_eth_core_to_chan_map.at(logical_core);
+    const auto& within_cluster = cluster.get_ethernet_connections();
+    auto it = within_cluster.find(device->id());
+    return it != within_cluster.end() && it->second.contains(eth_chan);
 }
 
 [[maybe_unused]]
@@ -924,4 +937,4 @@ static bool ensure_links(std::span<std::shared_ptr<distributed::MeshDevice>> dev
 
 }  // namespace tt::tt_metal
 
-#endif /* _ETH_COMMON_HPP */
+#endif /* ETH_COMMON_HPP */

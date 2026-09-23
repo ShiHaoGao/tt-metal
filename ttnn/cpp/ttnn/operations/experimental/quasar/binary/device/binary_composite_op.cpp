@@ -19,13 +19,14 @@
 #include "ttnn/operations/creation/creation.hpp"
 #include "ttnn/operations/experimental/quasar/reshape_view/reshape.hpp"
 #include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
-#include "ttnn/device.hpp"
 #include <variant>
 #include <tt-metalium/sub_device_types.hpp>
 
 namespace ttnn::operations::experimental::quasar::binary {
 
 using namespace operations;
+
+namespace q = ttnn::operations::experimental::quasar::binary;
 
 // nextafter
 Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
@@ -35,13 +36,13 @@ Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::option
         Tensor eps_gt(input_a);
         {
             eps_gt = ttnn::where(
-                gt(input_a, input_b, std::nullopt, output_mem_config),
-                add(input_a, eps, std::nullopt, output_mem_config),
+                q::gt(input_a, input_b, std::nullopt, output_mem_config),
+                q::add(input_a, eps, std::nullopt, output_mem_config),
                 input_a);
         }
         result = ttnn::where(
-            lt(input_a, input_b, std::nullopt, output_mem_config),
-            subtract(input_a, eps, std::nullopt, output_mem_config),
+            q::lt(input_a, input_b, std::nullopt, output_mem_config),
+            q::subtract(input_a, eps, std::nullopt, output_mem_config),
             eps_gt);
     }
     return result;
@@ -247,7 +248,7 @@ Tensor div(
     const bool suppress_fap = fast_and_approximate_mode && input.dtype() == DataType::BFLOAT16;
     const bool effective_fap = suppress_fap ? false : fast_and_approximate_mode;
 
-    std::optional<Tensor> divided = divide(
+    std::optional<Tensor> divided = q::divide(
         input,
         value,
         std::nullopt,
@@ -371,7 +372,7 @@ Tensor div(
     const bool suppress_fap = fast_and_approximate_mode && input_dtype == DataType::BFLOAT16;
     const bool effective_fap = suppress_fap ? false : fast_and_approximate_mode;
 
-    std::optional<Tensor> divided = divide(
+    std::optional<Tensor> divided = q::divide(
         input_a,
         input_b,
         std::nullopt,
@@ -391,34 +392,33 @@ Tensor div(
 }
 
 Tensor div_no_nan(
-    const Tensor& input_a, unary::ScalarVariant value, const std::optional<MemoryConfig>& /*output_mem_config*/) {
+    const Tensor& input_a, unary::ScalarVariant value, const std::optional<MemoryConfig>& output_mem_config) {
     float value_f = std::visit([](auto v) -> float { return static_cast<float>(v); }, value);
     if (value_f == 0) {
-        return ttnn::zeros_like(input_a);
+        return ttnn::zeros_like(input_a, std::nullopt, std::nullopt, std::nullopt, output_mem_config);
     }
-    return multiply(input_a, (1.0f / value_f));
+    return q::multiply(input_a, (1.0f / value_f), std::nullopt, output_mem_config);
 }
 
 Tensor div_no_nan(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
     if (input_a.dtype() == DataType::FLOAT32 && input_b.dtype() == DataType::FLOAT32) {
         // Not using SFPU div op here since inf/nan handling is not required
-        Tensor div_result = multiply(input_a, ttnn::reciprocal(input_b), std::nullopt, output_mem_config);
+        Tensor div_result = q::multiply(input_a, ttnn::reciprocal(input_b), std::nullopt, output_mem_config);
         return ttnn::where(ttnn::eqz(input_b, output_mem_config), 0.0f, div_result);
     }
-    Tensor div_result = divide(input_a, input_b, std::nullopt, output_mem_config);
+    Tensor div_result = q::divide(input_a, input_b, std::nullopt, output_mem_config);
     return ttnn::where(ttnn::eqz(input_b, output_mem_config), 0.0f, div_result);
 }
 
-Tensor prelu(
-    const Tensor& input, unary::ScalarVariant weight, const std::optional<MemoryConfig>& /*output_mem_config*/) {
+Tensor prelu(const Tensor& input, unary::ScalarVariant weight, const std::optional<MemoryConfig>& output_mem_config) {
     float weight_f = std::visit([](auto v) -> float { return static_cast<float>(v); }, weight);
-    return ttnn::prelu_sfpu(input, weight_f);
+    return ttnn::prelu_sfpu(input, weight_f, output_mem_config);
 }
 
 Tensor prelu(
-    const Tensor& input, const std::array<float, 1>& weight, const std::optional<MemoryConfig>& /*output_mem_config*/) {
+    const Tensor& input, const std::array<float, 1>& weight, const std::optional<MemoryConfig>& output_mem_config) {
     float scalar_weight = weight[0];
-    return ttnn::prelu_sfpu(input, scalar_weight);
+    return ttnn::prelu_sfpu(input, scalar_weight, output_mem_config);
 }
 
 Tensor prelu(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
@@ -436,7 +436,7 @@ Tensor prelu(const Tensor& input_a, const Tensor& input_b, const std::optional<M
         b = ttnn::operations::experimental::quasar::reshape(input_b, ttnn::Shape(reshape));
     }
 
-    Tensor result = ttnn::where(ttnn::ltz(input_a, output_mem_config), multiply(input_a, b), input_a);
+    Tensor result = ttnn::where(ttnn::ltz(input_a, output_mem_config), q::multiply(input_a, b), input_a);
     return result;
 }
 
@@ -523,9 +523,9 @@ Tensor floor_div(
         return ttnn::where(
             ttnn::eqz(input_a, output_mem_config),
             t_nan,
-            multiply(ttnn::sign(input_a, output_mem_config), t_inf, std::nullopt, output_mem_config));
+            q::multiply(ttnn::sign(input_a, output_mem_config), t_inf, std::nullopt, output_mem_config));
     }
-    Tensor temp = multiply(input_a, (1.0f / value_f), std::nullopt, output_mem_config);
+    Tensor temp = q::multiply(input_a, (1.0f / value_f), std::nullopt, output_mem_config);
     return ttnn::floor(temp);
 }
 
@@ -534,10 +534,11 @@ Tensor floor_div(const Tensor& input_a, const Tensor& input_b, const std::option
     Tensor result = div(input_a, input_b, false, "floor", std::nullopt, output_mem_config);
     // floor(nan, inf, -inf) = nan, inf, -inf
     return ttnn::where(
-        logical_or(
-            eq(temp, std::nanf("")),
-            logical_or(
-                eq(temp, std::numeric_limits<float>::infinity()), eq(temp, -std::numeric_limits<float>::infinity()))),
+        q::logical_or(
+            q::eq(temp, std::nanf("")),
+            q::logical_or(
+                q::eq(temp, std::numeric_limits<float>::infinity()),
+                q::eq(temp, -std::numeric_limits<float>::infinity()))),
         temp,
         result);
 }
@@ -548,7 +549,7 @@ Tensor floor_div(const Tensor& input_a, const Tensor& input_b, const std::option
  * - implementation supports any 1D "squeezable tensor" at input operands
  *   by running reshape.
  */
-Tensor outer(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& /*output_mem_config*/) {
+Tensor outer(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
     const ttnn::Shape& s_a = input_a.logical_shape();
     const ttnn::Shape& s_b = input_b.logical_shape();
     auto num_ones = [](const ttnn::Shape& s) -> uint32_t {
@@ -582,31 +583,33 @@ Tensor outer(const Tensor& input_a, const Tensor& input_b, const std::optional<M
     a_slim = ttnn::operations::experimental::quasar::to_layout(a_slim, ttnn::TILE_LAYOUT);
     b_slim = ttnn::operations::experimental::quasar::to_layout(b_slim, ttnn::TILE_LAYOUT);
 
-    auto* device = ttnn::GetDefaultDevice();
+    // Take the device from the operand that is already on one, not from the process-wide default
+    // device: that default is a raw pointer nothing clears when the device it names is closed.
+    auto* device = a_slim.device() != nullptr ? a_slim.device() : b_slim.device();
     if (device != nullptr) {
-        if (a_slim.storage_type() != tt::tt_metal::StorageType::DEVICE) {
+        if (a_slim.storage_type() != ttnn::StorageType::DEVICE) {
             a_slim = a_slim.to_device(device);
         }
-        if (b_slim.storage_type() != tt::tt_metal::StorageType::DEVICE) {
+        if (b_slim.storage_type() != ttnn::StorageType::DEVICE) {
             b_slim = b_slim.to_device(device);
         }
     }
 
-    return ttnn::matmul(a_slim, b_slim);
+    return ttnn::matmul(a_slim, b_slim, /*transpose_a=*/false, /*transpose_b=*/false, output_mem_config);
 }
 
 Tensor polyval(
     const Tensor& input_a, const std::vector<float>& coeffs, const std::optional<MemoryConfig>& output_mem_config) {
     TT_ASSERT(!coeffs.empty() && "coeffs should be 1 or more coefficients");
     if (coeffs.size() == 1) {
-        return ttnn::full_like(input_a, coeffs[0]);
+        return ttnn::full_like(input_a, coeffs[0], std::nullopt, std::nullopt, std::nullopt, output_mem_config);
     }
-    Tensor result = multiply(input_a, coeffs[0], std::nullopt, output_mem_config);
+    Tensor result = q::multiply(input_a, coeffs[0], std::nullopt, output_mem_config);
     for (int idx = 1; idx < coeffs.size() - 1; idx++) {
-        result = add(result, coeffs[idx], std::nullopt, output_mem_config);
-        result = multiply(input_a, result, std::nullopt, output_mem_config);
+        result = q::add(result, coeffs[idx], std::nullopt, output_mem_config);
+        result = q::multiply(input_a, result, std::nullopt, output_mem_config);
     }
-    Tensor final_tensor = add(result, coeffs.back(), std::nullopt, output_mem_config);
+    Tensor final_tensor = q::add(result, coeffs.back(), std::nullopt, output_mem_config);
     return final_tensor;
 }
 
@@ -815,7 +818,8 @@ Tensor bias_gelu(
             device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sub_device_id.value());
     }
     return ttnn::gelu(
-        add(input_tensor_a,
+        q::add(
+            input_tensor_a,
             bias,
             std::nullopt,
             memory_config,

@@ -13,6 +13,9 @@ namespace ttml::metal::ops::mla_q_rope::device {
 struct MlaQRopeParams {
     uint32_t qk_nope_dim{};
     uint32_t qk_rope_dim{};
+    // true:  packed [B,1,S,H*D] -> head-major [B,H,S,D]  (forward)
+    // false: head-major [B,H,S,D] -> packed [B,1,S,H*D]  (backward)
+    bool packed_input{};
 };
 
 struct MlaQRopeInputs {
@@ -25,6 +28,6 @@ struct MlaQRopeInputs {
 using operation_attributes_t = MlaQRopeParams;
 using tensor_args_t = MlaQRopeInputs;
 using tensor_return_value_t = ttnn::Tensor;
-using spec_return_value_t = ttnn::TensorSpec;
+using spec_return_value_t = tt::tt_metal::TensorSpec;
 
 }  // namespace ttml::metal::ops::mla_q_rope::device

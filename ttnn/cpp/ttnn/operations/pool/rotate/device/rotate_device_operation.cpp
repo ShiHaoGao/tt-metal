@@ -68,6 +68,12 @@ void RotateDeviceOperation::validate_inputs(
     if (operation_attributes.interpolation_mode == "bilinear") {
         constexpr uint32_t MAX_TILES_PER_REDUCTION = 8;
         const uint32_t input_channels = input.padded_shape()[-1];
+        TT_FATAL(
+            input_channels % tt::constants::TILE_WIDTH == 0,
+            "Input tensor last dimension must be divisible by TILE_WIDTH ({}), but got {} in padded shape {}",
+            tt::constants::TILE_WIDTH,
+            input_channels,
+            input.padded_shape());
         const uint32_t in_ntiles_c =
             static_cast<uint32_t>(std::ceil(static_cast<float>(input_channels) / tt::constants::TILE_WIDTH));
         TT_FATAL(
@@ -99,19 +105,19 @@ RotateDeviceOperation::spec_return_value_t RotateDeviceOperation::compute_output
                 operation_attributes.memory_config.memory_layout(),
                 operation_attributes.memory_config.buffer_type(),
                 shard_spec);
-            return TensorSpec(
+            return tt::tt_metal::TensorSpec(
                 output_shape,
                 tt::tt_metal::TensorLayout(input.dtype(), tt::tt_metal::PageConfig(Layout::ROW_MAJOR), mem_config));
         }
         if (operation_attributes.memory_config.nd_shard_spec().has_value()) {
-            return TensorSpec(
+            return tt::tt_metal::TensorSpec(
                 output_shape,
                 tt::tt_metal::TensorLayout(
                     input.dtype(), tt::tt_metal::PageConfig(Layout::ROW_MAJOR), operation_attributes.memory_config));
         }
     }
 
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         output_shape,
         tt::tt_metal::TensorLayout::fromPaddedShape(
             input.dtype(),

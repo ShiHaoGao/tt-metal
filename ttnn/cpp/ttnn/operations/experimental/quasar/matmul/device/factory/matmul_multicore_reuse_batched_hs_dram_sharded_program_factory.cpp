@@ -14,6 +14,7 @@
 #include "hostdevcommon/common_values.hpp"
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/host_api.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/work_split.hpp>
 #include "ttnn/operations/eltwise/unary/common/unary_op_types.hpp"
 #include "ttnn/operations/compute_throttle_utils.hpp"
@@ -405,6 +406,7 @@ static ProgramDescriptor create_program_batch_sharded_descriptor(
         in1_writer_compile_args.push_back(bias_buffer_page_size);
         in1_writer_compile_args.push_back(bias_buffer_num_pages);
         in1_writer_compile_args.push_back(in3_block_tiles);
+        tt::tt_metal::TensorAccessorArgs(*bias_tensor).append_to(in1_writer_compile_args);
     }
 
     uint32_t in0_num_subblocks = per_core_M / out_subblock_h;
@@ -523,6 +525,7 @@ static ProgramDescriptor create_program_batch_sharded_descriptor(
     std::set<CoreCoord> worker_cores_set(all_worker_cores_ordered.begin(), all_worker_cores_ordered.end());
 
     std::vector<uint32_t> bank_ids;
+    bank_ids.reserve(all_worker_cores_ordered.size());
 
     // Idle cores in the bounding box
     for (const auto& core : all_cores_in_rect_grid_vec) {
@@ -607,7 +610,7 @@ ProgramDescriptor MatmulMultiCoreReuseBatchedHSDRAMShardedProgramFactory::create
 
     const auto& a = input_tensors.at(0).mesh_tensor();
     const auto& b = input_tensors.at(1).mesh_tensor();
-    auto bias = tt::tt_metal::as_optional_mesh_tensor(optional_input_tensors.at(0));
+    auto bias = ttnn::as_optional_mesh_tensor(optional_input_tensors.at(0));
     const auto& output = output_tensors.at(0).mesh_tensor();
     const auto& ashape = a.padded_shape();
     const auto& bshape = b.padded_shape();

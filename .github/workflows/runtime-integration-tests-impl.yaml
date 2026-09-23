@@ -19,7 +19,7 @@ on:
 
 jobs:
   load-test-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     outputs:
       matrix: ${{ steps.build-matrix.outputs.matrix }}
     env:
@@ -35,14 +35,6 @@ jobs:
           sparse-checkout-cone-mode: true
       - name: Install dependencies
         run: pip3 install PyYAML
-      - name: Verify test timeouts against budget
-        run: |
-          set -e
-          echo "Verifying that timeouts defined in tests.yaml are within the allowed limits..."
-          python3 .github/scripts/utils/verify_time_budget.py \
-            ${{ env.TESTS_YAML_PATH }} \
-            ./.github/time_budget.yaml \
-            "integration"
       - name: Build unified test matrix based on enabled SKUs
         id: build-matrix
         run: |
@@ -91,7 +83,7 @@ jobs:
           build-artifact-name: ${{ inputs.build-artifact-name }}
           wheel-artifact-name: ${{ inputs.wheel-artifact-name }}
       - name: Ensure BH links online
-        if: ${{ contains(matrix.test-group.sku, 'bh_loudbox') }}
+        if: ${{ contains(matrix.test-group.sku, 'bh_loudbox') || contains(matrix.test-group.sku, 'bh_galaxy') }}
         uses: tenstorrent/tt-metal/.github/actions/ensure-bh-links-online@main
         timeout-minutes: 10
       - name: ${{ matrix.test-group.name }}

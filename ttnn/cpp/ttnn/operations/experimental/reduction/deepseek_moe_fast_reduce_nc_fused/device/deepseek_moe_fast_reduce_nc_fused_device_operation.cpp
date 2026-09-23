@@ -103,16 +103,19 @@ void DeepseekMoEFastReduceNCFusedDeviceOperation::validate_on_program_cache_miss
         reduction_dim_size,
         num_shared_experts_val);
 
+    // One score row per input row, the padded rows of the input's last row tile excepted (they get a zero
+    // score).  Any number of row tiles is supported: the reader builds one score tile per (row tile, expert)
+    // and the compute kernel scales each output tile with its own row tile's scores.
     const uint32_t num_tokens = input_shape[-2];
     TT_FATAL(
-        (scores_shape[0] > num_tokens - tt::constants::TILE_WIDTH) && (scores_shape[0] <= num_tokens),
-        "scores dim 0 (tokens in slice = {}) must be between {} and {} for the current fused kernel",
+        (scores_shape[0] > num_tokens - tt::constants::TILE_HEIGHT) && (scores_shape[0] <= num_tokens),
+        "scores dim 0 (tokens in slice = {}) must be between {} and {} (the rows of the input's last row tile)",
         scores_shape[0],
-        num_tokens - tt::constants::TILE_WIDTH + 1,
+        num_tokens - tt::constants::TILE_HEIGHT + 1,
         num_tokens);
 }
 
-ttnn::TensorSpec DeepseekMoEFastReduceNCFusedDeviceOperation::compute_output_specs(
+tt::tt_metal::TensorSpec DeepseekMoEFastReduceNCFusedDeviceOperation::compute_output_specs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     const uint32_t reduction_dim = operation_attributes.reduce_dim;
     const tt::tt_metal::MemoryConfig& output_memory_config = operation_attributes.output_memory_config;
@@ -126,7 +129,7 @@ ttnn::TensorSpec DeepseekMoEFastReduceNCFusedDeviceOperation::compute_output_spe
     output_shape[reduction_dim] = 1;  // keepdim = true
     output_shape[split_dim] /= num_output_tensors;
 
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         output_shape,
         operations::TensorLayout(input_tensor.dtype(), tt::tt_metal::PageConfig(Layout::TILE), output_memory_config));
 }
@@ -135,7 +138,7 @@ std::vector<ttnn::Tensor> DeepseekMoEFastReduceNCFusedDeviceOperation::create_ou
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     const ttnn::Tensor& input_tensor = tensor_args.input_tensor;
 
-    const ttnn::TensorSpec& output_tensor_spec = compute_output_specs(operation_attributes, tensor_args);
+    const tt::tt_metal::TensorSpec& output_tensor_spec = compute_output_specs(operation_attributes, tensor_args);
 
     const uint32_t num_output_tensors = input_tensor.logical_shape()[-1] / operation_attributes.split_size;
     std::vector<ttnn::Tensor> output_tensors(num_output_tensors);

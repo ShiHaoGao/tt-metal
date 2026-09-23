@@ -30,15 +30,17 @@ struct MoeGroupedTopkDeviceOperation {
         bool stable_sort;
         ScoreFunc score_func;
         tt::tt_metal::MemoryConfig output_mem_config;
+        tt::tt_metal::Layout weights_layout = tt::tt_metal::Layout::TILE;
     };
 
     struct tensor_args_t {
         const Tensor& scores;
         const Tensor& bias;
         std::optional<Tensor> padding_config;
+        std::optional<Tensor> biased_scores;
     };
 
-    using spec_return_value_t = std::array<TensorSpec, 2>;
+    using spec_return_value_t = std::array<tt::tt_metal::TensorSpec, 2>;
     using tensor_return_value_t = std::array<Tensor, 2>;
 
     struct ProgramFactory {
@@ -93,6 +95,8 @@ moe_grouped_topk(
     ttnn::operations::experimental::deepseek_prefill::moe_grouped_topk::ScoreFunc score_func =
         ttnn::operations::experimental::deepseek_prefill::moe_grouped_topk::ScoreFunc::Sigmoid,
     const std::optional<tt::tt_metal::MemoryConfig>& output_mem_config = std::nullopt,
-    const std::optional<Tensor>& padding_config = std::nullopt);
+    const std::optional<Tensor>& padding_config = std::nullopt,
+    const std::optional<Tensor>& biased_scores = std::nullopt,
+    tt::tt_metal::Layout weights_layout = tt::tt_metal::Layout::TILE);
 
 }  // namespace ttnn::prim

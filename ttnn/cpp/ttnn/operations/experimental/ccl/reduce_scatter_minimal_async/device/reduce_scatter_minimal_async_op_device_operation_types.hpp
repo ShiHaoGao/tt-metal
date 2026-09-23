@@ -48,6 +48,9 @@ struct ReduceScatterMinimalAsyncParams {
     std::optional<uint32_t> num_buffers_per_channel;
     std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config;
 
+    std::optional<ttnn::MeshShape> mesh_shape;
+    std::vector<tt::tt_fabric::FabricNodeId> fabric_nodes;
+
     // Compile-time attributes drive the default program-cache reflection hash and the canonical key
     static constexpr auto attribute_names = std::forward_as_tuple(
         "dim",
@@ -63,23 +66,24 @@ struct ReduceScatterMinimalAsyncParams {
         "chunks_per_sync",
         "num_workers_per_link",
         "num_buffers_per_channel",
-        "compute_kernel_config");
+        "compute_kernel_config",
+        "mesh_shape",
+        "fabric_nodes");
     auto attribute_values() const {
-        return std::make_tuple(
-            dim,
-            num_links,
-            ring_size,
-            output_mem_config,
-            optional_intermediate_mem_config,
-            topology,
-            barrier_semaphore.has_value(),
-            using_persistent_buffers,
-            sub_device_id,
-            cluster_axis,
-            chunks_per_sync,
-            num_workers_per_link,
-            num_buffers_per_channel,
-            compute_kernel_config);
+        // Reference stored attributes; the computed presence flag must remain an owned value.
+        return std::tuple_cat(
+            std::tie(dim, num_links, ring_size, output_mem_config, optional_intermediate_mem_config, topology),
+            std::make_tuple(barrier_semaphore.has_value()),
+            std::tie(
+                using_persistent_buffers,
+                sub_device_id,
+                cluster_axis,
+                chunks_per_sync,
+                num_workers_per_link,
+                num_buffers_per_channel,
+                compute_kernel_config,
+                mesh_shape,
+                fabric_nodes));
     }
 };
 
@@ -87,6 +91,10 @@ struct ReduceScatterMinimalAsyncInputs {
     Tensor input_tensor;
     std::optional<Tensor> optional_intermediate_tensor;
     std::optional<Tensor> optional_output_tensor;
+    // Ring contiguous fast path only (Ring topology, scatter dim != 0): caller-provided persistent
+    // penult intermediate (see reduce_scatter_ring_penult_intermediate_staging_spec). When
+    // absent and the contiguous path applies, create_output_tensors allocates one and returns it at index 2.
+    std::optional<Tensor> optional_penult_intermediate_tensor;
 };
 
 }  // namespace ttnn::experimental::prim

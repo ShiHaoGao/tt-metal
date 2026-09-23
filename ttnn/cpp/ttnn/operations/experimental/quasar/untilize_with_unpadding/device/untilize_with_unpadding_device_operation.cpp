@@ -5,6 +5,8 @@
 #include "untilize_with_unpadding_device_operation.hpp"
 #include "ttnn/device_operation.hpp"
 
+#include <algorithm>
+
 #include "ttnn/tensor/tensor_utils.hpp"
 #include "ttnn/operations/data_movement/common/common.hpp"
 #include "ttnn/tensor/tensor_ops.hpp"
@@ -212,7 +214,7 @@ void UntilizeWithUnpaddingDeviceOperation::validate_on_program_cache_miss(
     }
 }
 
-TensorSpec UntilizeWithUnpaddingDeviceOperation::compute_output_specs(
+tt::tt_metal::TensorSpec UntilizeWithUnpaddingDeviceOperation::compute_output_specs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& input) {
     ttsl::SmallVector<uint32_t> out_shape;
     const auto& input_tensor_a = input;
@@ -232,7 +234,18 @@ TensorSpec UntilizeWithUnpaddingDeviceOperation::compute_output_specs(
         if (input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED) {
             const auto tile = input_tensor_a.tensor_spec().tile();
             uint32_t tile_height = tile.get_height();
-            uint32_t shard_idx0 = tt::round_up(tt::div_up(fused_height, num_cores), tile_height);
+            // Same `batch` as the sharded writer: whole padded matrices packed into one core.
+            uint32_t batch = std::max(
+                1u,
+                (shard_spec.shape[0] * shard_spec.shape[1]) /
+                    (input_tensor_a.padded_shape()[-2] * input_tensor_a.padded_shape()[-1]));
+            uint32_t shard_idx0;
+            if (batch > 1) {
+                // Writer uses out_shard_h / batch as unpadded rows per matrix.
+                shard_idx0 = batch * output_shape[-2];
+            } else {
+                shard_idx0 = tt::round_up(tt::div_up(fused_height, num_cores), tile_height);
+            }
             shard_shape = {shard_idx0, output_shape[-1]};
         } else {
             shard_shape = {fused_height, shard_spec.shape[1]};
@@ -243,10 +256,11 @@ TensorSpec UntilizeWithUnpaddingDeviceOperation::compute_output_specs(
             operation_attributes.output_mem_config.buffer_type(),
             shard_spec);
 
-        return TensorSpec(output_shape, TensorLayout(output_dtype, PageConfig(Layout::ROW_MAJOR), mem_config));
+        return tt::tt_metal::TensorSpec(
+            output_shape, TensorLayout(output_dtype, PageConfig(Layout::ROW_MAJOR), mem_config));
     }
 
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         output_shape,
         TensorLayout(output_dtype, PageConfig(Layout::ROW_MAJOR), operation_attributes.output_mem_config));
 }

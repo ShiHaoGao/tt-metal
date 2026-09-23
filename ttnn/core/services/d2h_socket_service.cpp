@@ -18,11 +18,11 @@
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
-#include <tt-metalium/data_types.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/hal.hpp>
 #include <tt-metalium/host_api.hpp>
 #include <internal/service/service_core_manager.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/memory_pin.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
 #include <tt-metalium/mesh_coord.hpp>
@@ -358,7 +358,7 @@ D2HStreamService::D2HStreamService(const std::shared_ptr<distributed::MeshDevice
         const auto& per_shard_spec = distributed_dummy.tensor_spec();
         const auto& topology = distributed_dummy.tensor_topology();
 
-        device_tensor_ = create_device_tensor(per_shard_spec, mesh_device_.get(), topology);
+        device_tensor_ = ttnn::create_device_tensor(per_shard_spec, mesh_device_.get(), topology);
         per_shard_spec_ = device_tensor_.tensor_spec();
 
         if (cfg_.composer_config.has_value()) {
@@ -621,6 +621,11 @@ D2HStreamService::D2HStreamService(
 }
 
 D2HStreamService::~D2HStreamService() {
+    // mesh_device_ is a shared_ptr, so the mesh can still be alive but already CLOSED when the last
+    // reference to this service drops. A closed mesh has cleared its command queues, released the
+    // service cores this would free, and unmapped the host FIFO window barrier() polls (untimed), so
+    // non-null is not enough to touch it -- gate on the mesh actually being open.
+    const bool device_live = mesh_device_ != nullptr && mesh_device_->is_initialized();
     try {
         stop_host_read_workers();
         if (!is_owner_) {
@@ -628,22 +633,21 @@ D2HStreamService::~D2HStreamService() {
             return;
         }
 
-        barrier();
-        signal_termination();
-
-        if (mesh_device_) {
+        if (device_live) {
+            barrier();
+            signal_termination();
             distributed::Finish(mesh_device_->mesh_command_queue());
         }
 
         auto& svc = tt::tt_metal::internal::service_core_manager();
-        if (mesh_device_) {
+        if (device_live) {
             for (const auto& [coord, core] : service_cores_) {
                 auto* d = mesh_device_->get_device(coord);
                 svc.wait_done(d, core);
             }
         }
 
-        if (mesh_device_) {
+        if (device_live) {
             for (const auto& [coord, addr] : termination_addrs_) {
                 auto* d = mesh_device_->get_device(coord);
                 svc.deallocate_l1(d, service_cores_.at(coord), addr);
@@ -677,7 +681,16 @@ D2HStreamService::~D2HStreamService() {
                 mesh_id_claimed_cores_.clear();
             }
         }
+    } catch (const std::exception& e) {
+        log_warning(tt::LogOp, "D2HStreamService: shutdown failed: {}", e.what());
+    } catch (...) {
+        log_warning(tt::LogOp, "D2HStreamService: shutdown failed with unknown exception");
+    }
 
+    // Outside the block above, and only reached by an owner: the descriptor is host state that needs
+    // no open mesh, and a leftover file makes the next service on this host read a stale manifest.
+    // It has to go even when the device-side release was skipped or threw part-way.
+    try {
         if (!descriptor_path_.empty()) {
             if (std::remove(descriptor_path_.c_str()) == 0 || errno == ENOENT) {
                 distributed::ShmResourceTracker::instance().untrack_file(descriptor_path_);
@@ -685,9 +698,9 @@ D2HStreamService::~D2HStreamService() {
             descriptor_path_.clear();
         }
     } catch (const std::exception& e) {
-        log_warning(tt::LogOp, "D2HStreamService: shutdown failed: {}", e.what());
+        log_warning(tt::LogOp, "D2HStreamService: descriptor cleanup failed: {}", e.what());
     } catch (...) {
-        log_warning(tt::LogOp, "D2HStreamService: shutdown failed with unknown exception");
+        log_warning(tt::LogOp, "D2HStreamService: descriptor cleanup failed with unknown exception");
     }
 }
 
@@ -958,7 +971,7 @@ const TensorSpec& D2HStreamService::get_per_shard_spec() const {
     return *per_shard_spec_;
 }
 
-const Tensor& D2HStreamService::get_backing_tensor() const {
+const ttnn::Tensor& D2HStreamService::get_backing_tensor() const {
     require_d2h_owner(is_owner_, "D2HStreamService::get_backing_tensor");
     return device_tensor_;
 }
@@ -1079,7 +1092,7 @@ void D2HStreamService::read_from_tensor(ttsl::Span<std::byte> bytes, ttsl::Span<
         cfg_.global_spec->layout() == Layout::ROW_MAJOR,
         "D2HStreamService::read_from_tensor(span): global_spec must be ROW_MAJOR");
 
-    Tensor host_tensor = (*mapper_)(make_zero_host_tensor(*cfg_.global_spec));
+    ttnn::Tensor host_tensor = (*mapper_)(make_zero_host_tensor(*cfg_.global_spec));
     read_from_tensor(host_tensor, metadata);
 
     const size_t per_shard_bytes = per_shard_spec_->compute_packed_buffer_size_bytes();
@@ -1092,7 +1105,7 @@ void D2HStreamService::read_from_tensor(ttsl::Span<std::byte> bytes, ttsl::Span<
     }
 
     TT_FATAL(composer_ != nullptr, "D2HStreamService::read_from_tensor: composer unavailable");
-    Tensor composed = composer_->compose(host_tensor);
+    ttnn::Tensor composed = composer_->compose(host_tensor);
 
     // View composed bytes directly; to_vector<uint8_t>() rejects non-UINT8 dtypes.
     const auto& composed_host = composed.host_storage().host_tensor();
@@ -1113,7 +1126,7 @@ void D2HStreamService::read_from_tensor(ttsl::Span<std::byte> bytes, ttsl::Span<
     std::memcpy(bytes.data(), composed_bytes.data(), bytes.size());
 }
 
-void D2HStreamService::read_from_tensor(Tensor& host_tensor, ttsl::Span<std::byte> metadata) {
+void D2HStreamService::read_from_tensor(ttnn::Tensor& host_tensor, ttsl::Span<std::byte> metadata) {
     TT_FATAL(
         tensor_enabled(),
         "D2HStreamService::read_from_tensor: no tensor configured; use read_metadata() in metadata-only mode");
@@ -1129,7 +1142,7 @@ void D2HStreamService::read_from_tensor(Tensor& host_tensor, ttsl::Span<std::byt
     }
 
     TT_FATAL(
-        host_tensor.storage_type() == StorageType::HOST,
+        host_tensor.storage_type() == ttnn::StorageType::HOST,
         "D2HStreamService::read_from_tensor: expected a preallocated host tensor");
 
     const auto& host_mesh_tensor = host_tensor.host_storage().host_tensor();

@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass
 from typing import Optional
+
+from loguru import logger
 
 import ttnn
 
@@ -31,6 +34,25 @@ CCL_NUM_BUFFERS_PER_CHANNEL = 2
 _tt_ccl_cache: dict[int, "TT_CCL"] = {}
 
 
+@dataclass(frozen=True)
+class SparseMlaOverlapResources:
+    profile: str
+    manager_id: object
+    topk_subdevice_id: ttnn.SubDeviceId
+    gather_subdevice_id: ttnn.SubDeviceId
+    topk_core_grid: ttnn.CoreRangeSet
+    gather_core_grid: ttnn.CoreRangeSet
+    ready_semaphore: object
+    data_valid_semaphore: object
+
+
+_SPARSE_MLA_OVERLAP_PROFILE_GRIDS = {
+    "galaxy_80_40": (12, 10),
+    "loudbox_80_40": (12, 10),
+    "qb2_80_30": (11, 10),
+}
+
+
 def get_tt_ccl(mesh_device: ttnn.MeshDevice) -> "TT_CCL":
     """Get or create TT_CCL for mesh_device (cached per device id)."""
     mesh_id = mesh_device.id()
@@ -40,7 +62,9 @@ def get_tt_ccl(mesh_device: ttnn.MeshDevice) -> "TT_CCL":
 
 
 def clear_tt_ccl_cache():
-    """Clear cache (for testing)."""
+    """Release registered sparse-MLA managers, then clear the cache (for testing)."""
+    for tt_ccl in _tt_ccl_cache.values():
+        tt_ccl.release_sparse_mla_overlap_manager()
     _tt_ccl_cache.clear()
 
 
@@ -113,6 +137,14 @@ class TT_CCL:
         # keeps the memory cost flat. See TtSharedExpert.forward.
         self.shared_rs_intermediate = None
 
+        # Keepalive for the shared-expert reduce_scatter INPUT (output_full). The overlapped
+        # dispatch must not reuse this buffer's DRAM slot mid-flight, so it is held until the next
+        # shared-expert forward. Stored here (one slot, shared across all layers that run
+        # sequentially) rather than on each per-layer TtSharedExpert instance — a per-instance
+        # reference would never be released (every layer object stays alive for the whole model),
+        # leaking one RS input per layer. See set_shared_rs_input_keepalive / TtSharedExpert.forward.
+        self.shared_rs_input_keepalive = None
+
         # Persistent ring-attention buffers shared by every layer's MLA, keyed by their shape
         # signature. One set for the whole model. See get_mla_ring_attention_buffers.
         self.mla_ring_attention_buffers: dict[tuple, dict] = {}
@@ -120,6 +152,125 @@ class TT_CCL:
         # Persistent chunked-prefill (ring_mla) gathered-KV scratch buffers shared by every layer's
         # MLA, keyed by shape signature. See get_mla_chunked_kv_buffer.
         self.mla_chunked_kv_buffers: dict[tuple, "ttnn.Tensor"] = {}
+
+        # Persistent full-capacity sparse-MLA KV-prefix gather buffers shared by every layer's MLA.
+        # See get_mla_sparse_kv_gather_buffer.
+        self.mla_sparse_kv_gather_buffers: dict[tuple, "ttnn.Tensor"] = {}
+
+        # Persistent TP high-bandwidth all-gather outputs shared by MLA layers.  Their sequence
+        # capacity is the fixed prefill chunk length, not the growing KV-cache length.
+        self.mla_high_bw_all_gather_buffers: dict[tuple, "ttnn.Tensor"] = {}
+
+        # Persistent ring-indexer gathered-K scratch buffers shared by every layer's DSA indexer,
+        # keyed by shape signature. See get_indexer_ring_k_buffer.
+        self.indexer_ring_k_buffers: dict[tuple, "ttnn.Tensor"] = {}
+
+        # One model-wide sparse-MLA overlap manager and external high-BW-gather semaphore pair.
+        # Full-indexer layers execute serially, so they reuse the same resources. The pair belongs
+        # exclusively to the SP KV-prefix gather branch and is never shared with the TP index gather.
+        self.sparse_mla_overlap_resources: SparseMlaOverlapResources | None = None
+
+    def get_sparse_mla_overlap_resources(self, profile: str) -> SparseMlaOverlapResources:
+        """Create or return the exact 80/40 production or 80/30 QB2 overlap profile.
+
+        Resource creation happens outside the hot forward path. Semaphore allocation is followed by a
+        mesh-wide synchronization so every participating device observes the zero initialization before
+        the first Fabric atomic increment.
+        """
+        profile = profile.lower()
+        if profile == "auto":
+            grid = self.mesh_device.compute_with_storage_grid_size()
+            profile = {
+                (11, 10): "qb2_80_30",
+                (12, 10): "loudbox_80_40",
+            }.get((grid.x, grid.y))
+            if profile is None:
+                raise ValueError(
+                    "automatic sparse MLA overlap requires an 11x10 QB2 or 12x10 "
+                    f"LoudBox/Galaxy Tensix grid, got {grid.x}x{grid.y}"
+                )
+        if profile not in _SPARSE_MLA_OVERLAP_PROFILE_GRIDS:
+            raise ValueError(
+                f"unknown sparse MLA overlap profile {profile!r}; expected one of "
+                f"{sorted(_SPARSE_MLA_OVERLAP_PROFILE_GRIDS)}"
+            )
+        existing = self.sparse_mla_overlap_resources
+        if existing is not None:
+            if existing.profile != profile:
+                raise ValueError(
+                    f"mesh already owns sparse MLA overlap profile {existing.profile!r}; "
+                    f"cannot also create {profile!r}"
+                )
+            return existing
+
+        grid = self.mesh_device.compute_with_storage_grid_size()
+        expected_grid = _SPARSE_MLA_OVERLAP_PROFILE_GRIDS[profile]
+        if (grid.x, grid.y) != expected_grid:
+            raise ValueError(
+                f"sparse MLA overlap profile {profile!r} requires a {expected_grid[0]}x{expected_grid[1]} "
+                f"Tensix grid, got {grid.x}x{grid.y}"
+            )
+
+        topk_core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 9))])
+        gather_core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(8, 0), ttnn.CoreCoord(grid.x - 1, 9))])
+        assert topk_core_grid.num_cores() == 80
+        expected_gather_cores = 40 if grid.x == 12 else 30
+        assert gather_core_grid.num_cores() == expected_gather_cores
+
+        manager_id = self.mesh_device.create_sub_device_manager(
+            [ttnn.SubDevice([topk_core_grid]), ttnn.SubDevice([gather_core_grid])],
+            0,
+        )
+        try:
+            l1_small_view = ttnn.get_memory_view(self.mesh_device, ttnn.BufferType.L1_SMALL)
+            semaphore_buffer_type = (
+                ttnn.BufferType.L1_SMALL if l1_small_view.total_bytes_per_bank > 0 else ttnn.BufferType.L1
+            )
+            ready_semaphore = ttnn.create_global_semaphore(self.mesh_device, gather_core_grid, 0, semaphore_buffer_type)
+            data_valid_semaphore = ttnn.create_global_semaphore(
+                self.mesh_device, gather_core_grid, 0, semaphore_buffer_type
+            )
+            ttnn.synchronize_device(self.mesh_device)
+        except Exception:
+            self.mesh_device.remove_sub_device_manager(manager_id)
+            raise
+
+        resources = SparseMlaOverlapResources(
+            profile=profile,
+            manager_id=manager_id,
+            topk_subdevice_id=ttnn.SubDeviceId(0),
+            gather_subdevice_id=ttnn.SubDeviceId(1),
+            topk_core_grid=topk_core_grid,
+            gather_core_grid=gather_core_grid,
+            ready_semaphore=ready_semaphore,
+            data_valid_semaphore=data_valid_semaphore,
+        )
+        self.sparse_mla_overlap_resources = resources
+        logger.info(
+            f"Sparse MLA overlap profile {profile}: top-k={topk_core_grid.num_cores()} cores, "
+            f"KV gather={gather_core_grid.num_cores()} cores"
+        )
+        return resources
+
+    def reset_sparse_mla_overlap_semaphores(self) -> None:
+        """Drain and restore caller-owned gather semaphores after an aborted overlap region."""
+        resources = self.sparse_mla_overlap_resources
+        if resources is None:
+            return
+        ttnn.synchronize_device(self.mesh_device)
+        ttnn.reset_global_semaphore_value(resources.ready_semaphore, 0)
+        ttnn.reset_global_semaphore_value(resources.data_valid_semaphore, 0)
+        ttnn.synchronize_device(self.mesh_device)
+
+    def release_sparse_mla_overlap_manager(self) -> None:
+        """Idempotently drain, reset, and unregister sparse-MLA overlap resources before mesh close."""
+        resources = self.sparse_mla_overlap_resources
+        if resources is None:
+            return
+        self.mesh_device.clear_loaded_sub_device_manager()
+        self.reset_sparse_mla_overlap_semaphores()
+        self.mesh_device.remove_sub_device_manager(resources.manager_id)
+        self.sparse_mla_overlap_resources = None
 
     def get_mla_ring_attention_buffers(
         self,
@@ -207,18 +358,85 @@ class TT_CCL:
             )
         return self.mla_chunked_kv_buffers[key]
 
-    def get_shared_rs_intermediate(self, input_tensor):
+    def get_mla_sparse_kv_gather_buffer(self, *, seq_len, row_width, dtype, layout):
+        """Return the full-capacity output scratch for sparse MLA's SP KV-prefix gather.
+
+        The sparse cache has a fixed maximum sequence length. Each layer gathers one selected cache slot
+        into this replicated batch-1 scratch, overwriting it before sparse SDPA consumes the selected
+        indices. Layers run serially, so one stable-address buffer per cache representation is sufficient
+        for the model and avoids per-prefix allocations.
+        """
+        import torch
+
+        key = (seq_len, row_width, dtype, layout)
+        if key not in self.mla_sparse_kv_gather_buffers:
+            self.mla_sparse_kv_gather_buffers[key] = ttnn.from_torch(
+                torch.zeros(1, 1, seq_len, row_width),
+                device=self.mesh_device,
+                layout=layout,
+                dtype=dtype,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+        return self.mla_sparse_kv_gather_buffers[key]
+
+    def get_mla_high_bw_all_gather_buffer(self, *, name, shape, dtype, layout):
+        """Return an MLA TP all-gather output allocated during model construction.
+
+        Layers execute serially, so one buffer for each fixed activation shape can be shared across the
+        model.  ``shape`` is the maximum (fixed) prefill chunk shape seen by the corresponding gather.
+        """
+        key = (name, tuple(shape), dtype, layout)
+        if key not in self.mla_high_bw_all_gather_buffers:
+            self.mla_high_bw_all_gather_buffers[key] = ttnn.empty(
+                shape,
+                dtype=dtype,
+                layout=layout,
+                device=self.mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        return self.mla_high_bw_all_gather_buffers[key]
+
+    def get_indexer_ring_k_buffer(self, *, local_k, sp_axis):
+        """Return the persistent full-K output buffer for the fused ring indexer.
+
+        ``local_k`` is the persistent local cache [B,1,T/sp,D]. In indexed mode the fused op gathers
+        only the selected slot over ``sp_axis`` into [1,1,T,D] while scoring arriving bands. All layers
+        execute serially and share the same index-cache geometry, so one stable-address scratch buffer
+        per shape/dtype is sufficient for the whole model instead of allocating a full gathered cache
+        per layer.
+        """
+        import torch
+
+        local_shape = tuple(local_k.shape)
+        global_seq_len = local_shape[2] * self.mesh_device.shape[sp_axis]
+        key = (global_seq_len, local_shape[3], local_k.dtype, sp_axis)
+        if key not in self.indexer_ring_k_buffers:
+            self.indexer_ring_k_buffers[key] = ttnn.from_torch(
+                torch.zeros(1, 1, global_seq_len, local_shape[3]),
+                device=self.mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=local_k.dtype,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+        return self.indexer_ring_k_buffers[key]
+
+    def get_shared_rs_intermediate(self, input_tensor, topology):
         """Lazily allocate (once per mesh) and return the shared reduce_scatter intermediate
-        accumulator. Line (Linear) topology needs a double-sized leading dim for the
-        forward/backward halves: shape = [2, *input_shape]. Interleaved DRAM, input dtype/layout,
-        replicated across the mesh. A single buffer is reused at a stable address by every
-        shared-expert reduce_scatter — all layers share the same shape and run sequentially, so one
-        buffer for the whole model is safe."""
+        accumulator. The Ring tiled path requires the persistent intermediate to have the same
+        shape, dtype, and layout as its input. The Linear path retains its double-sized leading
+        dimension for forward/backward halves. Interleaved DRAM, replicated across the mesh. A
+        single buffer is reused at a stable address by every shared-expert reduce_scatter — all
+        layers share the same shape and run sequentially, so one buffer for the whole model is safe."""
         import torch
 
         if self.shared_rs_intermediate is None:
+            intermediate_shape = list(input_tensor.shape)
+            if topology == ttnn.Topology.Linear:
+                intermediate_shape = [2] + intermediate_shape
             self.shared_rs_intermediate = ttnn.from_torch(
-                torch.zeros([2] + list(input_tensor.shape)),
+                torch.zeros(intermediate_shape),
                 device=self.mesh_device,
                 layout=input_tensor.layout,
                 dtype=input_tensor.dtype,
@@ -226,6 +444,15 @@ class TT_CCL:
                 mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
             )
         return self.shared_rs_intermediate
+
+    def set_shared_rs_input_keepalive(self, input_tensor):
+        """Hold the shared-expert reduce_scatter INPUT alive until the next shared-expert forward,
+        so the concurrent (overlapped) dispatch cannot reuse its DRAM slot mid-flight. A single slot
+        shared across all sequentially-run layers: each layer's forward overwrites it, releasing the
+        previous layer's input (its refcount drops to zero and the DRAM is freed). This must live on
+        tt_ccl (one instance for the whole model), NOT on the per-layer TtSharedExpert object — the
+        latter would pin one RS input per layer for the model's lifetime, leaking DRAM every layer."""
+        self.shared_rs_input_keepalive = input_tensor
 
     def get_and_cycle_barrier_semaphore_handle(self, cluster_axis=None):
         semaphore_index = 2 if cluster_axis is None else cluster_axis
@@ -269,6 +496,50 @@ def default_topology(mesh_device: ttnn.MeshDevice) -> Optional[ttnn.Topology]:
         # NOTE: this should be a fallback when the ring is not available
         return ttnn.Topology.Linear
     return None
+
+
+# Per-axis CCL topology. Mesh dim 0 = rows = "Y" = sp_axis; dim 1 = cols = "X" = tp_axis.
+# A torus fabric physically wraps a given axis; Ring is only valid on a wrapped axis (otherwise the
+# collective hangs forever on a wrap link the fabric does not service — get_usable_topology() keeps
+# Ring because the coords span the axis). Reading the *active* fabric config keeps the returned
+# topology consistent with whatever was opened, so a (descriptor, fabric, topology) mismatch can't
+# silently ask Ring on an unwrapped axis.
+_FABRIC_PER_AXIS_TOPOLOGY = {
+    # fabric_config: (sp_topology [dim 0 / Y], tp_topology [dim 1 / X])
+    ttnn.FabricConfig.FABRIC_2D_TORUS_X: (ttnn.Topology.Linear, ttnn.Topology.Ring),
+    ttnn.FabricConfig.FABRIC_2D_TORUS_Y: (ttnn.Topology.Ring, ttnn.Topology.Linear),
+    ttnn.FabricConfig.FABRIC_2D_TORUS_XY: (ttnn.Topology.Ring, ttnn.Topology.Ring),
+    ttnn.FabricConfig.FABRIC_1D_RING: (ttnn.Topology.Ring, ttnn.Topology.Linear),
+}
+
+
+def per_axis_topology(
+    fabric_config: Optional[ttnn.FabricConfig] = None,
+) -> tuple[ttnn.Topology, ttnn.Topology]:
+    """Return the per-axis CCL topology ``(sp_topology, tp_topology)`` for the fabric.
+
+    ``sp_topology`` drives cluster_axis=0 (rows / Y) collectives, ``tp_topology`` drives
+    cluster_axis=1 (cols / X). Ring is returned only for an axis the fabric physically wraps; every
+    other axis is Linear. When ``fabric_config`` is None the currently-active fabric is queried so
+    the result always matches the opened fabric.
+    """
+    if fabric_config is None:
+        fabric_config = ttnn.get_fabric_config()
+    mapped = _FABRIC_PER_AXIS_TOPOLOGY.get(fabric_config)
+    if mapped is not None:
+        return mapped
+    # Unknown fabric → all-Linear. If the fabric name looks ring/torus-capable, this means a wrap-
+    # capable fabric was opened but has no per-axis mapping here: collectives would silently run
+    # all-Linear (correct but no ring speedup, and a likely sign the mapping needs updating). Warn
+    # loudly rather than degrade silently.
+    name = getattr(fabric_config, "name", str(fabric_config))
+    if "TORUS" in name.upper() or "RING" in name.upper():
+        logger.warning(
+            f"per_axis_topology: fabric {name} is ring/torus-capable but has no entry in "
+            "_FABRIC_PER_AXIS_TOPOLOGY; defaulting to (Linear, Linear) so no axis will ring. "
+            "Add it to the mapping if a ring topology is intended."
+        )
+    return (ttnn.Topology.Linear, ttnn.Topology.Linear)
 
 
 # =============================================================================

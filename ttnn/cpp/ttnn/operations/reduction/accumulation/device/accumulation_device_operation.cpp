@@ -89,7 +89,7 @@ AccumulationDeviceOperation::spec_return_value_t AccumulationDeviceOperation::co
             : ((attributes.dtype == DataType::INVALID) ? tensor_args.input_tensor.dtype() : attributes.dtype);
 
     const auto output_shape{tensor_args.input_tensor.logical_shape()};
-    return TensorSpec{output_shape, TensorLayout{dtype, output_layout, attributes.output_memory_config}};
+    return tt::tt_metal::TensorSpec{output_shape, TensorLayout{dtype, output_layout, attributes.output_memory_config}};
 }
 
 AccumulationDeviceOperation::tensor_return_value_t AccumulationDeviceOperation::create_output_tensors(
@@ -109,7 +109,8 @@ ttnn::Tensor accumulation(
     const bool& reverse_order,
     std::optional<Tensor> optional_out,
     const std::optional<MemoryConfig>& memory_config,
-    AccumulationOp op) {
+    AccumulationOp op,
+    bool disable_compensation) {
     using OperationType = AccumulationDeviceOperation;
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
@@ -120,7 +121,8 @@ ttnn::Tensor accumulation(
                 ? *memory_config
                 : (optional_out.has_value() ? optional_out->memory_config() : input_tensor.memory_config()),
             reverse_order,
-            op},
+            op,
+            disable_compensation},
         OperationType::tensor_args_t{input_tensor, std::move(optional_out)});
 }
 

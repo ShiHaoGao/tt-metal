@@ -11,6 +11,7 @@
 #include "ckernel_sfpu_recip.h"
 
 #include "ckernel_sfpu_piecewise_rational.h"
+#include "cmath_common.h"
 
 namespace ckernel::sfpu {
 
@@ -89,8 +90,8 @@ inline void calculate_digamma() {
             sfpi::vFloat bern = sfpi::vFloat(0.0833333333f) - inv_x2 * sfpi::vFloat(0.0083333333f);
             result = _calculate_log_body_no_init_(x) - inv_x * sfpi::vFloat(0.5f) - inv_x2 * bern;
             // digamma(+inf) = +inf; the log approximation clamps inf to a finite value, so
-            // restore it explicitly (exp field all-ones, zero mantissa => infinity).
-            v_if(sfpi::exexp(x) == 128 && sfpi::exman(x) == 0) { result = std::numeric_limits<float>::infinity(); }
+            // restore it explicitly.
+            v_if(sfpi::is_inf(x)) { result = std::numeric_limits<float>::infinity(); }
             v_endif;
         }
         v_endif;
@@ -102,6 +103,7 @@ inline void calculate_digamma() {
 
 template <bool APPROXIMATION_MODE>
 void digamma_init() {
+    math::reset_counters(p_setrwc::SET_ABD_F);
     // sfpu_reciprocal_init programs vConstFloatPrgm0/1/2 with the reciprocal's Newton seed;
     // all three stay reserved for it, so digamma must not repurpose Prgm1/Prgm2.
     sfpu_reciprocal_init();

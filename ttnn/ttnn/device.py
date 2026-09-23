@@ -74,6 +74,7 @@ def close_device(device: "ttnn.device.Device"):
 
 
 synchronize_device = ttnn._ttnn.device.synchronize_device
+is_trace_capture_active = ttnn._ttnn.device.is_trace_capture_active
 SetRootDir = ttnn._ttnn.device.SetRootDir
 GetDefaultDevice = ttnn._ttnn.device.GetDefaultDevice
 SetDefaultDevice = ttnn._ttnn.device.SetDefaultDevice
@@ -228,12 +229,14 @@ SubDeviceManagerId = ttnn._ttnn.device.SubDeviceManagerId
 
 # Real-time profiler callbacks (experimental)
 ProgramRealtimeRecord = ttnn._ttnn.device.ProgramRealtimeRecord
+ProgramRealtimeRecordBatch = ttnn._ttnn.device.ProgramRealtimeRecordBatch
 RegisterProgramRealtimeProfilerCallback = ttnn._ttnn.device.RegisterProgramRealtimeProfilerCallback
 UnregisterProgramRealtimeProfilerCallback = ttnn._ttnn.device.UnregisterProgramRealtimeProfilerCallback
 IsProgramRealtimeProfilerActive = ttnn._ttnn.device.IsProgramRealtimeProfilerActive
 
 __all__ = [
     "ProgramRealtimeRecord",
+    "ProgramRealtimeRecordBatch",
     "RegisterProgramRealtimeProfilerCallback",
     "UnregisterProgramRealtimeProfilerCallback",
     "IsProgramRealtimeProfilerActive",

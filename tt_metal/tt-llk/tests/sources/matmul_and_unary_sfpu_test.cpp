@@ -53,7 +53,11 @@ void run_kernel(RUNTIME_PARAMETERS params)
     _llk_unpack_reconfig_data_format_srca_impl_<is_fp32_dest_acc_en, p_dim_stride_target::IGNORE, false>(
         formats_array[run].unpack_A_src, formats_array[run].unpack_A_dst, TILE_SIZE_PACK);
     _llk_unpack_A_init_<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, unpack_to_dest>(
-        0, 0, FACE_R_DIM, 4, formats_array[run].unpack_A_src, formats_array[run].unpack_A_dst);
+        0 /* transpose_of_faces */,
+        0 /* within_face_16x16_transpose */,
+        ckernel::DEFAULT_TENSOR_SHAPE,
+        formats_array[run].unpack_A_src,
+        formats_array[run].unpack_A_dst);
     _llk_unpack_A_<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, unpack_to_dest>(
         L1_ADDRESS(buffer_A_tilized), formats_array[run].unpack_A_src, formats_array[run].unpack_A_dst);
 }
@@ -84,6 +88,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
     _llk_math_wait_for_dest_available_<DstSync::SyncHalf>();
     _llk_math_matmul_<MATH_FIDELITY>(0);
     _llk_math_dest_section_done_<DstSync::SyncHalf, is_fp32_dest_acc_en>();
+    _llk_math_matmul_uninit_();
 
     // Start of second math kernel to perform matmul on now tilized input data
     run = 1; // second L1-to-L1 run, we access the second set of formats_array in our array

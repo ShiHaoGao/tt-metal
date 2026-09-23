@@ -11,6 +11,8 @@
 #include <tt-metalium/circular_buffer_constants.h>
 #include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/mesh_coord.hpp>
+#include <tt-metalium/experimental/blaze/named_kernel_args.hpp>
+#include <internal/reload_table.hpp>
 #include <tt_stl/small_vector.hpp>
 
 #include <functional>
@@ -104,6 +106,8 @@ struct ComputeConfigDescriptor {
     UnpackToDestModes unpack_to_dest_mode;
     bool bfp8_pack_precise = false;
     bool math_approx_mode = false;
+    // See ComputeConfig::enable_trisc2_rvv.
+    bool enable_trisc2_rvv = false;
 };
 
 // Declares that a specific per-core runtime arg position holds a buffer base address
@@ -151,6 +155,8 @@ struct KernelDescriptor {
     // runtime args for that core
     RuntimeArgs runtime_args;
     CommonRuntimeArgs common_runtime_args;
+    // EXPERIMENTAL: named kernel args
+    experimental::blaze::NamedKernelArgs blaze_named_args;
 
     std::optional<KernelBuildOptLevel> opt_level = std::nullopt;
 
@@ -218,6 +224,8 @@ struct ProgramDescriptor {
     SemaphoreDescriptors semaphores;
     CBDescriptors cbs;
     std::optional<std::uint64_t> custom_program_hash;
+    // Blaze-only internal runtime binary reload; std::nullopt when the program does not reload.
+    std::optional<internal::ReloadTable> reload_table;
 
     std::optional<uint32_t> find_available_semaphore_id(const CoreCoord& core, CoreType core_type) const;
 };
