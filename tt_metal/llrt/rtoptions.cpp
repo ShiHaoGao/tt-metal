@@ -302,7 +302,23 @@ bool equals_all(const std::string& token) { return to_lower_copy(trim_copy(token
 
 }  // namespace
 
-RunTimeOptions::RunTimeOptions() : system_kernel_dir("/usr/share/tenstorrent/kernels/") {
+RunTimeOptions::RunTimeOptions() : RunTimeOptions(std::nullopt) {}
+
+RunTimeOptions::RunTimeOptions(std::optional<tt_metal::DeviceProfilerMode> profiler_mode)
+    : system_kernel_dir("/usr/share/tenstorrent/kernels/") {
+    if (profiler_mode) {
+        switch (*profiler_mode) {
+            case tt_metal::DeviceProfilerMode::Disabled: break;
+            case tt_metal::DeviceProfilerMode::Program:
+#if !defined(TRACY_ENABLE)
+                TT_THROW("Program device profiler deployment requires a Tracy-enabled build of tt-metal.");
+#else
+                profiler_enabled = true;
+#endif
+                break;
+            default: TT_THROW("Invalid device profiler deployment mode.");
+        }
+    }
 // Default assume package install path
 #ifdef TT_METAL_INSTALL_ROOT
     if (std::filesystem::is_directory(std::filesystem::path(TT_METAL_INSTALL_ROOT))) {
@@ -352,6 +368,9 @@ RunTimeOptions::RunTimeOptions() : system_kernel_dir("/usr/share/tenstorrent/ker
     }
 
     InitializeFromEnvVars();
+    if (profiler_mode) {
+        validate_device_profiler_mode(*profiler_mode);
+    }
 
     if (this->runtime_target_device_ != tt::TargetDevice::Silicon) {
         log_info(tt::LogMetal, "Disabling multi-erisc mode with simulator/mock target device");
@@ -361,6 +380,27 @@ RunTimeOptions::RunTimeOptions() : system_kernel_dir("/usr/share/tenstorrent/ker
     TT_FATAL(
         !(get_feature_enabled(RunTimeDebugFeatureDprint) && get_profiler_enabled()),
         "Cannot enable both debug printing and profiling");
+}
+
+void RunTimeOptions::validate_device_profiler_mode(tt_metal::DeviceProfilerMode mode) const {
+    switch (mode) {
+        case tt_metal::DeviceProfilerMode::Disabled:
+            TT_FATAL(!profiler_enabled, "Existing device profiler deployment differs from requested Disabled mode.");
+            return;
+        case tt_metal::DeviceProfilerMode::Program:
+            TT_FATAL(profiler_enabled, "Existing device profiler deployment differs from requested Program mode.");
+            TT_FATAL(
+                !profile_dispatch_cores && !profiler_sync_enabled && !profiler_trace_profiler &&
+                    !profiler_trace_tracking && !profiler_mid_run_dump && !profiler_sum &&
+                    !profiler_noc_events_enabled && profiler_perf_counter_mode == 0 &&
+                    !experimental_noc_debug_dump_enabled,
+                "Program device profiler deployment conflicts with another profiler protocol.");
+            TT_FATAL(
+                !get_feature_enabled(RunTimeDebugFeatureDprint) && !get_watcher_enabled(),
+                "Program device profiler deployment conflicts with DPRINT or Watcher.");
+            return;
+        default: TT_THROW("Invalid device profiler deployment mode.");
+    }
 }
 
 RunTimeOptions::RunTimeOptions(ExplicitBuildOptions options)

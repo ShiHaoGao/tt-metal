@@ -30,6 +30,7 @@
 #include <umd/device/types/xy_pair.hpp>
 #include <umd/device/types/core_coordinates.hpp>
 #include <tt-metalium/experimental/fabric/fabric_types.hpp>
+#include <tt-metalium/experimental/context/device_profiler_config.hpp>
 #include "tt_metal/hw/inc/hostdev/fabric_telemetry_msgs.h"
 
 // Forward declarations — full definitions not needed in this header
@@ -397,6 +398,7 @@ public:
     };
 
     RunTimeOptions();
+    explicit RunTimeOptions(std::optional<tt_metal::DeviceProfilerMode> profiler_mode);
     // Construct the subset of runtime options needed by offline compilation
     // without consulting process environment variables, the current working
     // directory, or the process-global root override.  This is the only
@@ -625,6 +627,8 @@ public:
     void set_test_mode_enabled(bool enable) { test_mode_enabled.store(enable, std::memory_order_relaxed); }
 
     bool get_profiler_enabled() const { return profiler_enabled; }
+    // Check an immutable deployment request without changing a live environment.
+    void validate_device_profiler_mode(tt_metal::DeviceProfilerMode mode) const;
     bool get_profiler_do_dispatch_cores() const { return profile_dispatch_cores; }
     bool get_profiler_sync_enabled() const { return profiler_sync_enabled; }
     bool get_profiler_trace_only() const { return profiler_trace_profiler; }

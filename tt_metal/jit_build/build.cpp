@@ -524,11 +524,14 @@ void JitBuildState::compile_one(const string& out_dir, const JitBuildSettings* s
         defines += fmt::format(R"(-DFULL_KERNEL_NAME="\"{}\"" )", settings->get_full_kernel_name());
 
         // Append user args
-        if (process_defines_at_compile_) {
-            settings->process_defines([&defines](const string& define, const string& value) {
+        // firmware_common.h includes device_print.h before chlkc_* and its
+        // defines_generated.h. This SDK header switch must reach the first
+        // inclusion; all other compute user defines retain their late scope.
+        settings->process_defines([&defines, this](const string& define, const string& value) {
+            if (process_defines_at_compile_ || define == "DEBUG_PRINT_ENABLED") {
                 defines += fmt::format("-D{}='{}' ", define, value);
-            });
-        }
+            }
+        });
 
         settings->process_compile_time_args([&defines](const std::vector<uint32_t>& values) {
             if (values.empty()) {
@@ -848,9 +851,11 @@ tt::jit_build::TargetRecipe JitBuildState::export_target_recipe(const JitBuildSe
 
     // Build defines: start with build-state base, then enrich with kernel-specific defines.
     std::vector<std::string> defines = tt::jit_build::utils::tokenize_flags(defines_);
-    if (settings && process_defines_at_compile_) {
-        settings->process_defines([&defines](const std::string& define, const std::string& value) {
-            defines.push_back(fmt::format("-D{}={}", define, value));
+    if (settings) {
+        settings->process_defines([&defines, this](const std::string& define, const std::string& value) {
+            if (process_defines_at_compile_ || define == "DEBUG_PRINT_ENABLED") {
+                defines.push_back(fmt::format("-D{}={}", define, value));
+            }
         });
     }
     if (settings) {

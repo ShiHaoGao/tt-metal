@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <umd/device/types/arch.hpp>
+#include <tt-metalium/experimental/context/device_profiler_config.hpp>
 #include <tt-metalium/experimental/fabric/fabric_types.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/sub_device.hpp>
@@ -54,10 +55,14 @@ public:
     bool is_mock_device() const { return mock_cluster_desc_path_.has_value(); }
     const std::string& mock_cluster_desc_path() const { return *mock_cluster_desc_path_; }
     const FabricConfigDescriptor& fabric_config_descriptor() const { return fabric_config_desc_; }
+    std::optional<DeviceProfilerMode> device_profiler_mode() const { return device_profiler_mode_; }
+    void set_device_profiler_mode(DeviceProfilerMode mode) { device_profiler_mode_ = mode; }
 
 protected:
     std::optional<std::string> mock_cluster_desc_path_ = std::nullopt;
     FabricConfigDescriptor fabric_config_desc_;
+    // Absence preserves the existing environment-driven SDK behavior.
+    std::optional<DeviceProfilerMode> device_profiler_mode_;
 };
 
 class MetalEnvImpl;

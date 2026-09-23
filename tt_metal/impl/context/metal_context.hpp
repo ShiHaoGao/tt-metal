@@ -64,6 +64,9 @@ public:
     // The context can be created beforehand using MetalContext::create_instance(). Otherwise an exception is thrown.
     // NOTE: To maintain legacy behavior, the default context id is automatically created if not already initialized
     static MetalContext& instance(ContextId context_id = DEFAULT_CONTEXT_ID);
+    // Resolve exactly this context with an immutable profiler deployment. Only
+    // a missing default context can be created; a live context is never mutated.
+    static MetalContext& instance(ContextId context_id, DeviceProfilerMode profiler_mode);
 
     // Create a MetalContext instance which will use the given MetalEnv to facilitate runtime.
     static ContextId create_instance(MetalEnv& env_to_use);
@@ -195,7 +198,8 @@ private:
     // This will create a MetalContext instance and create a default MetalEnv owned by the context.
     // Usually the MetalEnv is owned by the user, but in this case of legacy behaviour, the context will own it.
     // Caller holds the g_instance mutex.
-    static ContextId create_default_instance_implicit_locked();
+    static ContextId create_default_instance_implicit_locked(
+        std::optional<DeviceProfilerMode> profiler_mode = std::nullopt);
 
     // Register handlers -- caller already holds the instance lock
     static void register_handlers_locked();

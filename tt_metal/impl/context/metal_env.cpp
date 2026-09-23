@@ -160,7 +160,7 @@ bool should_enable_blackhole_dram_programmable_cores(const Cluster& cluster) {
 }  // namespace
 
 void MetalEnvImpl::initialize_base_objects() {
-    this->rtoptions_ = std::make_unique<llrt::RunTimeOptions>();
+    this->rtoptions_ = std::make_unique<llrt::RunTimeOptions>(descriptor_.device_profiler_mode());
 
     if (descriptor_.is_mock_device()) {
         log_info(tt::LogMetal, "Using programmatically configured mock mode: {}", descriptor_.mock_cluster_desc_path());
@@ -197,6 +197,9 @@ void MetalEnvImpl::initialize_base_objects() {
         should_enable_blackhole_dram_programmable_cores(*this->cluster_));
 
     this->rtoptions_->ParseAllFeatureEnv(*hal_);
+    if (const auto profiler_mode = descriptor_.device_profiler_mode()) {
+        this->rtoptions_->validate_device_profiler_mode(*profiler_mode);
+    }
     this->cluster_->set_hal(hal_.get());
 }
 

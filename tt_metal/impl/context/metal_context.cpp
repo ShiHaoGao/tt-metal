@@ -421,7 +421,30 @@ MetalContext& MetalContext::instance(ContextId context_id) {
     return *instance;
 }
 
-ContextId MetalContext::create_default_instance_implicit_locked() {
+MetalContext& MetalContext::instance(ContextId context_id, DeviceProfilerMode profiler_mode) {
+    check_context_id(context_id);
+    // Reject invalid input before creating the environment or physical cluster.
+    TT_FATAL(
+        profiler_mode == DeviceProfilerMode::Disabled || profiler_mode == DeviceProfilerMode::Program,
+        "Invalid device profiler deployment mode.");
+    std::lock_guard lock(g_instance_mutex);
+    MetalContext* instance = g_instances[context_id.get()].load(std::memory_order_acquire);
+    if (!instance) {
+        TT_FATAL(
+            context_id == DEFAULT_CONTEXT_ID,
+            "No MetalContext instance for context_id {}. Create one via create_instance().",
+            context_id);
+        // Unlike the legacy overload, an explicit deployment request must not
+        // fall back to an unrelated non-default context.
+        create_default_instance_implicit_locked(profiler_mode);
+        register_handlers_locked();
+        instance = g_instances[context_id.get()].load(std::memory_order_acquire);
+    }
+    instance->rtoptions().validate_device_profiler_mode(profiler_mode);
+    return *instance;
+}
+
+ContextId MetalContext::create_default_instance_implicit_locked(std::optional<DeviceProfilerMode> profiler_mode) {
     if (g_instances[DEFAULT_CONTEXT_ID.get()].load(std::memory_order_acquire) != nullptr) {
         TT_THROW("Only one silicon MetalContext instance may exist; context_id 0 is already in use.");
     }
@@ -430,6 +453,9 @@ ContextId MetalContext::create_default_instance_implicit_locked() {
     if (auto mock_cluster_desc = experimental::get_mock_cluster_desc()) {
         log_info(tt::LogMetal, "Using programmatically configured mock mode: {}", *mock_cluster_desc);
         desc = MetalEnvDescriptor(*mock_cluster_desc);
+    }
+    if (profiler_mode) {
+        desc.set_device_profiler_mode(*profiler_mode);
     }
     g_default_env = new MetalEnv(std::move(desc));
     MetalContext* instance = new MetalContext(DEFAULT_CONTEXT_ID, *g_default_env);

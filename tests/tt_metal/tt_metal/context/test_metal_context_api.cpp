@@ -14,8 +14,125 @@
 #include "impl/context/metal_context.hpp"
 #include "tt_cluster.hpp"
 #include "impl/device/mock_device_util.hpp"
+#include <tt-metalium/experimental/context/device_profiler_config.hpp>
+#include <tt-metalium/experimental/mock_device/mock_device.hpp>
 
 namespace tt::tt_metal {
+
+namespace {
+class ScopedProfilerEnvironment {
+public:
+    ScopedProfilerEnvironment() {
+        for (const char* name : {
+                 "TT_METAL_DEVICE_PROFILER", "TT_METAL_DEVICE_PROFILER_DISPATCH", "TT_METAL_PROFILER_SYNC",
+                 "TT_METAL_TRACE_PROFILER", "TT_METAL_PROFILER_TRACE_TRACKING", "TT_METAL_PROFILER_MID_RUN_DUMP",
+                 "TT_METAL_PROFILER_SUM", "TT_METAL_DEVICE_PROFILER_NOC_EVENTS", "TT_METAL_PROFILE_PERF_COUNTERS",
+                 "TT_METAL_NOC_DEBUG_DUMP", "TT_METAL_WATCHER", "TT_METAL_DPRINT_CORES"}) {
+            const char* value = std::getenv(name);
+            values.emplace_back(name, value ? std::optional<std::string>(value) : std::nullopt);
+            unsetenv(name);
+        }
+    }
+    ~ScopedProfilerEnvironment() {
+        for (const auto& [name, value] : values) {
+            if (value) {
+                setenv(name.c_str(), value->c_str(), 1);
+            } else {
+                unsetenv(name.c_str());
+            }
+        }
+    }
+
+private:
+    std::vector<std::pair<std::string, std::optional<std::string>>> values;
+};
+}  // namespace
+
+// These tests use options or mock topology only. They must never open silicon.
+class DeviceProfilerDeploymentTest : public ::testing::Test {
+protected:
+    void TearDown() override {
+        MetalContext::destroy_all_instances();
+        experimental::disable_mock_mode();
+    }
+    ScopedProfilerEnvironment environment;
+};
+
+TEST_F(DeviceProfilerDeploymentTest, ExplicitOptionsRespectBuildCapabilityWithoutEnvironment) {
+    const llrt::RunTimeOptions disabled(DeviceProfilerMode::Disabled);
+    EXPECT_FALSE(disabled.get_profiler_enabled());
+#if defined(TRACY_ENABLE)
+    const llrt::RunTimeOptions program(DeviceProfilerMode::Program);
+    EXPECT_TRUE(program.get_profiler_enabled());
+    EXPECT_FALSE(program.get_profiler_trace_only());
+    EXPECT_FALSE(program.get_profiler_noc_events_enabled());
+    EXPECT_FALSE(program.get_experimental_noc_debug_dump_enabled());
+#else
+    EXPECT_THROW(llrt::RunTimeOptions{DeviceProfilerMode::Program}, std::runtime_error);
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+#endif
+    EXPECT_EQ(std::getenv("TT_METAL_DEVICE_PROFILER"), nullptr);
+}
+
+TEST_F(DeviceProfilerDeploymentTest, ExplicitOptionsRejectConflictingProfilerProtocol) {
+    for (const char* name : {"TT_METAL_TRACE_PROFILER", "TT_METAL_PROFILER_SUM",
+                             "TT_METAL_DEVICE_PROFILER_NOC_EVENTS", "TT_METAL_PROFILER_MID_RUN_DUMP"}) {
+        SCOPED_TRACE(name);
+        setenv(name, "1", 1);
+        EXPECT_THROW(llrt::RunTimeOptions{DeviceProfilerMode::Program}, std::runtime_error);
+        unsetenv(name);
+    }
+    setenv("TT_METAL_DEVICE_PROFILER", "1", 1);
+    EXPECT_THROW(llrt::RunTimeOptions{DeviceProfilerMode::Disabled}, std::runtime_error);
+    // The existing environment-driven SDK constructor is unchanged.
+#if defined(TRACY_ENABLE)
+    const llrt::RunTimeOptions legacy;
+    EXPECT_TRUE(legacy.get_profiler_enabled());
+#else
+    EXPECT_THROW(llrt::RunTimeOptions{}, std::runtime_error);
+#endif
+}
+
+TEST_F(DeviceProfilerDeploymentTest, InvalidModeAndMissingContextDoNotCreateDefaultContext) {
+    const auto invalid = static_cast<DeviceProfilerMode>(255);
+    EXPECT_THROW(llrt::RunTimeOptions{invalid}, std::runtime_error);
+    EXPECT_THROW(MetalContext::instance(DEFAULT_CONTEXT_ID, invalid), std::runtime_error);
+    EXPECT_THROW(MetalContext::instance(ContextId{1}, DeviceProfilerMode::Program), std::runtime_error);
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+}
+
+TEST_F(DeviceProfilerDeploymentTest, DefaultMockContextEnforcesBuildCapabilityBeforeConstruction) {
+    experimental::configure_mock_mode(tt::ARCH::BLACKHOLE, 1);
+#if defined(TRACY_ENABLE)
+    auto& context = MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Program);
+    EXPECT_TRUE(context.rtoptions().get_mock_enabled());
+    EXPECT_TRUE(context.rtoptions().get_profiler_enabled());
+    EXPECT_EQ(&context, &MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Program));
+    EXPECT_THROW(MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Disabled), std::runtime_error);
+    EXPECT_TRUE(context.rtoptions().get_profiler_enabled());
+#else
+    EXPECT_THROW(MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Program), std::runtime_error);
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+    auto& context = MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Disabled);
+    EXPECT_TRUE(context.rtoptions().get_mock_enabled());
+    EXPECT_FALSE(context.rtoptions().get_profiler_enabled());
+    EXPECT_EQ(&context, &MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Disabled));
+#endif
+}
+
+TEST_F(DeviceProfilerDeploymentTest, ExactMockContextIsReusedWithoutModeMutation) {
+    MetalEnvDescriptor descriptor(experimental::get_mock_cluster_desc_name(tt::ARCH::BLACKHOLE, 1).value());
+    descriptor.set_device_profiler_mode(DeviceProfilerMode::Disabled);
+    MetalEnv environment(std::move(descriptor));
+    const auto id = MetalContext::create_instance(environment);
+    auto& context = MetalContext::instance(id, DeviceProfilerMode::Disabled);
+    EXPECT_EQ(context.get_context_id(), id);
+    EXPECT_FALSE(context.rtoptions().get_profiler_enabled());
+    EXPECT_THROW(MetalContext::instance(id, DeviceProfilerMode::Program), std::runtime_error);
+    EXPECT_FALSE(context.rtoptions().get_profiler_enabled());
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+    MetalContext::destroy_instance(false, id);
+}
 
 class MetalContextTest : public ::testing::Test {
 protected:
