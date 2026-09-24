@@ -63,6 +63,11 @@ struct OfflineKernelCompileParams {
         ARCH arch = ARCH::Invalid;
         std::string core_descriptor;
         std::string soc_descriptor;
+        /// When specified, compile only configurations with this exact DRAM
+        /// bank count. Native bodies can seal address geometry against this
+        /// value; a descriptor may enumerate multiple harvesting variants.
+        /// Reject an unmatched requirement before building any kernel.
+        std::optional<size_t> num_dram_banks;
     };
 
     /// Offline compile target-selection mode.

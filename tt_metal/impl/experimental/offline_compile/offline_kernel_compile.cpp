@@ -314,11 +314,20 @@ void CompileKernelOffline(
                 const std::filesystem::path root = params.environment
                     ? params.environment->root_dir
                     : std::filesystem::path(rtoptions.get_root_dir());
+                bool matched = false;
                 enumerate_jit_device_configs(
                     mode.arch,
                     (root / "tt_metal" / "core_descriptors" / mode.core_descriptor).string(),
                     (root / "tt_metal" / "soc_descriptors" / mode.soc_descriptor).string(),
-                    compile_one);
+                    [&](const JitDeviceConfig& candidate) {
+                        if (mode.num_dram_banks && candidate.num_dram_banks != *mode.num_dram_banks)
+                            return;
+                        matched = true;
+                        compile_one(candidate);
+                    });
+                if (!matched)
+                    throw std::invalid_argument(
+                        "OfflineKernelCompileParams::ExplicitProduct has no matching device configuration");
             } else {
                 static_assert(std::is_same_v<ModeT, OfflineKernelCompileParams::AllSupportedProducts>,
                               "Unhandled OfflineKernelCompileParams::Mode alternative");
