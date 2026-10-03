@@ -68,7 +68,11 @@ Tile::Tile(std::array<uint32_t, 2> tile_shape, bool transpose_tile) : tile_shape
 }
 
 uint32_t Tile::get_tile_size(const DataFormat& format) const {
-    uint32_t l1_alignment = MetalContext::instance().hal().get_alignment(HalMemType::L1);
+    return get_tile_size(format, MetalContext::instance().hal().get_alignment(HalMemType::L1));
+}
+
+uint32_t Tile::get_tile_size(const DataFormat& format, uint32_t l1_alignment) const {
+    TT_FATAL(l1_alignment != 0, "Tile L1 alignment must be nonzero");
     uint32_t aligned_exp_size = tt::round_up(face_shape[0] * num_faces, l1_alignment);
     switch (format) {
         case DataFormat::Bfp2:

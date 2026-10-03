@@ -222,6 +222,7 @@ set(HW_JIT_API_HEADERS
     inc/api/tensor/noc_traits.h
     inc/hostdev/debug_ring_buffer_common.h
     inc/hostdev/dev_msgs.h
+    inc/hostdev/worker_stream_state_contract.h
     inc/hostdev/device_print_common.h
     inc/hostdev/device_print_structures.h
     inc/hostdev/fabric_telemetry_msgs.h
@@ -272,6 +273,7 @@ set(HW_JIT_API_HEADERS
     inc/internal/tensor/helpers.h
     inc/internal/tt-1xx/cache.h
     inc/internal/tt-1xx/blackhole/c_tensix_core.h
+    inc/internal/tt-1xx/blackhole/dst_initialization.h
     inc/internal/tt-1xx/blackhole/cfg_defines.h
     inc/internal/tt-1xx/blackhole/core_config.h
     inc/internal/tt-1xx/blackhole/dev_mem_map.h

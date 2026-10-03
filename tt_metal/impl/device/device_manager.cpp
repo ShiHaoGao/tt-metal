@@ -192,6 +192,7 @@ void DeviceManager::initialize(
     bool init_profiler,
     bool initialize_fabric_and_dispatch_fw,
     const std::shared_ptr<ContextDescriptor>& descriptor) {
+    ctx_.validate_worker_stream_state_access();
     ZoneScoped;
     log_debug(tt::LogMetal, "DeviceManager initialize");
 
@@ -461,6 +462,7 @@ void DeviceManager::add_devices_to_pool(const std::vector<ChipId>& device_ids) {
 }
 
 void DeviceManager::initialize_profiler() {
+    ctx_.validate_worker_stream_state_access();
     auto active_devices = this->get_all_active_devices_impl();
     initializers_[ProfilerInitializer::key] =
         std::make_unique<ProfilerInitializer>(descriptor_, skip_remote_devices_, ctx_.profiler_state_manager().get());
@@ -470,6 +472,7 @@ void DeviceManager::initialize_profiler() {
 }
 
 void DeviceManager::initialize_fabric_and_dispatch_fw() {
+    ctx_.validate_worker_stream_state_access();
     if (using_fast_dispatch_ && env_impl_.get_cluster().is_galaxy_cluster()) {
         log_info(
             tt::LogMetal, "Initializing Fabric and Dispatch Firmware for Galaxy cluster (this may take a few minutes)");
@@ -492,11 +495,13 @@ void DeviceManager::initialize_fabric_and_dispatch_fw() {
 }
 
 void DeviceManager::reset_dispatch_topology() {
+    ctx_.validate_worker_stream_state_access();
     initializers_.erase(DispatchKernelInitializer::key);
     init_done_.insert(DispatchKernelInitializer::key);
 }
 
 void DeviceManager::initialize_dispatch_firmware(bool force_recreate_topology) {
+    ctx_.validate_worker_stream_state_access();
     // This function is used by DispatchContext for manual FD setup.
     // It will re initialize the dispatch firmware on the active devices after it was manually disabled
     auto active_devices = this->get_all_active_devices_impl();
@@ -661,6 +666,7 @@ void DeviceManager::clear_rt_profiler_device_init_complete(ChipId chip_id) {
 }
 
 bool DeviceManager::close_device(ChipId device_id) {
+    ctx_.validate_worker_stream_state_access();
     // Sync and close one device
     // Currently can only call this on mmio chips, once we split dispatch kernel shutdown
     // from device close, we can call this on remote devices too
@@ -678,6 +684,7 @@ bool DeviceManager::close_device(ChipId device_id) {
 }
 
 bool DeviceManager::close_devices(const std::vector<IDevice*>& devices, bool /*skip_synchronize*/) {
+    ctx_.validate_worker_stream_state_access();
     ZoneScoped;
 
     // Ordered, because we need to shutdown tunnels from the farthest to the closest.

@@ -22,6 +22,7 @@ bool isFabricUnitTest() { return false; }
 namespace tt::tt_fabric {
 
 std::unique_ptr<tt::tt_metal::Program> create_and_compile_tt_fabric_program(tt::tt_metal::IDevice* device) {
+    tt::tt_metal::MetalContext::instance(tt::tt_metal::extract_context_id(device)).validate_worker_stream_state_access();
     auto fabric_program_ptr = std::make_unique<tt::tt_metal::Program>();
 
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
@@ -41,6 +42,10 @@ std::unique_ptr<tt::tt_metal::Program> create_and_compile_tt_fabric_program(tt::
     builder.compile_ancillary_kernels();
     builder.create_kernels();
 
+    fabric_program_ptr->impl().bind_internal_worker_stream_state_client(
+        tt::tt_metal::MetalContext::instance(tt::tt_metal::extract_context_id(device)), device->id(),
+        tt::tt_metal::detail::ProgramImpl::InternalWorkerStreamStateOwner::Fabric);
+
     // Compile the program
     fabric_program_ptr->impl().compile(device, tt::tt_metal::MetalContext::instance().rtoptions().get_fast_dispatch());
 
@@ -48,6 +53,7 @@ std::unique_ptr<tt::tt_metal::Program> create_and_compile_tt_fabric_program(tt::
 }
 
 std::unique_ptr<tt::tt_metal::Program> create_and_compile_fabric_program(tt::tt_metal::IDevice* device) {
+    tt::tt_metal::MetalContext::instance(tt::tt_metal::extract_context_id(device)).validate_worker_stream_state_access();
     auto fabric_config = tt::tt_metal::MetalContext::instance().get_fabric_config();
     if (tt_fabric::is_tt_fabric_config(fabric_config)) {
         return create_and_compile_tt_fabric_program(device);

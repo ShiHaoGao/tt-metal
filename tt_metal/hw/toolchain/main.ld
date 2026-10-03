@@ -143,6 +143,13 @@ PHDRS {
 
 SECTIONS
 {
+#if defined(TYPE_FIRMWARE)
+  /* Host-only ABI record retained in the exact firmware ELF, never in PT_LOAD. */
+  .tt_worker_stream_state 0x6800000 (INFO) :
+  {
+    KEEP(*(.tt_worker_stream_state))
+  } :NONE
+#endif
   /* DEVICE_PRINT string table – file-only section, VMA = 0x6400000 */
   .device_print_strings 0x6400000 (INFO) :
   {

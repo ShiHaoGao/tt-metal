@@ -51,7 +51,7 @@ inline constexpr uint32_t kSpscMaxPayloadWords =
     kSpscNRiscDecode * (kSpscRingCap + kernel_profiler::SPSC_SPAN_PACK_ALIGN_WORDS - 1);
 inline constexpr uint32_t kSpscMaxFrameWords = kernel_profiler::spsc_span_frame_words(kSpscMaxPayloadWords);
 inline constexpr uint32_t kSpscMaxFramePages = kSpscMaxFrameWords / kernel_profiler::SPSC_SPAN_PAGE_WORDS;
-static_assert(kSpscMaxFrameWords == 2656 && kSpscMaxFramePages == 166);
+static_assert(kSpscMaxFrameWords == 2672 && kSpscMaxFramePages == 167);
 
 // Packed NoC (y<<16)|x -> dense core index, direct-indexed so a frame's lookup is one load. 64x64 covers every
 // supported grid; a coordinate outside it is unknown.

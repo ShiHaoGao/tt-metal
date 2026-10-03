@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -43,21 +44,46 @@ const ll_api::memory& get_risc_binary(
     const std::string& path,
     ll_api::memory::Loading loading,
     const std::function<void(ll_api::memory&)>& update_callback) {
+    struct Entry {
+        std::unique_ptr<const ll_api::memory> image;
+        std::exception_ptr failure;
+    };
     static struct {
-        std::unordered_map<std::string, std::unique_ptr<const ll_api::memory>> map;
+        std::unordered_map<std::string, std::shared_ptr<Entry>> map;
         std::mutex mutex;
         std::condition_variable cvar;
     } cache;
 
     std::unique_lock lock(cache.mutex);
-    auto [slot, inserted] = cache.map.try_emplace(path);
-    const ll_api::memory* ptr = nullptr;
-    if (inserted) {
-        // We're the first with PATH. Create and insert.
-        lock.unlock();
-        ll_api::memory* mutable_ptr = new ll_api::memory(path, loading);
+    std::shared_ptr<Entry> entry;
+    bool producer = false;
+    {
+        auto slot = cache.map.find(path);
+        if (slot == cache.map.end()) {
+            // Allocate before inserting: allocation failure must not leave an
+            // entry with no producer. No map iterator survives the unlock.
+            entry = std::make_shared<Entry>();
+            cache.map.emplace(path, entry);
+            producer = true;
+        } else {
+            entry = slot->second;
+        }
+    }
+    if (!producer) {
+        cache.cvar.wait(lock, [&] { return entry->image || entry->failure; });
+        if (entry->failure) {
+            std::rethrow_exception(entry->failure);
+        }
+        TT_ASSERT(entry->image->get_loading() == loading);
+        return *entry->image;
+    }
+
+    lock.unlock();
+    std::unique_ptr<ll_api::memory> image;
+    try {
+        image = std::make_unique<ll_api::memory>(path, loading);
         if (update_callback) {
-            update_callback(*mutable_ptr);
+            update_callback(*image);
         }
         // Every device-executed image, kernel or firmware, passes through here before it can run, so
         // harvesting .tt_zone_meta registers a zone's name strictly before that zone can reach the host.
@@ -66,23 +92,19 @@ const ll_api::memory& get_risc_binary(
             ZoneMetaRegistry::instance().ingest_elf(path);
         }
 
+    } catch (...) {
         lock.lock();
-        // maps have iterator stability, so SLOT is still valid.
-        slot->second = decltype(slot->second)(mutable_ptr);
-        ptr = mutable_ptr;
-        // We can't wake just those waiting on this slot, so wake them
-        // all. Should be a rare event anyway.
+        entry->failure = std::current_exception();
+        // Existing waiters retain this completed attempt and its exception.
+        // New callers may retry the same path with a fresh entry.
+        cache.map.erase(path);
         cache.cvar.notify_all();
-    } else {
-        if (!slot->second) {
-            // Someone else is creating the initial entry, wait for them.
-            cache.cvar.wait(lock, [=] { return bool(slot->second); });
-        }
-        ptr = slot->second.get();
-        TT_ASSERT(ptr->get_loading() == loading);
+        throw;
     }
-
-    return *ptr;
+    lock.lock();
+    entry->image = std::move(image);
+    cache.cvar.notify_all();
+    return *entry->image;
 }
 
 // CoreCoord core --> NOC coordinates ("functional workers" from the SOC descriptor)

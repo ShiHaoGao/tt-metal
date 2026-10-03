@@ -66,18 +66,17 @@ using namespace ll_api;
 
 class ElfFile::Impl {
 private:
-    ElfFile& owner_;
+    ElfFile* owner_;
 
 protected:
-    // This is a view of the caller's object, which must remain live
-    // for the lifetime of this object. (As that's the case anyway,
-    // there's no burden on the caller). See the document on
-    // ReadImage's declaration.
-    const std::string_view path_;
+    // A diagnostic label, owned independently of the input path or bytes.
+    const std::string path_;
 
 public:
-    Impl(ElfFile& owner, std::string_view path) : owner_(owner), path_(path) {}
+    Impl(ElfFile& owner, std::string_view path) : owner_(&owner), path_(path) {}
     virtual ~Impl() = default;
+
+    void Rebind(ElfFile& owner) noexcept { owner_ = &owner; }
 
 public:
     Impl(const Impl&) = delete;
@@ -87,6 +86,7 @@ public:
 
 public:
     static Impl* Make(ElfFile& owner, const std::string& path);
+    static Impl* FromContents(ElfFile& owner, std::string_view label);
 
 public:
     virtual void LoadImage() = 0;
@@ -97,8 +97,8 @@ public:
     virtual std::span<std::byte> GetSectionContents(std::string_view name, uint64_t& virtual_address) const = 0;
 
 private:
-    [[nodiscard]] auto GetSegments() const -> std::vector<Segment>& { return owner_.segments_; }
-    [[nodiscard]] auto GetContents() const -> std::span<std::byte>& { return owner_.contents_; }
+    [[nodiscard]] auto GetSegments() const -> std::vector<Segment>& { return owner_->segments_; }
+    [[nodiscard]] auto GetContents() const -> std::span<std::byte>& { return owner_->contents_; }
     void TrimSegments(std::span<const std::uint32_t>);
 
 private:
@@ -146,7 +146,10 @@ private:
     [[nodiscard]] auto GetHeader() const -> Ehdr& { return *ByteOffset<Ehdr>(GetContents().data()); }
     [[nodiscard]] auto GetPhdrs() const -> std::span<const Phdr> { return phdrs_; }
     [[nodiscard]] auto GetShdrs() const -> std::span<Shdr> { return shdrs_; }
-    [[nodiscard]] auto GetShdr(unsigned ix) const -> const Shdr& { return shdrs_[ix]; }
+    [[nodiscard]] auto GetShdr(unsigned ix) const -> const Shdr& {
+        if (ix >= shdrs_.size()) TT_THROW("{}: section index is outside the section table", path_);
+        return shdrs_[ix];
+    }
     using Impl::GetContents;
     [[nodiscard]] auto GetContents(const Phdr& phdr) const -> std::span<std::byte> {
         return GetContents().subspan(phdr.p_offset, phdr.p_filesz);
@@ -155,7 +158,15 @@ private:
         return GetContents().subspan(shdr.sh_offset, shdr.sh_size);
     }
     [[nodiscard]] auto GetString(size_t offset, const Shdr& shdr) const -> const char* {
-        return ByteOffset<char const>(GetContents(shdr).data(), offset);
+        if (shdr.sh_type != SHT_STRTAB || offset >= shdr.sh_size) {
+            TT_THROW("{}: string reference is outside its string table", path_);
+        }
+        const auto bytes = GetContents(shdr);
+        const auto* string = ByteOffset<char const>(bytes.data(), offset);
+        if (!std::memchr(string, '\0', bytes.size() - offset)) {
+            TT_THROW("{}: unterminated ELF string", path_);
+        }
+        return string;
     }
     [[nodiscard]] auto GetName(const Shdr& shdr) const -> const char* {
         return GetString(shdr.sh_name, GetShdr(GetHeader().e_shstrndx));
@@ -265,11 +276,33 @@ private:
     }
 };
 
-ElfFile::~ElfFile() {
+ElfFile::ElfFile(ElfFile&& s) noexcept :
+    pimpl_(std::exchange(s.pimpl_, nullptr)),
+    contents_(std::exchange(s.contents_, std::span<std::byte>{})),
+    segments_(std::move(s.segments_)) {
+    if (pimpl_) pimpl_->Rebind(*this);
+}
+
+ElfFile& ElfFile::operator=(ElfFile&& s) noexcept {
+    if (this != &s) {
+        Reset();
+        pimpl_ = std::exchange(s.pimpl_, nullptr);
+        contents_ = std::exchange(s.contents_, std::span<std::byte>{});
+        segments_ = std::move(s.segments_);
+        if (pimpl_) pimpl_->Rebind(*this);
+    }
+    return *this;
+}
+
+ElfFile::~ElfFile() { Reset(); }
+
+void ElfFile::Reset() noexcept {
     ReleaseImpl();
+    segments_.clear();
     if (!contents_.empty()) {
         munmap(contents_.data(), contents_.size());
     }
+    contents_ = {};
 }
 
 std::span<std::byte> ElfFile::GetSectionContents(std::string_view section_name, uint64_t& virtual_address) const {
@@ -285,8 +318,26 @@ void ElfFile::ReleaseImpl() {
 }
 
 void ElfFile::ReadImage(const std::string& path) {
-    pimpl_ = Impl::Make(*this, path);
-    pimpl_->LoadImage();
+    ElfFile candidate;
+    candidate.pimpl_ = Impl::Make(candidate, path);
+    candidate.pimpl_->LoadImage();
+    *this = std::move(candidate);
+}
+
+void ElfFile::ReadImage(std::span<const std::byte> image, std::string_view label) {
+    if (image.size() < EI_NIDENT) {
+        TT_THROW("{}: truncated ELF identification", label);
+    }
+    ElfFile candidate;
+    void* buffer = mmap(nullptr, image.size(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buffer == MAP_FAILED) {
+        TT_THROW("{}: cannot allocate ELF image storage: {}", label, strerror(errno));
+    }
+    candidate.contents_ = std::span(reinterpret_cast<std::byte*>(buffer), image.size());
+    std::memcpy(buffer, image.data(), image.size());
+    candidate.pimpl_ = Impl::FromContents(candidate, label);
+    candidate.pimpl_->LoadImage();
+    *this = std::move(candidate);
 }
 
 ElfFile::Impl* ElfFile::Impl::Make(ElfFile& owner, const std::string& path) {
@@ -306,8 +357,16 @@ ElfFile::Impl* ElfFile::Impl::Make(ElfFile& owner, const std::string& path) {
 
     owner.contents_ = std::span(reinterpret_cast<std::byte*>(buffer), st.st_size);
 
-    // Sniff the header
-    const unsigned char* ident = reinterpret_cast<const unsigned char*>(buffer);
+    return FromContents(owner, path);
+}
+
+ElfFile::Impl* ElfFile::Impl::FromContents(ElfFile& owner, std::string_view path) {
+    // Validate identification before reading any header fields. The input
+    // mapping may be shorter than a page, including the last byte of a page.
+    if (owner.contents_.size() < EI_NIDENT) {
+        TT_THROW("{}: truncated ELF identification", path);
+    }
+    const unsigned char* ident = reinterpret_cast<const unsigned char*>(owner.contents_.data());
 
     // Make sure it's ELF ...
     if (!(ident[EI_MAG0] == 0x7f && ident[EI_MAG1] == 'E' && ident[EI_MAG2] == 'L' && ident[EI_MAG3] == 'F')) {
@@ -319,6 +378,10 @@ ElfFile::Impl* ElfFile::Impl::Make(ElfFile& owner, const std::string& path) {
     bool is_64 = ident[EI_CLASS] == ELFCLASS64;
     if (!(is_32 || is_64) || !(ident[EI_DATA] == ELFDATA2LSB && ident[EI_VERSION] == EV_CURRENT)) {
         TT_THROW("{}: incompatible address size or endianness", path);
+    }
+
+    if (owner.contents_.size() < (is_64 ? sizeof(Elf64_Ehdr) : sizeof(Elf32_Ehdr))) {
+        TT_THROW("{}: truncated ELF header", path);
     }
 
     if (is_64) {
@@ -356,6 +419,7 @@ void ElfFile::Impl::XIPify() {
 }
 
 void ElfFile::Impl::TrimSegments(std::span<const std::uint32_t> info) {
+    if (info.size() % 3) TT_THROW("{}: malformed segment metadata", path_);
     auto segment_iter = GetSegments().end();
     for (unsigned ix = info.size() / 3 * 3; ix;) {
         ix -= 3;
@@ -370,6 +434,10 @@ void ElfFile::Impl::TrimSegments(std::span<const std::uint32_t> info) {
             --segment_iter;
             if (segment_iter->address == vma) {
                 if (uint32_t trim = info[ix + 1] - vma) {
+                    if (trim % sizeof(word_t) || trim > segment_iter->membytes ||
+                        trim / sizeof(word_t) > segment_iter->contents.size()) {
+                        TT_THROW("{}: segment trim is outside its contents", path_);
+                    }
                     if (segment_iter->lma == segment_iter->address) {
                         // Keep the LMA matching
                         segment_iter->lma += trim;
@@ -425,18 +493,57 @@ void ElfFile::Impl::Elf<Is64>::LoadImage() {
         TT_THROW("{}: incompatible architecture {}", path_, hdr.e_machine);
     }
 
-    if (!hdr.e_phoff || hdr.e_phoff & (sizeof(address_t) - 1) || hdr.e_phentsize != sizeof(Phdr) ||
-        (hdr.e_phoff + hdr.e_phnum * sizeof(Phdr) > GetContents().size())) {
+    if (!hdr.e_phoff || hdr.e_phoff & (alignof(Phdr) - 1) || hdr.e_phentsize != sizeof(Phdr) ||
+        hdr.e_phoff > GetContents().size() ||
+        hdr.e_phnum > (GetContents().size() - hdr.e_phoff) / sizeof(Phdr)) {
         TT_THROW("{}: PHDRS are missing or malformed", path_);
     }
     phdrs_ = std::span(ByteOffset<Phdr>(GetContents().data(), hdr.e_phoff), hdr.e_phnum);
-    if (!hdr.e_shoff || hdr.e_shoff & (sizeof(address_t) - 1) || hdr.e_shentsize != sizeof(Shdr) ||
-        (hdr.e_shoff + hdr.e_shnum * sizeof(Shdr) > GetContents().size())) {
+    if (!hdr.e_shoff || hdr.e_shoff & (alignof(Shdr) - 1) || hdr.e_shentsize != sizeof(Shdr) ||
+        hdr.e_shoff > GetContents().size() ||
+        hdr.e_shnum > (GetContents().size() - hdr.e_shoff) / sizeof(Shdr)) {
         TT_THROW("{}: sections are missing or malformed", path_);
     }
     shdrs_ = std::span(ByteOffset<Shdr>(GetContents().data(), hdr.e_shoff), hdr.e_shnum);
     if (!hdr.e_shstrndx || hdr.e_shstrndx >= GetShdrs().size()) {
         TT_THROW("{}: string table is missing or malformed", path_);
+    }
+
+    // Validate records before using any section names, symbols or relocations.
+    for (const auto& section : GetShdrs()) {
+        if (section.sh_type != SHT_NOBITS &&
+            (section.sh_offset > GetContents().size() ||
+             section.sh_size > GetContents().size() - section.sh_offset)) {
+            TT_THROW("{}: section contents are outside the ELF image", path_);
+        }
+        const size_t entry_size = section.sh_type == SHT_RELA     ? sizeof(Rela)
+                                  : section.sh_type == SHT_SYMTAB ? sizeof(Sym)
+                                                                 : 0;
+        const size_t alignment = section.sh_type == SHT_RELA ? alignof(Rela) : alignof(Sym);
+        if (entry_size && (section.sh_entsize != entry_size || section.sh_size % entry_size ||
+                           section.sh_offset % alignment)) {
+            TT_THROW("{}: section has a malformed record size", path_);
+        }
+    }
+    for (const auto& section : GetShdrs()) {
+        (void)GetName(section);
+        if (section.sh_type == SHT_SYMTAB) {
+            for (const auto& symbol : GetSymbols(section)) {
+                (void)GetName(symbol, section.sh_link);
+            }
+        } else if (section.sh_type == SHT_RELA) {
+            (void)GetShdr(section.sh_info);
+            const auto& symbols = GetShdr(section.sh_link);
+            if (symbols.sh_type != SHT_SYMTAB) {
+                TT_THROW("{}: relocation section does not reference a symbol table", path_);
+            }
+            const size_t symbol_count = symbols.sh_size / sizeof(Sym);
+            for (const auto& relocation : GetRelocations(section)) {
+                if (GetRelocSymIx(relocation) >= symbol_count) {
+                    TT_THROW("{}: relocation symbol is outside its symbol table", path_);
+                }
+            }
+        }
     }
 
     GetSegments().reserve(hdr.e_phnum);
@@ -468,6 +575,15 @@ void ElfFile::Impl::Elf<Is64>::LoadImage() {
             phdr.p_memsz,
             phdr.p_offset);
 
+        if (phdr.p_offset > GetContents().size() ||
+            phdr.p_filesz > GetContents().size() - phdr.p_offset || phdr.p_filesz > phdr.p_memsz ||
+            phdr.p_memsz > UINT32_MAX - (sizeof(word_t) - 1) ||
+            phdr.p_vaddr > UINT32_MAX || phdr.p_paddr > UINT32_MAX ||
+            phdr.p_memsz > uint64_t{UINT32_MAX} + 1 - phdr.p_vaddr ||
+            phdr.p_memsz > uint64_t{UINT32_MAX} + 1 - phdr.p_paddr) {
+            TT_THROW("{}: load segment is outside the ELF image or address space", path_);
+        }
+
         // Require loadable segments to be nicely aligned
         if (((phdr.p_offset | phdr.p_vaddr | phdr.p_paddr) & (sizeof(word_t) - 1)) ||
             // Only support loading into the first 4GB
@@ -483,10 +599,11 @@ void ElfFile::Impl::Elf<Is64>::LoadImage() {
                 phdr.p_offset);
         }
 
-        // This word-size rounding up means the span can occupy some bytes
-        // outside the range of the original span, but those bytes will
-        // still be inside the span covering the whole file, so that's ok.
+        // Word-size padding must also stay within the owned mapping.
         offset_t file_words = (phdr.p_filesz + sizeof(word_t) - 1) / sizeof(word_t);
+        if (file_words > (GetContents().size() - phdr.p_offset) / sizeof(word_t)) {
+            TT_THROW("{}: padded load segment is outside the ELF image", path_);
+        }
         offset_t mem_bytes = (phdr.p_memsz + sizeof(word_t) - 1) & ~(sizeof(word_t) - 1);
         GetSegments().emplace_back(
             std::span(reinterpret_cast<const word_t*>(GetContents(phdr).data()), file_words),
@@ -549,6 +666,9 @@ void ElfFile::Impl::Elf<Is64>::LoadImage() {
     }
     if (segment_info) {
         auto bytes = GetContents(*segment_info);
+        if (segment_info->sh_offset % alignof(uint32_t) || bytes.size() % (3 * sizeof(uint32_t))) {
+            TT_THROW("{}: malformed segment metadata", path_);
+        }
         std::span info{reinterpret_cast<const uint32_t*>(bytes.data()), bytes.size() / sizeof(uint32_t)};
         TrimSegments(info);
     }
@@ -745,11 +865,8 @@ void ElfFile::Impl::Elf<Is64>::XIPify() {
     static char const* const r_names[][2] = {
         {"R_RISCV_HI20", "R_RISCV_LO12"}, {"R_RISCV_PCREL_HI20", "R_RISCV_PCREL_LO12"}};
 
-    auto check_relaxed = [&](const Rela& reloc) {
-        // If RELOC is the final reloc, this will
-        // be out of bounds (and probably fail),
-        // but we kind of want that anyway
-        if (GetRelocType((&reloc)[1]) != R_RISCV_RELAX) {
+    auto check_relaxed = [&](const Rela& reloc, std::span<const Rela> relocs) {
+        if (&reloc + 1 == relocs.data() + relocs.size() || GetRelocType((&reloc)[1]) != R_RISCV_RELAX) {
             log_debug(tt::LogLLRuntime, "{}: Relocation at {:#x} is not relaxed", path_, reloc.r_offset);
         }
     };
@@ -896,8 +1013,9 @@ void ElfFile::Impl::Elf<Is64>::XIPify() {
                     }
                     break;
 
+                case R_RISCV_64:
                 case R_RISCV_32_PCREL:
-                    TT_THROW("{}: R_RISCV_32_PCREL relocation found at {:#x}", path_, reloc.r_offset);
+                    TT_THROW("{}: unsupported relocation {} at {:#x}", path_, type, reloc.r_offset);
                     break;
             }
         }
@@ -974,7 +1092,7 @@ void ElfFile::Impl::Elf<Is64>::XIPify() {
                 }
 
                 // translate hi
-                check_relaxed(*hi_reloc);
+                check_relaxed(*hi_reloc, relocs);
                 uint32_t insn = Read32(section, hi_reloc->r_offset);
                 log_debug(
                     tt::LogLLRuntime,
@@ -1001,7 +1119,7 @@ void ElfFile::Impl::Elf<Is64>::XIPify() {
                 for (auto* lo_reloc : slot.second.lo_relocs) {
                     unsigned type = GetRelocType(*lo_reloc);
                     bool is_form_i = type == (kind == PCREL ? R_RISCV_PCREL_LO12_I : R_RISCV_LO12_I);
-                    check_relaxed(*lo_reloc);
+                    check_relaxed(*lo_reloc, relocs);
                     uint32_t insn = Read32(section, lo_reloc->r_offset);
                     log_debug(
                         tt::LogLLRuntime,

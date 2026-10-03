@@ -420,6 +420,7 @@ std::map<ChipId, IDevice*> CreateDevices(
 namespace experimental {
 
 void ConfigureProgramWithoutLaunch(IDevice* device, Program& program) {
+    program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
     ZoneScoped;
     // Debug breadcrumbs, one per step: a hang in this path has no Python frame below it, and the
     // step name is what says where it stopped.
@@ -470,6 +471,7 @@ void ConfigureProgramWithoutLaunch(IDevice* device, Program& program) {
 }
 
 void DispatchCompiledProgramToDevice(IDevice* device, Program& program) {
+    program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
     ZoneScoped;
 
     auto device_id = device->id();
@@ -996,6 +998,7 @@ bool program_targets_only_dram_cores(const Program& program, const Hal& hal) {
 }
 
 void LaunchProgram(IDevice* device, Program& program, bool wait_until_cores_done, bool force_slow_dispatch) {
+    program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
     {  // Profiler scope start
         ZoneScoped;
         MetalContext& metal_ctx = MetalContext::instance(extract_context_id(device));
@@ -1108,6 +1111,7 @@ void WaitProgramDone(IDevice* device, Program& program, bool read_device_profile
 }
 
 bool ConfigureDeviceWithProgram(IDevice* device, Program& program, bool force_slow_dispatch) {
+    program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
     ZoneScoped;
     bool pass = true;
     const MetalContext& metal_ctx = MetalContext::instance(extract_context_id(device));
@@ -1295,6 +1299,7 @@ bool ConfigureDeviceWithProgram(IDevice* device, Program& program, bool force_sl
 }
 
 void WriteRuntimeArgsToDevice(IDevice* device, Program& program, bool force_slow_dispatch) {
+    program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
     ZoneScoped;
     auto device_id = device->id();
     // This function is shared between FD and SD.
@@ -1990,8 +1995,7 @@ void LightMetalBeginCapture() {
 #if defined(TT_ENABLE_LIGHT_METAL_TRACE) && (TT_ENABLE_LIGHT_METAL_TRACE == 1)
     log_debug(tt::LogMetalTrace, "Begin LightMetalBinary Capture");
     auto& lm_capture_ctx = LightMetalCaptureContext::get();
-    lm_capture_ctx.reset();            // Clear previous traces if any, ensure tracing disabled
-    lm_capture_ctx.set_tracing(true);  // Enable tracing
+    lm_capture_ctx.begin_capture();
 #else
     log_warning(tt::LogMetalTrace, "TT_ENABLE_LIGHT_METAL_TRACE!=1, ignoring LightMetalBeginCapture()");
 #endif
@@ -2002,9 +2006,7 @@ LightMetalBinary LightMetalEndCapture() {
 #if defined(TT_ENABLE_LIGHT_METAL_TRACE) && (TT_ENABLE_LIGHT_METAL_TRACE == 1)
     log_debug(tt::LogMetalTrace, "End LightMetalBinary Capture");
     auto& lm_capture_ctx = LightMetalCaptureContext::get();
-    TT_ASSERT(lm_capture_ctx.is_tracing(), "Light Metal Capture was not enabled.");
-    lm_capture_ctx.set_tracing(false);  // Disable tracing
-    return lm_capture_ctx.create_light_metal_binary();
+    return lm_capture_ctx.end_capture();
 #else
     log_warning(tt::LogMetalTrace, "TT_ENABLE_LIGHT_METAL_TRACE!=1, ignoring LightMetalEndCapture()");
     return {};

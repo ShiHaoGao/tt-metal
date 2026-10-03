@@ -45,6 +45,8 @@ set(UNIT_TESTS_API_SOURCES
     test_math.cpp
     test_filesystem_utils.cpp
     test_tt_memory.cpp
+    test_worker_stream_state_image.cpp
+    ../firmware/test_worker_stream_state_program.cpp
     test_graph_tracking.cpp
     test_cb_statistics.cpp
     test_buffer_region.cpp

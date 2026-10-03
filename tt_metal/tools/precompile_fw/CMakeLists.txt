@@ -30,6 +30,14 @@ if(NOT TT_METAL_SKIP_LINKING)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         DEPENDS
             precompile_fw
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/firmware/src/tt-1xx/brisc.cc
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/firmware/src/tt-1xx/trisc.cc
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/hostdev/worker_stream_state_contract.h
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/toolchain/main.ld
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/internal/tt-1xx/blackhole/dst_initialization.h
+            ${PROJECT_SOURCE_DIR}/tt_metal/tt-llk/tt_llk_blackhole/common/inc/ckernel_ops.h
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/internal/tt-1xx/blackhole/cfg_defines.h
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/internal/vptr_uint.h
         COMMENT "Pre-compiling firmware binaries"
     )
 

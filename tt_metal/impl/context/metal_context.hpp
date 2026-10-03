@@ -6,12 +6,15 @@
 
 #include <tt_stl/indestructible.hpp>
 #include <optional>
+#include <atomic>
 #include <vector>
 #include <llrt/hal.hpp>  // Hal — full definition needed to call hal().get_*() via MetalContext
 #include <llrt/rtoptions.hpp>
 #include <impl/allocator/allocator_types.hpp>
 #include <tt-metalium/allocator.hpp>
 #include "impl/device/firmware/firmware_initializer.hpp"
+#include "llrt/worker_stream_state_provider.hpp"
+#include "impl/context/worker_stream_state_client.hpp"
 #include <umd/device/types/cluster_descriptor_types.hpp>
 #include "context_types.hpp"
 #include <tt-metalium/experimental/context/metal_env.hpp>
@@ -43,12 +46,16 @@ class ContextDescriptor;
 class DataCollector;
 class DeviceManager;
 class RiscFirmwareInitializer;
+class FabricFirmwareInitializer;
 class dispatch_core_manager;
 class DispatchQueryManager;
+class DispatchTopology;
 class DPrintServer;
 class WatcherServer;
 class DispatchMemMap;
 class NOCDebugState;
+namespace detail { class ProgramImpl; }
+namespace distributed { class MeshDeviceImpl; }
 
 // A class to manage one-time initialization and teardown (FW, dispatch, fabric, cluster) and access to related state.
 // Dispatch-independent state (Cluster) is initialized with the creation of MetalContext and accessible right after.
@@ -80,6 +87,12 @@ public:
 
     // Check if a MetalContext for a given context id exists.
     static bool instance_exists(ContextId context_id = DEFAULT_CONTEXT_ID);
+    static std::shared_ptr<const WorkerStreamStateClient>
+    acquire_worker_stream_state_client(DeviceProfilerMode profiler_mode);
+    void validate_worker_stream_state_client(const std::shared_ptr<const WorkerStreamStateClient>& client) const;
+    void validate_worker_stream_state_access() const;
+    void validate_worker_stream_state_trace() const;
+    std::shared_ptr<const WorkerStreamStateProvider> worker_stream_state_provider(ChipId device_id) const;
 
     // Returns the id of this instance. The ID cannot be used to uniquely identify the context.
     // IDs are recycled after instances are destroyed.
@@ -241,7 +254,8 @@ private:
     // Usually the MetalEnv is owned by the user, but in this case of legacy behaviour, the context will own it.
     // Caller holds the g_instance mutex.
     static ContextId create_default_instance_implicit_locked(
-        std::optional<DeviceProfilerMode> profiler_mode = std::nullopt);
+        std::optional<DeviceProfilerMode> profiler_mode = std::nullopt,
+        std::shared_ptr<const WorkerStreamStateClient> worker_client = {});
 
     // Register handlers -- caller already holds the instance lock
     static void register_handlers_locked();
@@ -254,6 +268,23 @@ private:
     void init_context_descriptor(int num_hw_cqs, size_t l1_small_size, size_t trace_region_size, size_t worker_l1_size);
     void init_risc_fw_context_descriptor(int num_hw_cqs, size_t worker_l1_size);
 
+    friend class detail::ProgramImpl;
+    friend class DispatchTopology;
+    friend class distributed::MeshDeviceImpl;
+    friend class FabricFirmwareInitializer;
+    std::shared_ptr<const WorkerStreamStateClient> retain_worker_stream_state_client() const;
+    // A null snapshot is ordinary SDK mode. Non-null snapshots are immutable,
+    // including after the token expires; replacing a generation is one atomic
+    // publication. Readers never race a mutable weak_ptr or mode flag.
+    struct WorkerStreamStateClientState {
+        explicit WorkerStreamStateClientState(const std::shared_ptr<const WorkerStreamStateClient>& client)
+            : client(client) {}
+        const std::weak_ptr<const WorkerStreamStateClient> client;
+    };
+    bool has_exclusive_worker_stream_state() const {
+        return bool(worker_stream_state_client_state_.load(std::memory_order_acquire));
+    }
+    std::atomic<std::shared_ptr<const WorkerStreamStateClientState>> worker_stream_state_client_state_;
     bool initialized_ = false;
     bool force_reinit_ = false;
 

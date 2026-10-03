@@ -162,6 +162,7 @@ MeshDeviceImpl::ScopedDevices::ScopedDevices(
     context_id_(context_id) {
     auto local_devices = extract_locals(all_device_ids);
     auto& ctx = MetalContext::instance(context_id);
+    worker_stream_state_client_ = ctx.retain_worker_stream_state_client();
     ctx.initialize_device_manager(
         local_devices,
         num_command_queues,
@@ -190,6 +191,7 @@ MeshDeviceImpl::ScopedDevices::ScopedDevices(
 }
 
 MeshDeviceImpl::ScopedDevices::~ScopedDevices() {
+    WorkerStreamStateAccess access(worker_stream_state_client_);
     if (!opened_local_devices_.empty()) {
         std::vector<IDevice*> devices_to_close;
         devices_to_close.reserve(opened_local_devices_.size());
@@ -365,6 +367,7 @@ MeshDeviceImpl::MeshDeviceImpl(
     metal_context_(&metal_context),
     metal_env_(&MetalEnvAccessor(metal_context_->get_env()).impl()),
     scoped_devices_(std::move(mesh_handle)),
+    worker_stream_state_cleanup_client_(metal_context.retain_worker_stream_state_client()),
     mesh_id_(generate_unique_mesh_id()),
     view_(std::move(mesh_device_view)),
     parent_mesh_(std::move(parent_mesh)),
@@ -1013,6 +1016,8 @@ bool MeshDeviceImpl::close() {
 }
 
 bool MeshDeviceImpl::close_impl(MeshDevice* pimpl_wrapper) {
+    if (is_initialized())
+        metal_context().validate_worker_stream_state_access();
     TTZoneScopedD(MISC);
 
     log_trace(tt::LogMetal, "Closing mesh device {}", this->id());
@@ -1133,6 +1138,7 @@ bool MeshDeviceImpl::close_impl(MeshDevice* pimpl_wrapper) {
         MetalContext::destroy_instance(false, context_id_);
         destroy_metal_context_instance_on_close_ = false;
     }
+    worker_stream_state_cleanup_client_.reset();
 
     return true;
 }
@@ -1222,6 +1228,7 @@ void MeshDeviceImpl::validate_sub_device_manager_tracker() const {
 
 SubDeviceManagerId MeshDeviceImpl::create_sub_device_manager(
     std::initializer_list<SubDevice> sub_devices, DeviceAddr local_l1_size) {
+    metal_context().validate_worker_stream_state_access();
     auto lock = lock_api();
     validate_sub_device_manager_tracker();
     return sub_device_manager_tracker_->create_sub_device_manager(sub_devices, local_l1_size);
@@ -1229,22 +1236,26 @@ SubDeviceManagerId MeshDeviceImpl::create_sub_device_manager(
 
 SubDeviceManagerId MeshDeviceImpl::create_sub_device_manager(
     ttsl::Span<const SubDevice> sub_devices, DeviceAddr local_l1_size) {
+    metal_context().validate_worker_stream_state_access();
     auto lock = lock_api();
     validate_sub_device_manager_tracker();
     return sub_device_manager_tracker_->create_sub_device_manager(sub_devices, local_l1_size);
 }
 void MeshDeviceImpl::remove_sub_device_manager(SubDeviceManagerId sub_device_manager_id) {
+    metal_context().validate_worker_stream_state_access();
     auto lock = lock_api();
     validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->remove_sub_device_manager(sub_device_manager_id);
     this->allocator_impl()->unregister_active_traces(sub_device_manager_id);
 }
 void MeshDeviceImpl::load_sub_device_manager(SubDeviceManagerId sub_device_manager_id) {
+    metal_context().validate_worker_stream_state_access();
     auto lock = lock_api();
     validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->load_sub_device_manager(sub_device_manager_id);
 }
 void MeshDeviceImpl::clear_loaded_sub_device_manager() {
+    metal_context().validate_worker_stream_state_access();
     auto lock = lock_api();
     validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->clear_loaded_sub_device_manager();
@@ -1534,12 +1545,14 @@ std::shared_ptr<MeshTraceBuffer> MeshDeviceImpl::get_mesh_trace(const MeshTraceI
 }
 
 MeshTraceId MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id) {
+    metal_context().validate_worker_stream_state_trace();
     auto trace_id = MeshTrace::next_id();
     this->begin_mesh_trace(cq_id, trace_id);
     return trace_id;
 }
 
 void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id) {
+    metal_context().validate_worker_stream_state_trace();
     TracyTTMetalBeginMeshTrace(this->get_device_ids(), *trace_id);
     TT_FATAL(
         !this->mesh_command_queues_[cq_id]->trace_id().has_value(),
@@ -1565,6 +1578,7 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
 }
 
 void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id) {
+    metal_context().validate_worker_stream_state_trace();
     TracyTTMetalEndMeshTrace(this->get_device_ids(), *trace_id);
 
     // Register the trace on any exit, including thrown exceptions, so subsequent allocations are treated
@@ -1649,6 +1663,7 @@ bool MeshDeviceImpl::initialize_impl(
     size_t /*worker_l1_size*/,
     ttsl::Span<const std::uint32_t> /*l1_bank_remap*/,
     bool /*minimal*/) {
+    metal_context().validate_worker_stream_state_access();
     TT_FATAL(!this->is_initialized(), "MeshDevice is already initialized!");
 
     // If the mesh device has no local devices, do not attempt to initialize it.
@@ -1901,10 +1916,12 @@ const std::vector<SubDeviceId>& MeshDeviceImpl::get_sub_device_stall_group() con
     return sub_device_manager_tracker_->get_active_sub_device_manager()->get_sub_device_stall_group();
 }
 void MeshDeviceImpl::set_sub_device_stall_group(ttsl::Span<const SubDeviceId> sub_device_ids) {
+    metal_context().validate_worker_stream_state_access();
     validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->get_active_sub_device_manager()->set_sub_device_stall_group(sub_device_ids);
 }
 void MeshDeviceImpl::reset_sub_device_stall_group() {
+    metal_context().validate_worker_stream_state_access();
     validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->get_active_sub_device_manager()->reset_sub_device_stall_group();
 }
@@ -1920,6 +1937,7 @@ bool MeshDeviceImpl::is_mmio_capable() const {
 }
 
 void MeshDeviceImpl::quiesce_internal() {
+    metal_context().validate_worker_stream_state_access();
     TT_FATAL(
         get_active_sub_device_manager_id() == get_default_sub_device_manager_id(),
         "Cannot quiesce when non-default sub-device manager is active");
@@ -1994,6 +2012,7 @@ std::shared_ptr<distributed::MeshDevice> MeshDeviceImpl::get_mesh_device() {
 MeshDevice::MeshDevice(MetalEnv& /*metal_env*/) {}
 
 MeshDevice::~MeshDevice() {
+    WorkerStreamStateAccess access(pimpl_->worker_stream_state_cleanup_client_);
     Inspector::mesh_device_destroyed(this->pimpl_.get());
     pimpl_->close_impl(this);
 }
@@ -2142,7 +2161,10 @@ bool MeshDevice::initialize(
     return pimpl_->initialize_impl(
         this, num_hw_cqs, l1_small_size, trace_region_size, worker_l1_size, l1_bank_remap, minimal);
 }
-bool MeshDevice::close() { return pimpl_->close_impl(this); }
+bool MeshDevice::close() {
+    MetalContext::instance(pimpl_->get_context_id()).validate_worker_stream_state_access();
+    return pimpl_->close_impl(this);
+}
 void MeshDevice::enable_program_cache() { pimpl_->enable_program_cache(); }
 void MeshDevice::clear_program_cache() { pimpl_->clear_program_cache(); }
 void MeshDevice::disable_and_clear_program_cache() { pimpl_->disable_and_clear_program_cache(); }

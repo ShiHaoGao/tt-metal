@@ -9,6 +9,7 @@
 #include <tensix.h>
 #include "hostdev/dev_msgs.h"
 #include "hostdev/rta_constants.h"
+#include "hostdev/worker_stream_state_contract.h"
 
 #include "tools/profiler/kernel_profiler.hpp"
 
@@ -24,6 +25,13 @@
 #endif
 #include "tt-metalium/circular_buffer_constants.h"
 // clang-format on
+
+#if defined(ARCH_BLACKHOLE) && COMPILE_FOR_TRISC == 0
+__attribute__((used, section(".tt_worker_stream_state")))
+const tt::worker_stream_state::ImageRecord worker_stream_state_image{
+    tt::worker_stream_state::kVersion,
+    static_cast<uint8_t>(tt::worker_stream_state::FirmwareRole::Trisc0), 0, 0};
+#endif
 
 #if defined(PROFILE_KERNEL)
 namespace kernel_profiler {
@@ -95,14 +103,18 @@ constexpr bool cb_init_write = false;
 using namespace ckernel;
 
 void init_sync_registers() {
-    volatile tt_reg_ptr uint* tiles_received_ptr;
-    volatile tt_reg_ptr uint* tiles_acked_ptr;
-    for (uint32_t operand = 0; operand < NUM_CIRCULAR_BUFFERS; operand++) {
-        tiles_received_ptr = get_cb_tiles_received_ptr(operand);
-        tiles_received_ptr[0] = 0;
-        tiles_acked_ptr = get_cb_tiles_acked_ptr(operand);
-        tiles_acked_ptr[0] = 0;
-    }
+    // Only BRISC's admitted SDK/boot reset request enters this function. Keep
+    // the architecture's original operand-to-stream mapping. Read each MMIO
+    // value back before reporting completion through the L1 mailbox.
+    auto write = [](uint32_t operand, tt::worker_stream_state::Counter counter, uint32_t value) {
+        volatile uint32_t* pointer = counter == tt::worker_stream_state::Counter::Received
+                                         ? get_cb_tiles_received_ptr(operand)
+                                         : get_cb_tiles_acked_ptr(operand);
+        *pointer = value;
+        while (*pointer != value) {}
+    };
+    tt::worker_stream_state::apply(
+        tt::worker_stream_state::Decision::ClearSdkCounters, NUM_CIRCULAR_BUFFERS, write);
 }
 
 int main(int argc, char* argv[]) {

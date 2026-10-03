@@ -90,10 +90,10 @@ void JitBuildOptions::set_cb_data_fmt_and_tile(CBIndex cb_id, DataFormat data_fo
             tile->get_narrow_tile(),
             tile->get_tile_shape()[0],
             tile->get_tile_shape()[1]);
-        set_cb_tile_size_all_cores(cb_id, tile->get_tile_size(data_format));
+        set_cb_tile_size_all_cores(cb_id, tile->get_tile_size(data_format, build_env.get_l1_alignment()));
     } else {
         Tile default_tile;
-        set_cb_tile_size_all_cores(cb_id, default_tile.get_tile_size(data_format));
+        set_cb_tile_size_all_cores(cb_id, default_tile.get_tile_size(data_format, build_env.get_l1_alignment()));
     }
 }
 
@@ -123,10 +123,10 @@ void JitBuildOptions::set_cb_data_fmt_tile_and_face_geometry(
             effective_tile.get_narrow_tile(),
             effective_tile.get_tile_shape()[0],
             effective_tile.get_tile_shape()[1]);
-        set_cb_tile_size_all_cores(cb_id, effective_tile.get_tile_size(data_format));
+        set_cb_tile_size_all_cores(cb_id, effective_tile.get_tile_size(data_format, build_env.get_l1_alignment()));
     } else {
         Tile default_tile;
-        set_cb_tile_size_all_cores(cb_id, default_tile.get_tile_size(data_format));
+        set_cb_tile_size_all_cores(cb_id, default_tile.get_tile_size(data_format, build_env.get_l1_alignment()));
     }
 }
 

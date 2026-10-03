@@ -7,11 +7,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "tt_elffile.hpp"
+#include "hostdev/worker_stream_state_contract.h"
 
 namespace ll_api {
 
@@ -35,14 +37,20 @@ private:
     std::uint32_t text_size_ = 0;
     std::uint32_t text_addr_ = 0;
     Loading loading_{Loading::DISCRETE};
+    tt::worker_stream_state::ImageRecord worker_stream_state_image_{};
 
     // Populate link_spans_/data_/text_addr_/text_size_ from ELF segments, ordering by address for
     // DISCRETE loads. Shared by the (path, loading) constructor and from_segments().
     void pack_from_segments(const std::string& path, const std::vector<ElfFile::Segment>& segments);
+    void pack_from_elf(ElfFile& elf, const std::string& label);
 
 public:
     memory();
     memory(const std::string& path, Loading loading);
+
+    // Parse a private copy of the input ELF bytes and retain the packed image.
+    // This path has no filesystem cache, dump or implicit device context.
+    memory(std::span<const std::byte> image, Loading loading, std::string_view label = "<memory>");
 
     // Build a memory directly from in-memory ELF segments (no on-disk ELF), running the same
     // address-ordering/packing logic as the (path, loading) constructor. Lets the segment-ordering
@@ -60,6 +68,9 @@ public:
 
     bool operator==(const memory& other) const;
     Loading get_loading() const { return loading_; }
+    const tt::worker_stream_state::ImageRecord& worker_stream_state_image() const {
+        return worker_stream_state_image_;
+    }
 
     std::uint32_t get_text_size() const { return this->text_size_; }
     std::uint32_t get_packed_size() const { return data_.size() * sizeof(word_t); }

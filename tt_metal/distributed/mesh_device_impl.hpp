@@ -43,6 +43,7 @@ class HWCommandQueue;
 class MetalEnv;
 class MetalEnvImpl;
 class MetalContext;
+class WorkerStreamStateClient;
 class SubDevice;
 class SystemMemoryManager;
 
@@ -94,6 +95,7 @@ private:
         std::vector<MaybeRemote<IDevice*>> devices_;
         std::map<ChipId, IDevice*> opened_local_devices_;
         ContextId context_id_ = DEFAULT_CONTEXT_ID;
+        std::shared_ptr<const WorkerStreamStateClient> worker_stream_state_client_;
 
     public:
         // Constructor acquires physical resources
@@ -147,6 +149,7 @@ private:
     // MeshDevice, and when the MeshDevice closes it also destroys the associated MetalContext.
     bool destroy_metal_context_instance_on_close_ = false;
     std::shared_ptr<ScopedDevices> scoped_devices_;
+    std::shared_ptr<const WorkerStreamStateClient> worker_stream_state_cleanup_client_;
     int mesh_id_;
     std::unique_ptr<MeshDeviceView> view_;
     // Only ever read on the dispatch path, which holds the api lock.
@@ -225,6 +228,7 @@ private:
     mutable std::shared_ptr<distributed::multihost::DistributedContext> coowner_context_;
 
     friend class ::tt::tt_metal::experimental::DispatchContext;
+    friend class MeshDevice;
 
 public:
     MeshDeviceImpl(

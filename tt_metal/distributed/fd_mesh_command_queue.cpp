@@ -404,6 +404,9 @@ void FDMeshCommandQueue::clear_expected_num_workers_completed() {
 }
 
 void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool blocking) {
+    for (const auto& [range, program] : mesh_workload.get_programs())
+        program.impl().validate_worker_stream_state_client(
+            MetalContext::instance(mesh_device_->impl().get_context_id()));
     ZoneScopedN("EnqueueProgram");
     auto lock = lock_api_function_();
     in_use_ = true;
@@ -1209,6 +1212,7 @@ void FDMeshCommandQueue::reset_worker_state(
     const vector_aligned<uint32_t>& go_signal_noc_data,
     const std::vector<std::pair<CoreRangeSet, uint32_t>>& core_go_message_mapping,
     ttsl::Span<const uint32_t> workers_per_sub_device) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
     for (auto* device : mesh_device_->get_devices()) {
         TT_FATAL(!device->sysmem_manager().get_bypass_mode(), "Cannot reset worker state during trace capture");
     }
@@ -1329,6 +1333,7 @@ void FDMeshCommandQueue::write_go_signal_sequences_to_unused_sub_grids(
 }
 
 void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blocking) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     auto lock = lock_api_function_();
     in_use_ = true;
     auto trace_inst = mesh_device_->get_mesh_trace(trace_id);
@@ -1372,6 +1377,7 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
 }
 
 void FDMeshCommandQueue::record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     auto lock = lock_api_function_();
     trace_dispatch::reset_host_dispatch_state_for_trace(
         mesh_device_->num_sub_devices(),
@@ -1411,6 +1417,7 @@ static VecIt remove_by_index(VecIt begin, VecIt end, IndexIt index_begin, IndexI
 }
 
 void FDMeshCommandQueue::record_end() {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     MetalContext& metal_ctx = MetalContext::instance(mesh_device_->impl().get_context_id());
     const auto& hal = metal_ctx.hal();
 
@@ -1769,6 +1776,7 @@ int FDMeshCommandQueue::get_prefetcher_cache_sizeB() const {
 }
 
 void FDMeshCommandQueue::wait_for_completion(bool reset_launch_msg_state) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
     if (in_use_) {
         size_t num_sub_devices = mesh_device_->num_sub_devices();
         for (auto* device : mesh_device_->get_devices()) {

@@ -24,6 +24,7 @@
 #include "mesh_device.hpp"
 #include "profiler_optional_metadata.hpp"
 #include "profiler_types.hpp"
+#include <tt-metalium/profiler_raw_capture.hpp>
 #include "tracy/TracyTTDevice.hpp"
 
 namespace tt::tt_metal {
@@ -181,6 +182,10 @@ private:
         uint8_t active_dram_buffer_index,
         bool force_slow_dispatch);
 
+    // Copy the just-read control/DRAM image before resetting device buffers.
+    void retainRawResults(IDevice* device, const std::vector<CoreCoord>& virtual_cores,
+                          ProfilerRawDeviceCapture& capture) const;
+
     // Read data from profiler buffer using fast dispatch
     void issueFastDispatchReadFromProfilerBuffer(
         distributed::MeshDevice* mesh_device, IDevice* device, uint8_t active_dram_buffer_index = 0);
@@ -314,7 +319,8 @@ public:
         const std::vector<CoreCoord>& virtual_cores,
         ProfilerReadState state = ProfilerReadState::NORMAL,
         ProfilerDataBufferSource data_source = ProfilerDataBufferSource::DRAM,
-        const std::optional<ProfilerOptionalMetadata>& metadata = {});
+        const std::optional<ProfilerOptionalMetadata>& metadata = {},
+        ProfilerRawDeviceCapture* raw_capture = nullptr);
 
     // Process the device profile results previously read
     void processResults(

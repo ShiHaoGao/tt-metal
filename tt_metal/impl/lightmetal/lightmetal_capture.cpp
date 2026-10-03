@@ -15,6 +15,8 @@
 #include <tt-metalium/program.hpp>
 
 #include "impl/program/program_impl.hpp"
+#include "impl/context/metal_context.hpp"
+#include "impl/context/worker_stream_state_client.hpp"
 
 namespace tt::tt_metal {
 
@@ -26,9 +28,24 @@ LightMetalCaptureContext& LightMetalCaptureContext::get() {
     return instance;
 }
 
-bool LightMetalCaptureContext::is_tracing() const { return is_tracing_; }
+bool LightMetalCaptureContext::is_tracing() const { return is_tracing_.load(std::memory_order_acquire); }
 
-void LightMetalCaptureContext::set_tracing(bool is_tracing) { is_tracing_ = is_tracing; }
+void LightMetalCaptureContext::begin_capture() {
+    WorkerStreamStateAdmission admission;
+    if (MetalContext::instance_exists())
+        MetalContext::instance().validate_worker_stream_state_trace();
+    TT_FATAL(!is_tracing(), "Light Metal Capture is already enabled.");
+    reset();
+    is_tracing_.store(true, std::memory_order_release);
+}
+
+LightMetalBinary LightMetalCaptureContext::end_capture() {
+    WorkerStreamStateAdmission admission;
+    TT_FATAL(is_tracing(), "Light Metal Capture was not enabled.");
+    auto binary = create_light_metal_binary();
+    is_tracing_.store(false, std::memory_order_release);
+    return binary;
+}
 
 flatbuffers::FlatBufferBuilder& LightMetalCaptureContext::get_builder() { return builder_; }
 
@@ -58,7 +75,7 @@ LightMetalBinary LightMetalCaptureContext::create_light_metal_binary() {
 
 // Reset some internal state, and ensure tracing isn't active. Should only be called at start of tracing.
 void LightMetalCaptureContext::reset() {
-    TT_ASSERT(!is_tracing_, "Cannot reset light metal capture context while tracing is enabled.");
+    TT_ASSERT(!is_tracing(), "Cannot reset light metal capture context while tracing is enabled.");
     builder_.Clear();
     next_global_id_ = 0;
     cmds_vec_.clear();

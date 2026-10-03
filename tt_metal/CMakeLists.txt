@@ -181,6 +181,11 @@ if(TT_METAL_BUILD_TESTS)
 endif()
 
 if(TT_INSTALL)
+    # Native deployment adapters consume these SDK-private ownership types.
+    install(FILES llrt/worker_stream_state_provider.hpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llrt COMPONENT metalium-dev)
+    install(FILES impl/context/worker_stream_state_client.hpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/impl/context COMPONENT metalium-dev)
     install(
         TARGETS
             tt_metal

@@ -24,6 +24,10 @@
 namespace tt::tt_metal::distributed {
 
 void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload, bool blocking) {
+    // Also covers the service-workload branch before it bypasses queue leaves.
+    for (const auto& [range, program] : mesh_workload.get_programs())
+        program.impl().validate_worker_stream_state_client(
+            MetalContext::instance(extract_context_id(mesh_cq.device())));
     // Short-circuit for inactive MeshDevices (no-op)
     if (mesh_cq.device()->get_view().get_devices().empty()) {
         return;

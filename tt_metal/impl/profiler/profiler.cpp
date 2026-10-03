@@ -652,9 +652,9 @@ tt::umd::CoreCoord translateNocCoordinatesToNoc0(
         enchantum::to_string(noc_used_for_transfer));
 }
 
-bool skipReadingDeviceTraceCounter() {
-    return MetalContext::instance().rtoptions().get_profiler_do_dispatch_cores() ||
-           MetalContext::instance().rtoptions().get_profiler_trace_only();
+bool skipReadingDeviceTraceCounter(ContextId context_id) {
+    return MetalContext::instance(context_id).rtoptions().get_profiler_do_dispatch_cores() ||
+           MetalContext::instance(context_id).rtoptions().get_profiler_trace_only();
 }
 
 bool isMarkerAZoneEndpoint(const tracy::TTDeviceMarker& marker) {
@@ -1621,7 +1621,8 @@ void DeviceProfiler::readRiscProfilerResults(
         }
     }
 
-    const uint32_t profiler_dram_bank_size_per_risc_bytes = get_profiler_dram_bank_size_per_risc_bytes();
+    const uint32_t profiler_dram_bank_size_per_risc_bytes =
+        get_profiler_dram_bank_size_per_risc_bytes(MetalContext::instance(context_id).rtoptions());
     const uint32_t profiler_dram_bank_vector_size_per_risc = profiler_dram_bank_size_per_risc_bytes / sizeof(uint32_t);
 
     const uint32_t coreFlatID = MetalContext::instance(context_id)
@@ -1775,7 +1776,7 @@ void DeviceProfiler::readRiscProfilerResults(
                     riscNumRead = data_buffer.at(index) & kernel_profiler::PROFILER_ID_RISC_MASK;
                     coreFlatIDRead = (data_buffer.at(index) >> kernel_profiler::PROFILER_ID_FLAT_SHIFT) &
                                      kernel_profiler::PROFILER_ID_FLAT_MASK;
-                    if (!skipReadingDeviceTraceCounter()) {
+                    if (!skipReadingDeviceTraceCounter(context_id)) {
                         deviceTraceCounterRead = (data_buffer.at(index) >> kernel_profiler::PROFILER_ID_TRACE_SHIFT) &
                                                  kernel_profiler::PROFILER_ID_TRACE_MASK;
                     }
@@ -1956,7 +1957,7 @@ void DeviceProfiler::readRiscProfilerResults(
         }
     }
 
-    if (!skipReadingDeviceTraceCounter()) {
+    if (!skipReadingDeviceTraceCounter(context_id)) {
         // TODO: #30169, This assert should be modified to be == once we've incorporated sub-device association for
         // traces. Currently, we don't know which sub-device a trace belongs to, and so the final device trace counter
         // that we read might not be the last trace that has been executed by the host.
@@ -2584,18 +2585,73 @@ void DeviceProfiler::setOutputDir(const std::string& new_output_dir) {
 #endif
 }
 
+void DeviceProfiler::retainRawResults(
+    IDevice* device,
+    const std::vector<CoreCoord>& virtual_cores,
+    ProfilerRawDeviceCapture& capture) const {
+    auto& context = MetalContext::instance(context_id);
+    const auto& cluster = context.get_cluster();
+    const auto& soc = cluster.get_soc_desc(device_id);
+    const auto& flat_ids = cluster.get_virtual_routing_to_profiler_flat_id(device_id);
+    const uint64_t words_per_risc = get_profiler_dram_bank_size_per_risc_bytes(context.rtoptions()) / sizeof(uint32_t);
+    const uint64_t max_riscs = context.hal().get_max_processors_per_core();
+
+    std::vector<ProfilerRawCoreCapture> cores;
+    cores.reserve(virtual_cores.size());
+    for (const auto& virtual_core : virtual_cores) {
+        ProfilerRawCoreCapture core;
+        core.virtual_core = virtual_core;
+        core.physical_core = soc.translate_coord_to(virtual_core, CoordSystem::TRANSLATED, CoordSystem::NOC0);
+        core.flat_id = flat_ids.at(virtual_core);
+        core.control_words = core_control_buffers.at(virtual_core);
+        const auto core_type = tt::llrt::get_core_type(
+            MetalEnvAccessor(context.get_env()).impl(), device->id(), virtual_core);
+        const bool tensix = core_type == HalProgrammableCoreType::TENSIX;
+        core.kind = tensix ? ProfilerRawCoreKind::Tensix : ProfilerRawCoreKind::Ethernet;
+        const uint32_t risc_count = tensix ? context.hal().get_num_risc_processors(core_type) : 1;
+        core.riscs.reserve(risc_count);
+        for (uint32_t risc = 0; risc < risc_count; ++risc) {
+            ProfilerRawRiscCapture stream;
+            stream.risc_id = risc;
+            stream.end_index = core.control_words.at(risc);
+            stream.dropped_zones = (core.control_words.at(kernel_profiler::DROPPED_ZONES) >> risc) & 1u;
+            stream.dram_word_offset = (core.flat_id * max_riscs + risc) * words_per_risc;
+            // Never let a corrupt end index read into the next RISC's region.
+            // Keep that index unchanged so the decoder diagnoses truncation.
+            if (stream.dram_word_offset < profile_buffer.size()) {
+                const uint64_t count = std::min<uint64_t>(
+                    {stream.end_index, words_per_risc, profile_buffer.size() - stream.dram_word_offset});
+                auto first = profile_buffer.begin() + stream.dram_word_offset;
+                stream.words.assign(first, first + count);
+            }
+            core.riscs.push_back(std::move(stream));
+        }
+        cores.push_back(std::move(core));
+    }
+    capture.device_id = device_id;
+    capture.protocol = ProfilerRawProtocol::ClassicDram;
+    capture.timestamp_width = kernel_profiler::PROFILER_MARKER_TS_BITS;
+    capture.cores = std::move(cores);
+    capture.disposition = ProfilerRawReadDisposition::ReadComplete;
+}
+
 void DeviceProfiler::readResults(
     distributed::MeshDevice* mesh_device,
     IDevice* device,
     const std::vector<CoreCoord>& virtual_cores,
     const ProfilerReadState state,
     const ProfilerDataBufferSource data_source,
-    const std::optional<ProfilerOptionalMetadata>& /*metadata*/) {
+    const std::optional<ProfilerOptionalMetadata>& /*metadata*/,
+    ProfilerRawDeviceCapture* raw_capture) {
 #if defined(TRACY_ENABLE)
     ZoneScoped;
     if (!getDeviceProfilerState(context_id)) {
         return;
     }
+
+    TT_FATAL(
+        !raw_capture || (state == ProfilerReadState::NORMAL && data_source == ProfilerDataBufferSource::DRAM),
+        "Raw profiler capture requires a normal classic DRAM read");
 
     const std::string zone_name = fmt::format(
         "{}-{}-{}-{}", "readResults", device_id, enchantum::to_string(state), enchantum::to_string(data_source));
@@ -2610,11 +2666,22 @@ void DeviceProfiler::readResults(
     constexpr uint8_t default_dram_buffer_index = 0;
 
     if (data_source == ProfilerDataBufferSource::DRAM) {
+        if (raw_capture) {
+            raw_capture->disposition = ProfilerRawReadDisposition::ReadStarted;
+        }
         readControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
 
         readProfilerBuffer(mesh_device, device, default_dram_buffer_index, force_slow_dispatch);
 
+        if (raw_capture) {
+            retainRawResults(device, virtual_cores, *raw_capture);
+            raw_capture->disposition = ProfilerRawReadDisposition::ResetStarted;
+        }
         resetControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
+        if (raw_capture) {
+            // No allocation or host decoding may intervene after reset succeeds.
+            raw_capture->disposition = ProfilerRawReadDisposition::ResetComplete;
+        }
     } else if (data_source == ProfilerDataBufferSource::L1) {
         readControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
 

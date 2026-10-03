@@ -32,6 +32,8 @@ std::unique_ptr<DispatchContext, DispatchContext::Deleter> DispatchContext::disp
 DispatchContext::~DispatchContext() = default;
 
 void DispatchContext::reset() {
+    if (MetalContext::instance_exists())
+        MetalContext::instance().validate_worker_stream_state_access();
     num_fd_inits_ = 0;
     fast_dispatch_enabled_ = false;
     stashed_sd_queues_.reset();
@@ -45,6 +47,7 @@ DispatchContext& DispatchContext::get() {
 }
 
 void DispatchContext::initialize_fast_dispatch(distributed::MeshDevice* mesh_device) {
+    mesh_device->impl().metal_context().validate_worker_stream_state_access();
     // If the mesh device is inactive, do not attempt to initialize fast dispatch.
     if (mesh_device->impl().view_->get_devices().empty()) {
         return;
@@ -123,6 +126,7 @@ void DispatchContext::initialize_fast_dispatch(distributed::MeshDevice* mesh_dev
 }
 
 void DispatchContext::terminate_fast_dispatch(distributed::MeshDevice* mesh_device) {
+    mesh_device->impl().metal_context().validate_worker_stream_state_access();
     // If the mesh device is inactive, do not attempt to terminate fast dispatch.
     if (mesh_device->impl().view_->get_devices().empty()) {
         return;
@@ -184,6 +188,7 @@ void DispatchContext::terminate_fast_dispatch(distributed::MeshDevice* mesh_devi
 }
 
 void DispatchContext::set_configure_only(distributed::MeshDevice* mesh_device, bool enable) {
+    mesh_device->impl().metal_context().validate_worker_stream_state_access();
     TT_FATAL(
         !mesh_device->impl().metal_env().get_rtoptions().get_fast_dispatch(),
         "{} can only be called when Fast Dispatch is disabled.",
@@ -193,6 +198,7 @@ void DispatchContext::set_configure_only(distributed::MeshDevice* mesh_device, b
 }
 
 void DispatchContext::enable_asynchronous_slow_dispatch(distributed::MeshDevice* mesh_device) {
+    mesh_device->impl().metal_context().validate_worker_stream_state_access();
     TT_FATAL(
         !mesh_device->impl().metal_env().get_rtoptions().get_fast_dispatch(),
         "{} can only be called when Fast Dispatch is disabled.",
@@ -202,6 +208,7 @@ void DispatchContext::enable_asynchronous_slow_dispatch(distributed::MeshDevice*
 }
 
 void DispatchContext::disable_asynchronous_slow_dispatch(distributed::MeshDevice* mesh_device) {
+    mesh_device->impl().metal_context().validate_worker_stream_state_access();
     TT_FATAL(
         !mesh_device->impl().metal_env().get_rtoptions().get_fast_dispatch(),
         "{} can only be called when Fast Dispatch is disabled.",

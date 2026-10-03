@@ -17,6 +17,7 @@
 #include "tt-metalium/program.hpp"       // KernelGroup
 #include "tt-metalium/mesh_workload.hpp"
 #include "hostdev/remote_dfb_constants.h"  // REMOTE_DFB_OFFSET_NONE
+#include "hostdev/worker_stream_state_contract.h"
 #include "program_device_map.hpp"          // ProgramTransferInfo
 #include "impl/buffers/semaphore.hpp"
 #include "impl/allocator/persistent_l1_arena.hpp"
@@ -45,8 +46,15 @@
 #include <utility>
 #include <tt_stl/span.hpp>
 
+namespace tt::tt_fabric {
+std::unique_ptr<tt::tt_metal::Program> create_and_compile_tt_fabric_program(tt::tt_metal::IDevice* device);
+}
+
 namespace tt::tt_metal {
 
+class DispatchTopology;
+class MetalContext;
+class WorkerStreamStateClient;
 class CircularBufferConfig;
 class IDevice;
 class JitBuildOptions;
@@ -58,6 +66,7 @@ class Kernel;
 
 namespace distributed {
 class MeshDevice;
+class RealtimeProfilerManager;
 class MeshWorkload;
 class MeshWorkloadImpl;
 }  // namespace distributed
@@ -173,6 +182,7 @@ using SemaphoresGetter = std::function<const std::vector<Semaphore>&()>;
 // Internal class for holding a group of programs for parallel compilation.
 class ProgramCompileGroup {
 private:
+    friend class ::tt::tt_metal::DispatchTopology;
     std::mutex mutex_;
     std::unordered_map<IDevice*, std::unique_ptr<Program>> program_device_map_;
 
@@ -224,6 +234,14 @@ public:
     void set_runtime_id(ProgramId id);
     ProgramId get_runtime_id() const;
     ProgramId get_id() const;
+    void set_worker_stream_state_owner(tt::worker_stream_state::Owner owner);
+    tt::worker_stream_state::Owner get_worker_stream_state_owner() const {
+        return worker_stream_state_owner_;
+    }
+    void validate_worker_stream_state() const;
+    void bind_worker_stream_state_client(std::shared_ptr<const WorkerStreamStateClient> client);
+    void validate_worker_stream_state_client(
+        const MetalContext& context, std::optional<ChipId> device_id = std::nullopt) const;
     std::size_t num_kernels() const;
     std::span<const std::shared_ptr<CircularBufferImpl>> circular_buffers() const;
     const std::vector<Semaphore>& semaphores() const;
@@ -652,6 +670,23 @@ private:
     std::unordered_map<ChipId, std::shared_ptr<Buffer>> kernels_buffer_;
     ProgramTransferInfo program_transfer_info;
 
+    tt::worker_stream_state::Owner worker_stream_state_owner_ =
+        tt::worker_stream_state::Owner::SdkCircularBuffers;
+    bool worker_stream_state_owner_frozen_{false};
+    std::shared_ptr<const WorkerStreamStateClient> worker_stream_state_client_;
+    friend class distributed::RealtimeProfilerManager;
+    friend class ::tt::tt_metal::DispatchTopology;
+    friend std::unique_ptr<Program> tt::tt_fabric::create_and_compile_tt_fabric_program(
+        ::tt::tt_metal::IDevice* device);
+    enum class InternalWorkerStreamStateOwner { Dispatch, Fabric, RealtimeProfiler };
+    void bind_internal_worker_stream_state_client(
+        MetalContext& context, ChipId device_id, InternalWorkerStreamStateOwner owner);
+    void bind_realtime_profiler_client(MetalContext& context, ChipId device_id);
+    std::weak_ptr<const WorkerStreamStateClient> worker_stream_state_internal_client_;
+    std::optional<InternalWorkerStreamStateOwner> worker_stream_state_internal_owner_;
+    std::optional<ChipId> worker_stream_state_internal_device_;
+    std::vector<std::vector<CoreCoord>> worker_stream_state_internal_cores_;
+    std::vector<std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>> worker_stream_state_internal_kernels_;
     bool finalized_{false};
     bool program_run_args_initialized_{false};
     // Used only when devices do not have virtualization enabled and used to check that programs are only rerun on

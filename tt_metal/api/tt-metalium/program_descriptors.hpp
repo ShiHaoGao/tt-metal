@@ -96,6 +96,7 @@ struct DataMovementConfigDescriptor {
     DataMovementProcessor processor = DataMovementProcessor::RISCV_0;
     NOC noc = NOC::RISCV_0_default;
     NOC_MODE noc_mode = NOC_MODE::DM_DEDICATED_NOC;
+    KernelBodyMode body_mode = KernelBodyMode::Sdk;
 };
 struct ComputeConfigDescriptor {
     using UnpackToDestModes = std::vector<UnpackToDestMode>;
@@ -108,6 +109,7 @@ struct ComputeConfigDescriptor {
     bool math_approx_mode = false;
     // See ComputeConfig::enable_trisc2_rvv.
     bool enable_trisc2_rvv = false;
+    KernelBodyMode body_mode = KernelBodyMode::Sdk;
 };
 
 // Declares that a specific per-core runtime arg position holds a buffer base address

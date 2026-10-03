@@ -32,6 +32,18 @@ set_target_properties(
 )
 list(APPEND METAL_TEST_TARGETS unit_tests_legacy)
 
+# Owned ELF admission must remain usable before any device/context exists.
+# Keep this CPU test in its own process, separate from device fixtures.
+add_executable(unit_tests_owned_elf llrt/test_owned_elf.cpp)
+target_link_libraries(unit_tests_owned_elf PRIVATE test_metal_common_libs)
+target_include_directories(unit_tests_owned_elf PRIVATE
+    "$<TARGET_PROPERTY:Metalium::Metal,INCLUDE_DIRECTORIES>")
+set_target_properties(unit_tests_owned_elf PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/test/tt_metal)
+gtest_discover_tests(unit_tests_owned_elf
+    TEST_PREFIX "unit_tests_owned_elf." DISCOVERY_TIMEOUT 60)
+list(APPEND METAL_TEST_TARGETS unit_tests_owned_elf)
+
 # Standalone test_clean_init executable (not a gtest - requires custom main with skip-teardown handling)
 add_executable(test_clean_init test_clean_init.cpp)
 tt_reuse_precompile_headers(test_clean_init metal_test_pch)

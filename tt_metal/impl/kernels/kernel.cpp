@@ -41,6 +41,20 @@ namespace tt::tt_metal {
 namespace fs = std::filesystem;
 
 namespace {
+void validate_user_defines(const std::map<std::string, std::string>& defines) {
+    TT_FATAL(
+        !defines.contains("TT_METAL_NATIVE_BODY"),
+        "TT_METAL_NATIVE_BODY is reserved for the typed KernelBodyMode configuration");
+}
+
+void set_kernel_body_mode(JitBuildOptions& options, KernelBodyMode mode) {
+    TT_FATAL(mode == KernelBodyMode::Sdk || mode == KernelBodyMode::Native, "Unknown kernel body mode");
+    TT_FATAL(
+        mode != KernelBodyMode::Native || options.build_env.get_arch() == tt::ARCH::BLACKHOLE,
+        "Native kernel bodies require the Blackhole Tensix startup ABI");
+    options.body_mode = mode;
+}
+
 // Kernel path resolve:
 //
 // If the path is not an absolute path, then it must be resolved relative to:
@@ -206,6 +220,7 @@ Kernel::Kernel(
     watcher_assert_enabled_(
         build_context.options.get_watcher_enabled() && !build_context.options.watcher_assert_disabled()),
     watcher_count_word_offset_(watcher_assert_enabled_ ? 1 : 0) {
+    validate_user_defines(defines_);
     this->register_kernel_with_watcher(build_context.watcher);
 
     size_t max_x = 0, max_y = 0;
@@ -284,6 +299,7 @@ CoreType Kernel::get_kernel_core_type() const {
 const std::string& Kernel::get_full_kernel_name() const { return this->kernel_full_name_; }
 
 void Kernel::add_defines(const std::map<std::string, std::string>& defines) {
+    validate_user_defines(defines);
     this->defines_.insert(defines.begin(), defines.end());
 }
 
@@ -297,15 +313,15 @@ void Kernel::process_defines(
 void DataMovementKernel::process_defines(
     const std::function<void(const std::string& define, const std::string& value)> callback) const {
     Kernel::process_defines(callback);
+    callback("TT_METAL_NATIVE_BODY", this->config_.body_mode == KernelBodyMode::Native ? "1" : "0");
     callback("NOC_INDEX", std::to_string(this->config_.noc));
     callback("NOC_MODE", std::to_string(this->config_.noc_mode));
 }
 
 void ComputeKernel::process_defines(
     const std::function<void(const std::string& define, const std::string& value)> callback) const {
-    for (const auto& [define, value] : this->defines_) {
-        callback(define, value);
-    }
+    Kernel::process_defines(callback);
+    callback("TT_METAL_NATIVE_BODY", this->config_.body_mode == KernelBodyMode::Native ? "1" : "0");
     // pass default noc mode as compute does not need it, just for compile to pass
     callback("NOC_MODE", std::to_string(NOC_MODE::DM_DEDICATED_NOC));
 }
@@ -554,11 +570,15 @@ uint32_t ComputeKernel::get_kernel_processor_type(int index) const {
 }
 
 std::string DataMovementKernel::config_hash() const {
-    return fmt::format(
+    std::string hash = fmt::format(
         "{}_{}_{}",
         enchantum::to_string(this->config_.processor),
         enchantum::to_string(this->config_.noc),
         enchantum::to_string(this->config_.noc_mode));
+    if (this->config_.body_mode == KernelBodyMode::Native) {
+        hash += "_native";
+    }
+    return hash;
 }
 
 std::string DramKernel::config_hash() const { return fmt::format("dram_{}", enchantum::to_string(this->config_.noc)); }
@@ -574,6 +594,11 @@ std::string EthernetKernel::config_hash() const {
 }
 
 std::string ComputeKernel::config_hash() const {
+    if (this->config_.body_mode == KernelBodyMode::Native) {
+        // Numerical LLK options do not configure or change a native body.
+        // The machine extension still changes the compile recipe.
+        return this->config_.enable_trisc2_rvv ? "native_rvv" : "native";
+    }
     // This handles config hashing for unpack_to_dest_mode which can be:
     // 1. Having specific configuration (e.g. some CBs are set to UnpackToDestFp32)
     // 2. Having explicit default configuration (vector full of Default)
@@ -979,7 +1004,15 @@ uint32_t Kernel::get_binary_text_size(IDevice* device, int index) const {
     return iter != this->binaries_.end() ? iter->second[index]->get_text_size() : 0;
 }
 
+void DataMovementKernel::set_build_options(JitBuildOptions& build_options) const {
+    set_kernel_body_mode(build_options, this->config_.body_mode);
+}
+
 void ComputeKernel::set_build_options(JitBuildOptions& build_options) const {
+    set_kernel_body_mode(build_options, this->config_.body_mode);
+    if (this->config_.body_mode == KernelBodyMode::Native) {
+        return;
+    }
     build_options.set_hlk_math_fidelity_all_cores(this->config_.math_fidelity);
     build_options.set_hlk_math_approx_mode_all_cores(this->config_.math_approx_mode);
     build_options.fp32_dest_acc_en = this->config_.fp32_dest_acc_en;

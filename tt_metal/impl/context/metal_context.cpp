@@ -16,6 +16,7 @@
 #include <tracy/Tracy.hpp>
 
 #include "metal_context.hpp"
+#include "impl/lightmetal/lightmetal_capture.hpp"
 #include "context_types.hpp"
 #include <internal/service/service_core_manager.hpp>
 #include "context/metal_env_accessor.hpp"
@@ -60,6 +61,16 @@
 #include <dispatch/dispatch_mem_map.hpp>
 
 namespace tt::tt_metal {
+
+WorkerStreamStateAccess::WorkerStreamStateAccess(
+    std::shared_ptr<const WorkerStreamStateClient> client)
+    : client_(std::move(client)), previous_(current_) {
+    current_ = client_.get();
+}
+
+WorkerStreamStateAccess::~WorkerStreamStateAccess() {
+    current_ = previous_;
+}
 
 // MetalContext destructor is private, so we can't use a unique_ptr to manage the instance.
 std::array<std::atomic<MetalContext*>, MAX_CONTEXT_COUNT> g_instances{};
@@ -106,9 +117,10 @@ void validate_worker_l1_size(size_t& worker_l1_size, const Hal& hal) {
 }  // namespace
 
 ContextId extract_context_id(const IDevice* device) {
-    // get_mesh_device is not const
-    if (const_cast<IDevice*>(device)->get_mesh_device() != nullptr) {
-        const auto& mesh_device = const_cast<IDevice*>(device)->get_mesh_device();
+    // Context identity does not acquire ownership. In particular, worker-state
+    // cleanup can query it from MeshDevice's destructor after the last shared
+    // owner has gone; get_mesh_device() would call shared_from_this() there.
+    if (const auto* mesh_device = dynamic_cast<const distributed::MeshDevice*>(device)) {
         return mesh_device->impl().get_context_id();
     }
     // Must be a Device if not MeshDevice
@@ -144,6 +156,7 @@ void MetalContext::initialize_device_manager(
     size_t worker_l1_size,
     bool init_profiler,
     bool initialize_fabric_and_dispatch_fw) {
+    validate_worker_stream_state_access();
     initialize(dispatch_core_config, num_hw_cqs, {l1_bank_remap.begin(), l1_bank_remap.end()}, worker_l1_size);
     init_context_descriptor(num_hw_cqs, l1_small_size, trace_region_size, worker_l1_size);
     device_manager_->initialize(device_ids, init_profiler, initialize_fabric_and_dispatch_fw, context_descriptor_);
@@ -155,6 +168,7 @@ void MetalContext::initialize(
     const BankMapping& l1_bank_remap,
     size_t worker_l1_size,
     bool minimal) {
+    validate_worker_stream_state_access();
     ZoneScoped;
 
     // Workaround for galaxy, need to always re-init
@@ -325,11 +339,13 @@ void MetalContext::reinitialize_dispatch_managers() {
 }
 
 void MetalContext::set_fast_dispatch_mode(bool enable) {
+    validate_worker_stream_state_access();
     rtoptions().set_fast_dispatch(enable);
     reinitialize_dispatch_managers();
 }
 
 void MetalContext::teardown() {
+    validate_worker_stream_state_access();
     ZoneScoped;
 
     if (!initialized_) {
@@ -373,6 +389,82 @@ void MetalContext::teardown() {
     inspector_data_.reset();
 
     noc_debug_state_.reset();
+}
+
+std::shared_ptr<const WorkerStreamStateProvider>
+MetalContext::worker_stream_state_provider(ChipId device_id) const {
+    return risc_firmware_initializer_ ? risc_firmware_initializer_->worker_stream_state_provider(device_id) : nullptr;
+}
+
+WorkerStreamStateAdmission::WorkerStreamStateAdmission()
+    : lock_([]() -> std::mutex& { static std::mutex mutex; return mutex; }()) {}
+
+std::shared_ptr<const WorkerStreamStateClient>
+MetalContext::acquire_worker_stream_state_client(DeviceProfilerMode profiler_mode) {
+    TT_FATAL(profiler_mode == DeviceProfilerMode::Disabled || profiler_mode == DeviceProfilerMode::Program,
+             "Invalid worker stream-state profiler deployment");
+    WorkerStreamStateAdmission admission;
+    TT_FATAL(!LightMetalCaptureContext::get().is_tracing(),
+             "Worker stream-state clients cannot enter an active LightMetal capture");
+    std::lock_guard lock(g_instance_mutex);
+    auto* context = g_instances[DEFAULT_CONTEXT_ID.get()].load(std::memory_order_acquire);
+    auto client = std::shared_ptr<const WorkerStreamStateClient>(new WorkerStreamStateClient);
+    if (context) {
+        auto state = context->worker_stream_state_client_state_.load(std::memory_order_acquire);
+        TT_FATAL(state, "Worker stream-state deployment cannot reuse an uncoordinated SDK context");
+        TT_FATAL(state->client.expired(), "Worker stream-state context already has a live client");
+        TT_FATAL(!context->device_manager_ || context->device_manager_->get_all_active_devices().empty(),
+                 "Retired worker stream-state client still has live devices");
+        context->rtoptions().validate_device_profiler_mode(profiler_mode);
+        TT_FATAL(!context->rtoptions().get_profiler_sync_enabled() &&
+                     !context->rtoptions().get_streaming_profiler_enabled(),
+                 "Worker stream-state deployment cannot run uncoordinated profiler worker programs");
+        context->worker_stream_state_client_state_.store(
+            std::make_shared<const WorkerStreamStateClientState>(client), std::memory_order_release);
+    } else {
+        // The helper constructs exclusive state before publishing g_instances.
+        // An ordinary lock-free instance() reader can never observe a temporary
+        // nonexclusive context while acquisition still holds g_instance_mutex.
+        create_default_instance_implicit_locked(profiler_mode, client);
+        register_handlers_locked();
+    }
+    return client;
+}
+
+void MetalContext::validate_worker_stream_state_client(
+    const std::shared_ptr<const WorkerStreamStateClient>& client) const {
+    auto state = worker_stream_state_client_state_.load(std::memory_order_acquire);
+    if (!state) {
+        TT_FATAL(!client, "Worker stream-state client belongs to another SDK context");
+        return;
+    }
+    auto live = state->client.lock();
+    TT_FATAL(live && client == live,
+             "Worker stream-state context rejects an uncoordinated or stale SDK client");
+}
+
+void MetalContext::validate_worker_stream_state_access() const {
+    auto state = worker_stream_state_client_state_.load(std::memory_order_acquire);
+    if (!state)
+        return;
+    auto live = state->client.lock();
+    TT_FATAL(live && WorkerStreamStateAccess::current_ == live.get(),
+             "Worker stream-state context lifecycle requires its exclusive client");
+}
+
+std::shared_ptr<const WorkerStreamStateClient> MetalContext::retain_worker_stream_state_client() const {
+    auto state = worker_stream_state_client_state_.load(std::memory_order_acquire);
+    if (!state)
+        return {};
+    auto live = state->client.lock();
+    TT_FATAL(live && WorkerStreamStateAccess::current_ == live.get(),
+             "Worker stream-state context lifecycle requires its exclusive client");
+    return live;
+}
+
+void MetalContext::validate_worker_stream_state_trace() const {
+    TT_FATAL(!has_exclusive_worker_stream_state(),
+             "SDK trace capture and replay have no retained worker stream-state client/provider binding");
 }
 
 bool MetalContext::instance_exists(ContextId context_id) {
@@ -446,7 +538,9 @@ MetalContext& MetalContext::instance(ContextId context_id, DeviceProfilerMode pr
     return *instance;
 }
 
-ContextId MetalContext::create_default_instance_implicit_locked(std::optional<DeviceProfilerMode> profiler_mode) {
+ContextId MetalContext::create_default_instance_implicit_locked(
+    std::optional<DeviceProfilerMode> profiler_mode,
+    std::shared_ptr<const WorkerStreamStateClient> worker_client) {
     if (g_instances[DEFAULT_CONTEXT_ID.get()].load(std::memory_order_acquire) != nullptr) {
         TT_THROW("Only one silicon MetalContext instance may exist; context_id 0 is already in use.");
     }
@@ -459,8 +553,20 @@ ContextId MetalContext::create_default_instance_implicit_locked(std::optional<De
     if (profiler_mode) {
         desc.set_device_profiler_mode(*profiler_mode);
     }
-    g_default_env = new MetalEnv(std::move(desc));
-    MetalContext* instance = new MetalContext(DEFAULT_CONTEXT_ID, *g_default_env);
+    // Allocate immutable admission before publication. A failed environment or
+    // profiler admission leaves no partially published context or dangling env.
+    std::shared_ptr<const WorkerStreamStateClientState> worker_state;
+    if (worker_client)
+        worker_state = std::make_shared<const WorkerStreamStateClientState>(worker_client);
+    auto environment = std::make_unique<MetalEnv>(std::move(desc));
+    if (worker_client) {
+        const auto& options = MetalEnvAccessor(*environment).impl().get_rtoptions();
+        TT_FATAL(!options.get_profiler_sync_enabled() && !options.get_streaming_profiler_enabled(),
+                 "Worker stream-state deployment cannot run uncoordinated profiler worker programs");
+    }
+    MetalContext* instance = new MetalContext(DEFAULT_CONTEXT_ID, *environment);
+    instance->worker_stream_state_client_state_.store(std::move(worker_state), std::memory_order_release);
+    g_default_env = environment.release();
     // Set the env_owned_ to true so the MetalContext destructor will delete the env_
     instance->env_owned_ = true;
 
@@ -505,6 +611,7 @@ void MetalContext::destroy_instance(bool check_device_count, ContextId context_i
     if (!instance) {
         return;
     }
+    instance->validate_worker_stream_state_access();
     if (check_device_count && instance->device_manager() && instance->device_manager()->is_initialized() &&
         !instance->device_manager()->get_all_active_devices().empty()) {
         TT_THROW("Cannot destroy MetalContext while devices are still open. Close all devices first.");
@@ -528,6 +635,11 @@ void MetalContext::register_handlers_locked() {
         std::atexit([]() {
             // Don't check device count because the destruction order is complicated and we can't guarantee that the
             // client isn't holding onto devices on process exit.
+            // Process termination owns final teardown, after user admission has
+            // ceased. Ordinary explicit destroy calls still require the client.
+            for (auto& slot : g_instances)
+                if (auto* context = slot.load(std::memory_order_acquire))
+                    context->worker_stream_state_client_state_.store({}, std::memory_order_release);
             MetalContext::destroy_all_instances(false);
         });
         registered_handlers = true;
@@ -632,6 +744,7 @@ tt::tt_fabric::ControlPlane& MetalContext::get_control_plane() {
 }
 
 void MetalContext::initialize_control_plane() {
+    validate_worker_stream_state_access();
     TT_ASSERT(env_ != nullptr, "Missing MetalEnv for this MetalContext");
     MetalEnvAccessor(*env_).impl().initialize_control_plane();
 }
@@ -644,6 +757,7 @@ distributed::SystemMesh& MetalContext::get_system_mesh() {
 void MetalContext::set_custom_fabric_topology(
     const std::string& mesh_graph_desc_file,
     const std::map<tt_fabric::FabricNodeId, ChipId>& logical_mesh_chip_id_to_physical_chip_id_mapping) {
+    validate_worker_stream_state_access();
     TT_FATAL(
         !device_manager_->is_initialized() || device_manager_->get_all_active_devices().empty(),
         "Modifying control plane requires no devices to be active");
@@ -653,6 +767,7 @@ void MetalContext::set_custom_fabric_topology(
 }
 
 void MetalContext::set_default_fabric_topology() {
+    validate_worker_stream_state_access();
     TT_FATAL(
         !device_manager_->is_initialized() || device_manager_->get_all_active_devices().empty(),
         "Modifying control plane requires no devices to be active");
@@ -668,6 +783,7 @@ void MetalContext::set_fabric_config(
     tt_fabric::FabricUDMMode fabric_udm_mode,
     tt_fabric::FabricManagerMode fabric_manager,
     tt_fabric::FabricRouterConfig router_config) {
+    validate_worker_stream_state_access();
     TT_FATAL(env_ != nullptr, "Missing MetalEnv for this MetalContext");
     // This env pointer was provided to both descriptors so they
     // will see the updated config as well
@@ -682,11 +798,13 @@ void MetalContext::set_fabric_config(
 }
 
 void MetalContext::initialize_fabric_config() {
+    validate_worker_stream_state_access();
     TT_FATAL(env_ != nullptr, "Missing MetalEnv for this MetalContext");
     MetalEnvAccessor(*env_).impl().initialize_fabric_config();
 }
 
 void MetalContext::initialize_fabric_tensix_datamover_config() {
+    validate_worker_stream_state_access();
     TT_FATAL(env_ != nullptr, "Missing MetalEnv for this MetalContext");
     MetalEnvAccessor(*env_).impl().initialize_fabric_tensix_datamover_config();
 }
@@ -707,6 +825,7 @@ const tt_fabric::FabricRouterConfig& MetalContext::get_fabric_router_config() co
 }
 
 void MetalContext::set_fabric_tensix_config(tt_fabric::FabricTensixConfig fabric_tensix_config) {
+    validate_worker_stream_state_access();
     TT_FATAL(env_ != nullptr, "Missing MetalEnv for this MetalContext");
     MetalEnvAccessor(*env_).impl().set_fabric_tensix_config(fabric_tensix_config);
 }

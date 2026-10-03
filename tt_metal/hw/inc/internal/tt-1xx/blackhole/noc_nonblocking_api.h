@@ -9,6 +9,7 @@
 #include "internal/tt-1xx/cache.h"
 #include "noc_parameters.h"
 #include "hostdev/dev_msgs.h"
+#include "hostdev/blackhole_noc_counters.h"
 #include "noc_overlay_parameters.h"
 #include "api/debug/assert.h"
 
@@ -89,31 +90,6 @@ extern uint32_t noc_nonposted_writes_acked[NUM_NOCS];
 extern uint32_t noc_nonposted_atomics_acked[NUM_NOCS];
 extern uint32_t noc_posted_writes_num_issued[NUM_NOCS];
 
-enum class NocBarrierType : uint8_t {
-    READS_NUM_ISSUED,
-    NONPOSTED_WRITES_NUM_ISSUED,
-    NONPOSTED_WRITES_ACKED,
-    NONPOSTED_ATOMICS_ACKED,
-    POSTED_WRITES_NUM_ISSUED,
-    COUNT
-};
-
-static constexpr uint8_t NUM_BARRIER_TYPES = static_cast<uint32_t>(NocBarrierType::COUNT);
-
-struct BarrierCounter {
-    uint32_t barrier[NUM_BARRIER_TYPES];
-};
-
-struct RiscBarrierCounter {
-    BarrierCounter risc[MaxDMProcessorsPerCoreType];
-};
-
-struct NocBarrierCounter {
-    RiscBarrierCounter noc[NUM_NOCS];
-};
-
-// Must update the allocated size for the counters in dev_mem_map.h AND base FW if this changes
-static_assert(sizeof(NocBarrierCounter) == 80, "NocBarrierCounter size is not 80 bytes");
 
 template <uint8_t proc_t, NocBarrierType barrier_type>
 inline __attribute__((always_inline)) uint32_t get_noc_counter_address(uint32_t noc) {

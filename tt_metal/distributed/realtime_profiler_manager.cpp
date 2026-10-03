@@ -749,6 +749,8 @@ void RealtimeProfilerManager::initialize_devices(const std::shared_ptr<MeshDevic
             CreateKernel(
                 realtime_profiler_program, realtime_profiler_push_kernel_path, realtime_profiler_core, ncrisc_config);
 
+            realtime_profiler_program.impl().bind_realtime_profiler_client(
+                MetalContext::instance(context_id_), device_id);
             realtime_profiler_program.impl().compile(device, /*force_slow_dispatch=*/true);
             ::tt::tt_metal::detail::WriteRuntimeArgsToDevice(
                 device, realtime_profiler_program, /*force_slow_dispatch=*/true);

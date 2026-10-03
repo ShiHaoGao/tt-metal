@@ -157,6 +157,8 @@ set(TT_METAL_PUBLIC_API
     api/tt-metalium/workload_descriptor.hpp
     api/tt-metalium/profiler_optional_metadata.hpp
     api/tt-metalium/profiler_types.hpp
+    api/tt-metalium/profiler_raw_capture.hpp
+    api/tt-metalium/profiler_raw_data.hpp
     api/tt-metalium/program.hpp
     api/tt-metalium/program_cache.hpp
     api/tt-metalium/program_descriptors.hpp
@@ -237,6 +239,7 @@ set(JITAPI_FILES
     soc_descriptors/blackhole_140_arch.yaml
     soc_descriptors/wormhole_b0_80_arch.yaml
     tools/profiler/kernel_profiler.hpp
+    tools/profiler/profiler_counter.hpp
     tools/profiler/perf_counters.hpp
     tools/profiler/fabric_event_profiler.hpp
     tools/profiler/noc_event_profiler.hpp

@@ -39,6 +39,8 @@ struct Tile {
     bool get_transpose_of_faces() const { return transpose_of_faces; }
 
     uint32_t get_tile_size(const DataFormat& format) const;
+    // Explicit target alignment keeps offline metadata independent of MetalContext.
+    uint32_t get_tile_size(const DataFormat& format, uint32_t l1_alignment) const;
 
     // operators
     bool operator==(const Tile& other) const;

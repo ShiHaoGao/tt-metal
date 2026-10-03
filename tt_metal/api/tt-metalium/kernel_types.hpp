@@ -61,6 +61,11 @@ enum class KernelBuildOptLevel : uint8_t {
     Oz,     // Aggressively optimize for size rather than speed.
 };
 
+// Native bodies provide their own numerical configuration and initialization.
+// Firmware startup, runtime arguments, CBs, and profiling retain the SDK ABI.
+// Currently supported only by the Blackhole Tensix kernel startup.
+enum class KernelBodyMode : uint8_t { Sdk, Native };
+
 struct DataMovementConfig {
     DataMovementProcessor processor = DataMovementProcessor::RISCV_0;  // For data transfer kernels: NCRISC & BRISC
     NOC noc = NOC::RISCV_0_default;
@@ -82,6 +87,7 @@ struct DataMovementConfig {
     KernelBuildOptLevel opt_level = KernelBuildOptLevel::O2;
     // Provide include paths for the kernel compiler (-I)
     std::vector<std::filesystem::path> compiler_include_paths;
+    KernelBodyMode body_mode = KernelBodyMode::Sdk;
 };
 
 struct ReaderDataMovementConfig : public DataMovementConfig {
@@ -103,6 +109,8 @@ struct WriterDataMovementConfig : public DataMovementConfig {
 };
 
 struct ComputeConfig {
+    // These numerical options are consumed only in Sdk body mode. Native
+    // bodies express numerical choices in their actual instructions.
     MathFidelity math_fidelity = MathFidelity::HiFi4;
     bool fp32_dest_acc_en = false;
     bool dst_full_sync_en = false;
@@ -132,6 +140,7 @@ struct ComputeConfig {
     KernelBuildOptLevel opt_level = KernelBuildOptLevel::O3;
     // Provide include paths for the kernel compiler (-I)
     std::vector<std::filesystem::path> compiler_include_paths;
+    KernelBodyMode body_mode = KernelBodyMode::Sdk;
 };
 
 // These are only used in op_profiler, are unstable and have not been designed for general use.

@@ -1173,6 +1173,21 @@ void generate_all_descriptors(const JitBuildEnv& env, const JitBuildOptions& opt
         throw std::runtime_error("Cannot create file: " + descriptors_path);
     }
 
+    if (options.body_mode == KernelBodyMode::Native) {
+        // Firmware/dataflow headers still consume CB storage metadata. These
+        // are the actual L1 formats and dimensions, not register formats or a
+        // global numerical policy inferred from unrelated buffers.
+        out << "#pragma once\n\n";
+        emit_formats_array(out, "constexpr uint8_t", "unpack_src_format", max_cbs, desc.buf_dataformat_arr);
+        emit_formats_array(out, "constexpr uint8_t", "pack_dst_format", max_cbs, desc.buf_dataformat_arr);
+        emit_unpack_tile_dims(out, desc, max_cbs);
+        emit_pack_tile_dims(out, desc, max_cbs);
+        if (!out) {
+            throw std::runtime_error("Failed to write file: " + descriptors_path);
+        }
+        return;
+    }
+
     auto fmts = compute_data_formats(options, env.get_arch(), max_cbs);
 
     out << "#pragma once\n\n"

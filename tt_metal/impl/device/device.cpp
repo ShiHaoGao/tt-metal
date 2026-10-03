@@ -568,6 +568,7 @@ bool Device::initialize(
     size_t worker_l1_size,
     ttsl::Span<const std::uint32_t> l1_bank_remap,
     bool minimal) {
+    context_->validate_worker_stream_state_access();
     ZoneScoped;
     // Every initialization call should enable program cache
     this->program_cache_.enable();
@@ -683,6 +684,7 @@ bool Device::initialize(
 }
 
 bool Device::close() {
+    context_->validate_worker_stream_state_access();
     log_trace(tt::LogMetal, "Closing device {}", this->id_);
     if (not this->initialized_) {
         TT_THROW("Cannot close device {} that has not been initialized!", this->id_);

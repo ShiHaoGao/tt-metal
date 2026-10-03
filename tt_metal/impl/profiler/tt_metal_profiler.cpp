@@ -1054,7 +1054,7 @@ std::vector<CoreCoord> getVirtualCoresForProfiling(const IDevice* device, const 
     const auto& dispatch_core_config = metal_ctx.get_dispatch_core_config();
     auto& env = MetalEnvAccessor(metal_ctx.get_env()).impl();
 
-    if (!onlyProfileDispatchCores(state)) {
+    if (state != ProfilerReadState::ONLY_DISPATCH_CORES || !env.get_rtoptions().get_profiler_do_dispatch_cores()) {
         for (const CoreCoord& core :
              tt::get_logical_compute_cores(env, device_id, device_num_hw_cqs, dispatch_core_config)) {
             const CoreCoord curr_core = device->worker_core_from_logical_core(core);
@@ -1250,6 +1250,63 @@ void ReadMeshDeviceProfilerResults(
     }
 
     mesh_device.wait_for_thread_pool();
+#endif
+}
+
+void ReadMeshDeviceProfilerResults(distributed::MeshDevice& mesh_device, ProfilerRawCapture& capture) {
+#if defined(TRACY_ENABLE)
+    const ContextId context_id = extract_context_id(&mesh_device);
+    auto& context = MetalContext::instance(context_id);
+    const auto& options = context.rtoptions();
+    TT_FATAL(capture.context_id == -1 && capture.devices.empty(), "Raw profiler capture must be fresh");
+    options.validate_device_profiler_mode(DeviceProfilerMode::Program);
+    TT_FATAL(
+        !options.get_profiler_accumulate() && !options.get_streaming_profiler_enabled() &&
+            !options.get_profiler_sync_events_enabled() && !getDeviceDebugDumpEnabled(context_id),
+        "Raw profiler capture requires the classic non-accumulate, non-streaming Program protocol");
+    TT_FATAL(
+        context.hal().get_arch() == tt::ARCH::BLACKHOLE || context.hal().get_arch() == tt::ARCH::WORMHOLE_B0,
+        "Raw classic profiler capture requires Blackhole or Wormhole");
+    TT_FATAL(mesh_device.is_initialized(), "Raw profiler capture requires an initialized mesh");
+    TT_FATAL(getDeviceProfilerState(context_id), "Raw profiler capture requires active profiling");
+    auto& manager = context.profiler_state_manager();
+    TT_FATAL(manager != nullptr, "Raw profiler capture requires profiler state");
+    const auto devices = mesh_device.get_devices();
+    TT_FATAL(!devices.empty(), "Raw profiler capture requires physical devices");
+
+    // Allocate every receipt before any device operation. A later host failure
+    // cannot destroy a prior device's successful read/reset disposition.
+    capture.devices.resize(devices.size());
+    capture.context_id = context_id.get();
+    std::vector<std::vector<CoreCoord>> cores;
+    cores.reserve(devices.size());
+    for (size_t index = 0; index < devices.size(); ++index) {
+        auto* device = devices[index];
+        TT_FATAL(extract_context_id(device) == context_id, "Raw profiler device belongs to another context");
+        TT_FATAL(manager->device_profiler_map.contains(device->id()), "Physical device has no profiler state");
+        capture.devices[index].device_id = device->id();
+        cores.push_back(detail::getVirtualCoresForProfiling(device, ProfilerReadState::NORMAL));
+    }
+    if (useFastDispatch(&mesh_device, &mesh_device, context_id)) {
+        for (uint8_t cq_id = 0; cq_id < mesh_device.num_hw_cqs(); ++cq_id) {
+            mesh_device.mesh_command_queue(cq_id).finish();
+        }
+    }
+    for (size_t index = 0; index < devices.size(); ++index) {
+        auto* device = devices[index];
+        manager->device_profiler_map.at(device->id()).readResults(
+            &mesh_device, device, cores[index], ProfilerReadState::NORMAL, ProfilerDataBufferSource::DRAM,
+            {}, &capture.devices[index]);
+    }
+    // Keep the existing Tracy projection, but use this context's owner and
+    // the same images. No second device drain and no default-context lookup.
+    for (size_t index = 0; index < devices.size(); ++index) {
+        auto* device = devices[index];
+        manager->device_profiler_map.at(device->id()).processResults(
+            device, cores[index], ProfilerReadState::NORMAL, ProfilerDataBufferSource::DRAM);
+    }
+#else
+    TT_THROW("Raw profiler capture requires a Tracy-enabled SDK");
 #endif
 }
 

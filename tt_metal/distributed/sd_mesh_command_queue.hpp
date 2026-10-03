@@ -80,7 +80,7 @@ public:
     // Configure-without-launch mode: enqueue_program writes binaries, CB configs, runtime args and
     // the launch message to L1 but never sends the go signal, so an image can be captured without
     // running it.
-    void set_configure_only(bool enable) { configure_only_ = enable; }
+    void set_configure_only(bool enable);
     bool is_configure_only() const { return configure_only_; }
     void disable_asynchronous_slow_dispatch();
     bool is_asynchronous_slow_dispatch_enabled() const { return asynchronous_slow_dispatch_enabled_; }

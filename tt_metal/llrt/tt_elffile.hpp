@@ -46,16 +46,8 @@ public:
     ElfFile operator=(ElfFile const&) = delete;
 
     // Move constructable & assignable -- take ownership
-    ElfFile(ElfFile&& s) noexcept : pimpl_(s.pimpl_), contents_(s.contents_), segments_(std::move(s.segments_)) {
-        s.contents_ = std::span<std::byte>();
-        s.pimpl_ = nullptr;
-    }
-    ElfFile& operator=(ElfFile&& s) noexcept {
-        std::swap(contents_, s.contents_);
-        segments_ = std::move(s.segments_);
-        std::swap(pimpl_, s.pimpl_);
-        return *this;
-    }
+    ElfFile(ElfFile&& s) noexcept;
+    ElfFile& operator=(ElfFile&& s) noexcept;
 
     std::vector<Segment> const& GetSegments() const { return segments_; }
 
@@ -67,8 +59,12 @@ public:
     void ReleaseImpl();
 
     // Read an elf file, populate segments vector.
-    // Path must remain live throughout processing.
     void ReadImage(const std::string& path);
+
+    // Copy an ELF image into private mutable storage before parsing. The
+    // caller may release or change its bytes after this call. The label is
+    // copied for diagnostics only; it is never used for file I/O or identity.
+    void ReadImage(std::span<const std::byte> image, std::string_view label = "<memory>");
 
     // Write the (now-processed) elf file.
     void WriteImage(const std::string& path);
@@ -91,9 +87,9 @@ public:
 private:
     class Impl;
 
-    // We can't use unique_ptr here, because the above move semantics
-    // would require Impl be complete at this point, which is what
-    // we're trying to avoid.
+    void Reset() noexcept;
+
+    // Reset releases the opaque parser before its backing mapping.
     Impl* pimpl_ = nullptr;
 
     std::span<std::byte> contents_;  // Owning buffer

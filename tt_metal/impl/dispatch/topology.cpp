@@ -9,6 +9,7 @@
 #include <enchantum/enchantum.hpp>
 #include <experimental/fabric/mesh_graph.hpp>
 #include <tt_metal.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <typeinfo>
@@ -697,6 +698,7 @@ void DispatchTopology::populate_fd_kernels(const std::vector<DispatchKernelNode>
 }
 
 void DispatchTopology::populate_cq_static_args(Device* device) {
+    descriptor_.metal_context().validate_worker_stream_state_access();
     TT_ASSERT(
         !node_id_to_kernel_.empty(),
         "Tried to populate static args on nodes without the nodes populated (need to run populate_fd_kernels()");
@@ -718,6 +720,7 @@ void DispatchTopology::populate_cq_static_args(Device* device) {
 }
 
 void DispatchTopology::create_cq_program(Device* device) {
+    descriptor_.metal_context().validate_worker_stream_state_access();
     TT_FATAL(
         command_queue_compile_group_->contains(device),
         "Tried to create and compile CQ program on device {} without static args populated (need to run "
@@ -731,6 +734,31 @@ void DispatchTopology::create_cq_program(Device* device) {
             node_and_kernel->CreateKernel();
             node_and_kernel->SetRuntimeArgs();
         }
+    }
+
+    // Admit exactly the kernels and core incidence built by this topology.
+    {
+        std::lock_guard lock(command_queue_compile_group_->mutex_);
+        auto& program = *command_queue_compile_group_->program_device_map_.at(device);
+        const auto& context = descriptor_.metal_context();
+        const auto cores = program.impl().logical_cores();
+        if (context.has_exclusive_worker_stream_state()) {
+            for (size_t index = 0; index != cores.size(); ++index) {
+                for (const auto& core : cores[index]) {
+                    const bool owned = std::any_of(node_id_to_kernel_.begin(), node_id_to_kernel_.end(),
+                        [&](const auto* node) {
+                            const auto logical = node->GetLogicalCore();
+                            return node->GetDeviceId() == device->id() &&
+                                   node->GetKernelType() != FDKernelType::VIRTUAL &&
+                                   node->GetCoreType() == context.hal().get_core_type(index) &&
+                                   core == CoreCoord(logical.x, logical.y);
+                        });
+                    TT_FATAL(owned, "CQ program kernel escaped its actual dispatch topology");
+                }
+            }
+        }
+        program.impl().bind_internal_worker_stream_state_client(
+            descriptor_.metal_context(), device->id(), detail::ProgramImpl::InternalWorkerStreamStateOwner::Dispatch);
     }
 
     // Register core coordinates for this device

@@ -14,6 +14,7 @@
 #include "hlk_desc.hpp"
 #include <hostdevcommon/kernel_structs.h>
 #include <tt-metalium/face_geometry.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/tile.hpp>
 
 namespace tt::tt_metal {
@@ -33,6 +34,7 @@ public:
     const JitBuildEnv& build_env;
     std::string name;
     std::string path;
+    KernelBodyMode body_mode = KernelBodyMode::Sdk;
 
     // HLK config
     tt::tt_hlk_desc hlk_desc;

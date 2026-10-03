@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dummy_mesh_command_queue.hpp"
+#include "impl/context/metal_context.hpp"
 #include <distributed/mesh_device_impl.hpp>
 #include "tt_metal/impl/threading/thread_pool.hpp"
 #include <mesh_device.hpp>
@@ -103,19 +104,23 @@ void DummyMeshCommandQueue::reset_worker_state(
     const vector_aligned<uint32_t>& /*go_signal_noc_data*/,
     const std::vector<std::pair<CoreRangeSet, uint32_t>>& /*core_go_message_mapping*/,
     ttsl::Span<const uint32_t> /*workers_per_sub_device*/) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
     // No-op for inactive rank
 }
 
 void DummyMeshCommandQueue::record_begin(
     const MeshTraceId& /*trace_id*/, const std::shared_ptr<MeshTraceDescriptor>& /*ctx*/) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     TT_THROW("Trace operations not supported for DummyMeshCommandQueue (inactive rank)");
 }
 
 void DummyMeshCommandQueue::record_end() {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     TT_THROW("Trace operations not supported for DummyMeshCommandQueue (inactive rank)");
 }
 
 void DummyMeshCommandQueue::enqueue_trace(const MeshTraceId& /*trace_id*/, bool /*blocking*/) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     TT_THROW("Trace operations not supported for DummyMeshCommandQueue (inactive rank)");
 }
 

@@ -546,6 +546,7 @@ public:
     ~DataMovementKernel() override = default;
 
     uint32_t get_kernel_processor_type(int index) const override;
+    void set_build_options(JitBuildOptions& build_options) const override;
     void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
     void read_binaries(IDevice* device, const std::string& binary_root) override;
 

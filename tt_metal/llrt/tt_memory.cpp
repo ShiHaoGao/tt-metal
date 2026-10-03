@@ -7,6 +7,7 @@
 #include <tt_stl/assert.hpp>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 #include "tt_elffile.hpp"
@@ -26,9 +27,8 @@ memory::memory(const std::string& path, Loading loading) : loading_(loading) {
     ElfFile elf;
 
     elf.ReadImage(path);
+    pack_from_elf(elf, path);
     if (loading == Loading::CONTIGUOUS_XIP) {
-        elf.MakeExecuteInPlace();
-
         // debug: dump disassembly after XIP transform
         // this output is used for tt-triage
         if (!tt::tt_metal::MetalContext::instance().rtoptions().get_disable_xip_dump()) {
@@ -44,8 +44,26 @@ memory::memory(const std::string& path, Loading loading) : loading_(loading) {
             }
         }
     }
+}
 
-    pack_from_segments(path, elf.GetSegments());
+memory::memory(std::span<const std::byte> image, Loading loading, std::string_view label) : loading_(loading) {
+    ElfFile elf;
+    elf.ReadImage(image, label);
+    pack_from_elf(elf, std::string(label));
+}
+
+void memory::pack_from_elf(ElfFile& elf, const std::string& label) {
+    uint64_t record_address = 0;
+    const auto record = elf.GetSectionContents(".tt_worker_stream_state", record_address);
+    if (record.size() == sizeof(worker_stream_state_image_)) {
+        tt::worker_stream_state::ImageRecord parsed{};
+        std::memcpy(&parsed, record.data(), sizeof(parsed));
+        using namespace tt::worker_stream_state;
+        if (acceptsImage(parsed, FirmwareRole::Brisc) || acceptsImage(parsed, FirmwareRole::Trisc0))
+            worker_stream_state_image_ = parsed;
+    }
+    if (loading_ == Loading::CONTIGUOUS_XIP) elf.MakeExecuteInPlace();
+    pack_from_segments(label, elf.GetSegments());
 }
 
 memory memory::from_segments(const std::vector<ElfFile::Segment>& segments, Loading loading) {

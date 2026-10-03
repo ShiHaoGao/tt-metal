@@ -15,12 +15,17 @@
 #include "noc_overlay_parameters.h"
 #include "stream_io_map.h"
 #include "c_tensix_core.h"
+#ifdef ARCH_BLACKHOLE
+#include "dst_initialization.h"
+#endif
 #include "tdma_xmov.h"
 #include "noc_nonblocking_api.h"
 #include "internal/firmware_common.h"
 #include "tools/profiler/kernel_profiler.hpp"
 #include "tools/profiler/perf_counters.hpp"
 #include "hostdev/dev_msgs.h"
+#include "hostdev/worker_stream_state_contract.h"
+#include "hostdev/remote_dfb_constants.h"
 #include "internal/risc_attribs.h"
 #include "internal/circular_buffer_interface.h"
 #include "internal/circular_buffer_init.h"
@@ -41,6 +46,13 @@
 #endif
 
 // clang-format on
+
+#if defined(ARCH_BLACKHOLE)
+__attribute__((used, section(".tt_worker_stream_state")))
+const tt::worker_stream_state::ImageRecord worker_stream_state_image{
+    tt::worker_stream_state::kVersion,
+    static_cast<uint8_t>(tt::worker_stream_state::FirmwareRole::Brisc), 0, 0};
+#endif
 
 // Global so triage can see these values.
 uint8_t noc_index;
@@ -245,8 +257,13 @@ void device_setup() {
     cfg_regs[RISCV_IC_INVALIDATE_InvalidateAll_ADDR32] =
         RISCV_IC_BRISC_MASK | RISCV_IC_TRISC_ALL_MASK | RISCV_IC_NCRISC_MASK;
 
-    // Clear destination registers
+    // Initialize destination registers before releasing the subordinate RISCs.
+#ifdef ARCH_BLACKHOLE
+    blackhole::initialize_dst(
+        instrn_buf[0], cfg_regs, reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_DBG_FEATURE_DISABLE));
+#else
     core.ex_zeroacc(instrn_buf[0]);
+#endif
 
     // Enable CC stack
     core.ex_encc(instrn_buf[0]);
@@ -336,7 +353,51 @@ inline void wait_ncrisc_trisc() {
     WAYPOINT("NTD");
 }
 
-inline void trigger_sync_register_init() { subordinate_sync->trisc0 = RUN_SYNC_MSG_INIT_SYNC_REGISTERS; }
+namespace worker_stream_state = tt::worker_stream_state;
+// Typed failure survives builds without Watcher assertions. An invalid launch
+// never reports completion or starts any subordinate; recovery requires reset.
+volatile worker_stream_state::Decision worker_stream_state_failure __attribute__((used)) =
+    worker_stream_state::Decision::Preserve;
+
+[[noreturn]] inline void reject_worker_stream_state(worker_stream_state::Decision failure) {
+    worker_stream_state_failure = failure;
+    WAYPOINT("SABI");
+    ASSERT(false);
+    while (true) {
+        invalidate_l1_cache();
+    }
+}
+
+struct WorkerStreamResetHandoff {
+    void request() { subordinate_sync->trisc0 = RUN_SYNC_MSG_INIT_SYNC_REGISTERS; }
+    bool complete() const {
+        invalidate_l1_cache();
+        return subordinate_sync->trisc0 == RUN_SYNC_MSG_DONE;
+    }
+    void poll() { invalidate_l1_cache(); }
+};
+
+inline void complete_worker_stream_reset(worker_stream_state::Decision decision) {
+    WorkerStreamResetHandoff handoff;
+    if (!worker_stream_state::completeReset(decision, handoff))
+        reject_worker_stream_state(decision);
+}
+
+inline worker_stream_state::Decision receive_worker_stream_state(
+    const kernel_config_msg_t& config, worker_stream_state::Boundary boundary) {
+    const bool sdk_descriptors = config.local_cb_mask != 0 ||
+                                config.min_remote_cb_start_index < NUM_CIRCULAR_BUFFERS ||
+                                config.cross_node_dfb_offset != REMOTE_DFB_OFFSET_NONE ||
+                                config.prefetcher_pipe_offset != REMOTE_DFB_OFFSET_NONE;
+#if !defined(ARCH_BLACKHOLE)
+    // This bounded implementation advertises Program ownership only on
+    // Blackhole. Ordinary SDK launches retain their existing owner elsewhere.
+    if (config.worker_stream_state_owner == static_cast<uint8_t>(worker_stream_state::Owner::Program))
+        return worker_stream_state::Decision::RejectOwner;
+#endif
+    return worker_stream_state::receive(
+        config.worker_stream_state_abi_version, config.worker_stream_state_owner, boundary, sdk_descriptors);
+}
 
 inline void barrier_remote_cb_interface_setup(uint8_t noc_index, uint32_t noc_mode, uint32_t end_cb_index) {
 #if defined(ARCH_BLACKHOLE)
@@ -380,7 +441,6 @@ int main() {
 
     // Wait for all cores to be finished initializing before reporting initialization done.
     wait_ncrisc_trisc();
-    mailboxes->go_messages[0].signal = RUN_MSG_DONE;
 
     // Initialize the NoCs to a safe state
     // This ensures if we send any noc txns without running a kernel setup are valid
@@ -388,7 +448,10 @@ int main() {
     noc_init(MEM_NOC_ATOMIC_RET_VAL_ADDR);
     noc_local_state_init(noc_index);
     noc_clear_all_packet_tags();
-    trigger_sync_register_init();
+    // Boot owns the quiescent platform state independently of any launch.
+    // Host-visible readiness must follow the actual TRISC0 MMIO acknowledgment.
+    complete_worker_stream_reset(worker_stream_state::Decision::ClearSdkCounters);
+    mailboxes->go_messages[0].signal = RUN_MSG_DONE;
 
     DeviceProfilerInit();
     while (1) {
@@ -445,6 +508,15 @@ int main() {
             uint32_t reload_round = 0;
             do {
                 uint32_t enables = launch_msg_address->kernel_config.enables;
+                // Empty dispatch wakeups own no worker stream state. For a
+                // populated launch, receive and snapshot the owner before any
+                // CB setup, NCRISC LOAD or issuer GO can have side effects.
+                const auto stream_state = enables != 0
+                                              ? receive_worker_stream_state(
+                                                    launch_msg_address->kernel_config,
+                                                    worker_stream_state::Boundary::LaunchEntry)
+                                              : worker_stream_state::Decision::Preserve;
+                complete_worker_stream_reset(stream_state);
                 // Trigger the NCRISC to start loading CBs and IRAM as soon as possible.
                 if (enables &
                     (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
@@ -567,8 +639,6 @@ int main() {
                 // BRISC reads perf counters after TRISCs finish (BRISC has NOC access for DRAM push).
                 ReadPerfCounters();
 
-                trigger_sync_register_init();
-
                 if constexpr (ASSERT_ENABLED) {
                     if (noc_mode == DM_DYNAMIC_NOC) {
                         WAYPOINT("NKFW");
@@ -586,6 +656,11 @@ int main() {
                         WAYPOINT("NKFD");
                     }
                 }
+
+                // Cleanup belongs to the completed launch, not a later slot.
+                // Wait for it before stage reload, DONE, dispatch notification
+                // or ring-slot release. Program-owned counters are untouched.
+                complete_worker_stream_reset(stream_state);
 
 #if defined(PROFILE_KERNEL)
                 if (noc_mode == DM_DYNAMIC_NOC) {

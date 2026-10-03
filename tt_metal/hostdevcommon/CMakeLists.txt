@@ -18,6 +18,10 @@ target_sources(
         TYPE HEADERS
         BASE_DIRS ${PROJECT_SOURCE_DIR}
         FILES ${HOSTDEVCOMMON_HOSTDEV_HEADERS}
+        FILE_SET worker_stream_state_api
+        TYPE HEADERS
+        BASE_DIRS ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc
+        FILES ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/hostdev/worker_stream_state_contract.h
 )
 
 target_include_directories(ttmetalium_hostdevcommon INTERFACE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/api>")
@@ -40,6 +44,10 @@ install(
         COMPONENT metalium-runtime
     FILE_SET
     api
+        COMPONENT metalium-dev
+    FILE_SET
+    worker_stream_state_api
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         COMPONENT metalium-dev
     FILE_SET
     hostdev_headers

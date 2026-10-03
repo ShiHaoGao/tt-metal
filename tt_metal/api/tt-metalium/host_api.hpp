@@ -37,6 +37,7 @@
 namespace tt::tt_metal {
 
 struct TraceDescriptor;
+struct ProfilerRawCapture;
 
 class Program;
 class IDevice;
@@ -619,6 +620,12 @@ void ReadMeshDeviceProfilerResults(
     distributed::MeshDevice& mesh_device,
     ProfilerReadState state = ProfilerReadState::NORMAL,
     const std::optional<ProfilerOptionalMetadata>& metadata = {});
+
+// Read/reset the classic Program profiler once, retaining its raw words in
+// capture before normal SDK presentation processing. Unsupported layouts are
+// rejected before queue/device operations. A thrown host processing error may
+// still leave ResetComplete device receipts and a usable raw image in capture.
+void ReadMeshDeviceProfilerResults(distributed::MeshDevice& mesh_device, ProfilerRawCapture& capture);
 
 // clang-format off
 /**

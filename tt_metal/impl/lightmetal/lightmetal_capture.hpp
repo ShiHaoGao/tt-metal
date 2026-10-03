@@ -5,6 +5,7 @@
 #pragma once
 
 #include <vector>
+#include <atomic>
 #include <memory>
 #include <flatbuffers/flatbuffers.h>
 #include <tt-metalium/experimental/lightmetal/lightmetal_replay.hpp>
@@ -43,7 +44,8 @@ public:
     LightMetalCaptureContext& operator=(const LightMetalCaptureContext&) = delete;
 
     bool is_tracing() const;
-    void set_tracing(bool tracing);
+    void begin_capture();
+    LightMetalBinary end_capture();
 
     flatbuffers::FlatBufferBuilder& get_builder();
     std::vector<flatbuffers::Offset<tt::tt_metal::flatbuffer::Command>>& get_cmds_vector();
@@ -72,7 +74,7 @@ public:
 private:
     LightMetalCaptureContext();  // Private constructor
 
-    bool is_tracing_ = false;
+    std::atomic<bool> is_tracing_{false};
     flatbuffers::FlatBufferBuilder builder_;
     std::vector<flatbuffers::Offset<tt::tt_metal::flatbuffer::Command>> cmds_vec_;
     std::vector<TraceDescriptorByTraceIdOffset> trace_descs_vec_;

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "hostdev/profiler_zone_id.h"
+#include "hostdev/worker_stream_state_contract.h"
 
 #include <enchantum/enchantum.hpp>
 #include <fmt/base.h>
@@ -212,6 +213,8 @@ void JitBuildEnv::init(
 
     this->arch_ = config.arch;
     this->max_cbs_ = config.max_cbs;
+    TT_FATAL(config.hal != nullptr, "JIT build environment requires an explicit HAL");
+    this->l1_alignment_ = config.hal->get_alignment(HalMemType::L1);
 
     // Tools
     const static bool use_ccache = std::getenv("TT_METAL_CCACHE_KERNEL_SUPPORT") != nullptr;
@@ -296,9 +299,18 @@ void JitBuildEnv::init(
         // effect on generated code.
         "--param=min-pagesize=0 ";
 
+    // The canonical host/firmware ABI participates in the same defines and
+    // final key used by JIT output and precompiled-bundle selection. Callers
+    // may repeat that value, but cannot select another firmware ABI.
+    auto defines = device_kernel_defines;
+    const auto worker_abi_version = std::to_string(tt::worker_stream_state::kVersion);
+    const auto worker_abi = defines.emplace("TT_WORKER_STREAM_STATE_ABI_VERSION", worker_abi_version).first;
+    TT_FATAL(worker_abi->second == worker_abi_version,
+             "Worker stream-state ABI override differs from the canonical host/firmware version");
+
     // Defines
     this->defines_ = "";
-    for (const auto& device_kernel_define : device_kernel_defines) {
+    for (const auto& device_kernel_define : defines) {
         this->defines_ += "-D" + device_kernel_define.first + "=" + device_kernel_define.second + " ";
     }
     this->defines_ += "-DTENSIX_FIRMWARE -DLOCAL_MEM_EN=0 ";

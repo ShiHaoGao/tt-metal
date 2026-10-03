@@ -14,6 +14,10 @@
 #include "dispatch/kernel_config/fd_kernel.hpp"
 #include "firmware_initializer.hpp"
 #include "llrt/hal/generated/dev_msgs.hpp"
+#include "llrt/worker_stream_state_provider.hpp"
+#include "llrt/tt_memory.h"
+#include <array>
+#include <memory>
 
 namespace tt::tt_fabric {
 class ControlPlane;
@@ -42,8 +46,10 @@ public:
 
     void run_async_build_phase(const std::set<tt::ChipId>& device_ids);
     void run_launch_phase(const std::set<tt::ChipId>& device_ids);
+    std::shared_ptr<const WorkerStreamStateProvider> worker_stream_state_provider(tt::ChipId device_id) const;
 
 private:
+    void withdraw_worker_stream_state();
     void clear_l1_state(tt::ChipId device_id);
     void clear_dram_state(tt::ChipId device_id);
     void clear_launch_messages_on_eth_cores(tt::ChipId device_id);
@@ -114,6 +120,12 @@ private:
     std::unordered_map<tt::ChipId, std::vector<uint8_t>> worker_logical_col_to_virtual_col_;
     std::unordered_map<tt::ChipId, std::vector<uint8_t>> worker_logical_row_to_virtual_row_;
 
+    struct WorkerImages {
+        std::array<const ll_api::memory*, 2> loaded{};
+        bool mismatch = false;
+    };
+    std::unordered_map<tt::ChipId, WorkerImages> worker_images_;
+    std::unordered_map<tt::ChipId, std::shared_ptr<const WorkerStreamStateProvider>> worker_providers_;
     bool initialized_ = false;
 };
 

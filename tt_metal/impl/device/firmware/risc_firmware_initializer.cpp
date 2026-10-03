@@ -105,6 +105,9 @@ void RiscFirmwareInitializer::init(
 }
 
 void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& device_ids) {
+    // This phase can clear worker L1 before firmware compilation starts. No
+    // earlier boot receipt may remain visible during a rebuild or its failure.
+    withdraw_worker_stream_state();
     ZoneScopedN("FW builds and Device Inits");
 
     std::vector<std::shared_future<void>> futures;
@@ -213,6 +216,10 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
 }
 
 void RiscFirmwareInitializer::run_launch_phase(const std::set<tt::ChipId>& device_ids) {
+    // This initializer publishes one completed launch phase. Earlier successful
+    // device boots stay inaccessible if a later device fails; a subsequent phase
+    // also cannot expose receipts left over from that incomplete attempt.
+    withdraw_worker_stream_state();
     // Launch FW on each device sequentially, since a multithreaded launch leads to initialization hangs.
     // See https://github.com/tenstorrent/tt-metal/issues/35701
     ZoneScopedN("Resets and FW Launch");
@@ -264,6 +271,7 @@ void RiscFirmwareInitializer::teardown_simulator_ethernet_cores() {
 }
 
 void RiscFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& /*init_done*/) {
+    withdraw_worker_stream_state();
     auto all_devices = cluster_.all_chip_ids();
 
     if (!cluster_.is_mock_or_emulated()) {
@@ -295,10 +303,15 @@ void RiscFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& /*ini
     // Keep simulator routing firmware alive until all cleanup that may access remote chips is done.
     teardown_simulator_ethernet_cores();
 
-    initialized_ = false;
 }
 
 bool RiscFirmwareInitializer::is_initialized() const { return initialized_; }
+
+void RiscFirmwareInitializer::withdraw_worker_stream_state() {
+    initialized_ = false;
+    worker_providers_.clear();
+    worker_images_.clear();
+}
 
 void RiscFirmwareInitializer::clear_l1_state(tt::ChipId device_id) {
     log_debug(tt::LogMetal, "Clearing L1 for device {}", device_id);
@@ -1195,6 +1208,12 @@ void RiscFirmwareInitializer::initialize_firmware(
                             core_type_idx,
                             processor_class,
                             riscv_id);
+                        if (cluster_.arch() == ARCH::BLACKHOLE && riscv_id == 0 && processor_class < 2) {
+                            auto& images = worker_images_[device_id];
+                            auto*& slot = images.loaded[processor_class];
+                            images.mismatch |= slot != nullptr && slot != &binary_mem;
+                            slot = &binary_mem;
+                        }
                     }
                 }
             }
@@ -1612,6 +1631,25 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
         }
         log_info(LogDevice, "Dispatch-engine firmware init complete");
     }
+    const auto selected = worker_images_.find(device_id);
+    if (selected != worker_images_.end() && !selected->second.mismatch) {
+        const auto& images = selected->second.loaded;
+        using namespace tt::worker_stream_state;
+        if (images[0] && images[1] &&
+            acceptsImage(images[0]->worker_stream_state_image(), FirmwareRole::Brisc) &&
+            acceptsImage(images[1]->worker_stream_state_image(), FirmwareRole::Trisc0)) {
+            worker_providers_[device_id] = std::shared_ptr<const WorkerStreamStateProvider>(
+                new WorkerStreamStateProvider(kVersion));
+        }
+    }
+}
+
+std::shared_ptr<const WorkerStreamStateProvider>
+RiscFirmwareInitializer::worker_stream_state_provider(tt::ChipId device_id) const {
+    if (!initialized_)
+        return {};
+    auto found = worker_providers_.find(device_id);
+    return found == worker_providers_.end() ? nullptr : found->second;
 }
 
 }  // namespace tt::tt_metal

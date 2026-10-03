@@ -140,6 +140,7 @@ enum ControlBuffer {
     DRAM_PROFILER_ADDRESS_T0_0,
     DRAM_PROFILER_ADDRESS_T1_0,
     DRAM_PROFILER_ADDRESS_T2_0,
+    CONTROL_BUFFER_END,
 };
 
 enum PacketTypes { ZONE_START, ZONE_END, ZONE_TOTAL, TS_DATA, TS_EVENT, TS_DATA_16B };
@@ -162,8 +163,11 @@ struct TimestampedDataSize<TS_DATA_16B> {
 };
 
 // TODO: use data types in profile_msg_t rather than addresses/sizes
-constexpr static std::uint32_t PROFILER_L1_CONTROL_VECTOR_SIZE = 64;
+// Include every control field and retain 64-byte alignment for the per-RISC
+// data buffers which immediately follow this vector in profiler_msg_t.
+constexpr static std::uint32_t PROFILER_L1_CONTROL_VECTOR_SIZE = (CONTROL_BUFFER_END + 15u) & ~15u;
 constexpr static std::uint32_t PROFILER_L1_CONTROL_BUFFER_SIZE = PROFILER_L1_CONTROL_VECTOR_SIZE * sizeof(uint32_t);
+static_assert(DRAM_PROFILER_ADDRESS_T2_0 < PROFILER_L1_CONTROL_VECTOR_SIZE);
 constexpr static std::uint32_t PROFILER_L1_MARKER_UINT32_SIZE = 2;
 constexpr static std::uint32_t PROFILER_L1_PROGRAM_ID_COUNT = 2;
 constexpr static std::uint32_t PROFILER_L1_GUARANTEED_MARKER_COUNT = 4;

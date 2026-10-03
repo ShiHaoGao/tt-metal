@@ -66,7 +66,7 @@ enum SpscControlBuffer {
     SPSC_CORE_XY = 2 * PROFILER_SPSC_MAX_RISC + 1,
     // Per-RISC count of full-ring blocks, written in the stall path and read by the host from L1 at teardown;
     // counting decoded stall markers would undercount, since a marker can be dropped between the relay frame and
-    // the BroadcastRing. 8 slots so SPSC_CONTROL_END stays inside the 64-word vector.
+    // the BroadcastRing. These slots must fit inside the shared control vector.
     SPSC_STALL_COUNT_0 = 2 * PROFILER_SPSC_MAX_RISC + 2,
     SPSC_STALL_COUNT_MAX = 8,
     SPSC_CONTROL_END = SPSC_STALL_COUNT_0 + SPSC_STALL_COUNT_MAX,  // first unused word; grow the layout here
@@ -77,9 +77,8 @@ constexpr std::uint32_t spsc_state_prog_word(std::uint32_t risc) {
 }
 
 // Bounds the SPSC backend's whole control block against the DRAM profiler's L1 control vector, which it
-// overlays. Deliberately not asserted on DRAM_PROFILER_ADDRESS_T2_0: that entry is already out of bounds
-// upstream (with PROFILER_MAX_RISC_COUNT = 24 it evaluates to 64), so asserting it would fail the build on a
-// defect this backend neither introduced nor can fix here.
+// overlays. The classic profiler independently sizes the vector for all its
+// control fields, including the TRISC2 DRAM address.
 static_assert(
     SPSC_CONTROL_END <= PROFILER_L1_CONTROL_VECTOR_SIZE,
     "SPSC/drainer control layout overflows the profiler L1 control vector");

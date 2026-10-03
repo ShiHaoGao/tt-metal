@@ -467,6 +467,7 @@ Program::Program(const ProgramDescriptor& descriptor) : internal_(std::make_shar
                         .named_compile_args = std::move(named_compile_args),
                         .opt_level = kernel_descriptor.opt_level.value_or(KernelBuildOptLevel::O2),
                         .compiler_include_paths = std::move(compiler_include_paths),
+                        .body_mode = dm_descriptor.body_mode,
                     };
                 },
                 [&](const ComputeConfigDescriptor& compute_descriptor)
@@ -484,6 +485,7 @@ Program::Program(const ProgramDescriptor& descriptor) : internal_(std::make_shar
                         .named_compile_args = std::move(named_compile_args),
                         .opt_level = kernel_descriptor.opt_level.value_or(KernelBuildOptLevel::O3),
                         .compiler_include_paths = std::move(compiler_include_paths),
+                        .body_mode = compute_descriptor.body_mode,
                     };
                 },
             },
@@ -850,7 +852,10 @@ KernelGroup::KernelGroup(
     go_msg(dev_msgs_factory.create<dev_msgs::go_msg_t>()) {
     this->core_ranges = this->core_ranges.merge(new_ranges);
 
+    program.validate_worker_stream_state();
     auto kernel_config = this->launch_msg.view().kernel_config();
+    kernel_config.worker_stream_state_abi_version() = tt::worker_stream_state::kVersion;
+    kernel_config.worker_stream_state_owner() = static_cast<uint8_t>(program.get_worker_stream_state_owner());
     kernel_config.brisc_noc_mode() = NOC_MODE::DM_DEDICATED_NOC;
 
     // Slow dispatch uses fixed addresses for the kernel config, configured here statically
@@ -1016,6 +1021,8 @@ KernelGroup* detail::ProgramImpl::kernels_on_core(const CoreCoord& core, uint32_
 }
 
 void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_index) {
+    validate_worker_stream_state();
+    worker_stream_state_owner_frozen_ = true;
     if (core_to_kernel_group_index_table_[programmable_core_type_index].empty()) {
         // Get the extent of the kernels in x, y
         CoreCoord base = {std::numeric_limits<decltype(base.x)>::max(), std::numeric_limits<decltype(base.y)>::max()};
@@ -1238,6 +1245,8 @@ void detail::ProgramImpl::CircularBufferAllocator::mark_address(
 }
 
 CBHandle detail::ProgramImpl::add_circular_buffer_(const std::shared_ptr<CircularBufferImpl>& circular_buffer) {
+    TT_FATAL(worker_stream_state_owner_ == tt::worker_stream_state::Owner::SdkCircularBuffers,
+             "Program-owned worker stream state cannot contain SDK circular buffers");
     // Metal 2.0 programs use DataflowBuffers, never legacy circular buffers.
     TT_FATAL(
         !this->created_from_spec_,
@@ -1339,6 +1348,8 @@ CBHandle detail::ProgramImpl::add_circular_buffer(
 }
 
 uint8_t detail::ProgramImpl::add_cross_node_dfb(experimental::CrossNodeDFB gdfb) {
+    TT_FATAL(worker_stream_state_owner_ == tt::worker_stream_state::Owner::SdkCircularBuffers,
+             "Program-owned worker stream state cannot contain SDK CrossNodeDFBs");
     TT_FATAL(this->compiled_.empty(), "Cannot add CrossNodeDFB to an already compiled program {}", this->id);
     // Check mutual exclusion: GlobalCircularBuffer and CrossNodeDFB cannot coexist in the same program.
     for (const auto& [core, remote_bits] : per_core_remote_cb_indices_) {
@@ -1391,6 +1402,8 @@ uint8_t detail::ProgramImpl::reserve_prefetcher_pipe_slot(
     uint32_t ring_size,
     uint32_t entry_size,
     uint32_t num_credit_lanes) {
+    TT_FATAL(worker_stream_state_owner_ == tt::worker_stream_state::Owner::SdkCircularBuffers,
+             "Program-owned worker stream state cannot contain SDK PrefetcherPipes");
     TT_FATAL(this->compiled_.empty(), "Cannot add a PrefetcherPipe slot to an already compiled program {}", this->id);
 
     for (const auto& [core, remote_bits] : per_core_remote_cb_indices_) {
@@ -3081,7 +3094,82 @@ void ProgramImpl::generate_trace_dispatch_commands(distributed::MeshDevice* mesh
     }
 }
 
+void detail::ProgramImpl::bind_worker_stream_state_client(
+    std::shared_ptr<const WorkerStreamStateClient> client) {
+    TT_FATAL(client && !worker_stream_state_client_ && !worker_stream_state_internal_owner_,
+             "Worker stream-state client must be bound exactly once");
+    // The existing setter validates descriptor absence and freezes at projection.
+    set_worker_stream_state_owner(tt::worker_stream_state::Owner::Program);
+    worker_stream_state_client_ = std::move(client);
+}
+
+void detail::ProgramImpl::bind_internal_worker_stream_state_client(
+    MetalContext& context, ChipId device_id, InternalWorkerStreamStateOwner owner) {
+    auto client = context.retain_worker_stream_state_client();
+    if (!client)
+        return;
+    TT_FATAL(!worker_stream_state_client_ && !worker_stream_state_internal_owner_ && compiled_.empty(),
+             "Internal SDK client must be bound once before compilation");
+    TT_FATAL(get_worker_stream_state_owner() == tt::worker_stream_state::Owner::SdkCircularBuffers,
+             "Internal SDK program must retain SDK worker ownership");
+    context.validate_worker_stream_state_client(client);
+    TT_FATAL(std::any_of(kernels_.begin(), kernels_.end(), [](const auto& kernels) { return !kernels.empty(); }),
+             "Internal SDK binding requires actual kernels");
+    auto cores = logical_cores();
+    auto kernels = kernels_;
+    worker_stream_state_internal_cores_ = std::move(cores);
+    worker_stream_state_internal_kernels_ = std::move(kernels);
+    worker_stream_state_internal_client_ = client;
+    worker_stream_state_internal_device_ = device_id;
+    worker_stream_state_internal_owner_ = owner;
+}
+
+void detail::ProgramImpl::bind_realtime_profiler_client(MetalContext& context, ChipId device_id) {
+    if (!context.has_exclusive_worker_stream_state())
+        return;
+    const auto reserved = context.get_dispatch_core_manager().get_reserved_realtime_profiler_core(device_id);
+    TT_FATAL(reserved.has_value(), "Internal profiler has no actual reserved core");
+    const auto cores = logical_cores();
+    bool found = false;
+    for (size_t index = 0; index != cores.size(); ++index) {
+        for (const auto& core : cores[index]) {
+            TT_FATAL(context.hal().get_core_type(index) == CoreType::WORKER &&
+                         core == CoreCoord(reserved->x, reserved->y),
+                     "Internal profiler program escaped its reserved core");
+            found = true;
+        }
+    }
+    TT_FATAL(found && get_worker_stream_state_owner() == tt::worker_stream_state::Owner::SdkCircularBuffers,
+             "Internal profiler requires a placed SDK-owned program");
+    bind_internal_worker_stream_state_client(context, device_id, InternalWorkerStreamStateOwner::RealtimeProfiler);
+}
+
+void detail::ProgramImpl::validate_worker_stream_state_client(
+    const MetalContext& context, std::optional<ChipId> device_id) const {
+    if (worker_stream_state_internal_owner_) {
+        auto client = worker_stream_state_internal_client_.lock();
+        TT_FATAL(client, "Internal SDK program outlived its exclusive client");
+        context.validate_worker_stream_state_client(client);
+        TT_FATAL(device_id && device_id == worker_stream_state_internal_device_,
+                 "Internal SDK program requires its actual owning device");
+        TT_FATAL(get_worker_stream_state_owner() == tt::worker_stream_state::Owner::SdkCircularBuffers &&
+                     logical_cores() == worker_stream_state_internal_cores_ &&
+                     kernels_ == worker_stream_state_internal_kernels_,
+                 "Internal SDK ownership, kernel identity or placement changed after binding");
+        return;
+    }
+    context.validate_worker_stream_state_client(worker_stream_state_client_);
+    if (get_worker_stream_state_owner() == tt::worker_stream_state::Owner::Program)
+        TT_FATAL(worker_stream_state_client_, "Program worker ownership requires an exclusive SDK client");
+    if (worker_stream_state_client_)
+        TT_FATAL(get_worker_stream_state_owner() == tt::worker_stream_state::Owner::Program,
+                 "Bound worker stream-state client requires Program ownership");
+}
+
 void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
+    validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    validate_worker_stream_state();
+    worker_stream_state_owner_frozen_ = true;
     TTZoneScopedD(PROGRAM);
 
     const ContextId device_context_id = extract_context_id(device);
@@ -3155,7 +3243,8 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
         // width formats that are supported mostly in tt-metal. This conservative check fires whenever a
         // compute kernel shares a core with any FP8 CB — the old Program API has no way to know which CB
         // a given kernel actually reads, so we err on the side of catching the misconfiguration.
-        if ((build_options.build_env.get_arch() == tt::ARCH::BLACKHOLE ||
+        if (build_options.body_mode == KernelBodyMode::Sdk &&
+            (build_options.build_env.get_arch() == tt::ARCH::BLACKHOLE ||
              build_options.build_env.get_arch() == tt::ARCH::QUASAR) &&
             kernel->get_kernel_processor_class() == HalProcessorClassType::COMPUTE &&
             std::any_of(
@@ -3267,6 +3356,8 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
 }
 
 void detail::ProgramImpl::compile_and_allocate(IDevice* device, bool force_slow_dispatch) {
+    validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    validate_worker_stream_state();
     // The compile and allocation steps below are individually guarded and would early-return:
     // nothing has changed since this program was compiled and laid out for this device. Skip them
     // outright, since this is called on every enqueue and the guards alone cost microseconds per
@@ -3301,6 +3392,44 @@ void detail::ProgramImpl::compile_and_allocate(IDevice* device, bool force_slow_
 void detail::ProgramImpl::set_runtime_id(ProgramId id) { this->runtime_id = id; }
 
 void Program::set_runtime_id(ProgramId id) { internal_->set_runtime_id(id); }
+
+void Program::set_worker_stream_state_owner(tt::worker_stream_state::Owner owner) {
+    internal_->set_worker_stream_state_owner(owner);
+}
+
+tt::worker_stream_state::Owner Program::get_worker_stream_state_owner() const {
+    return internal_->get_worker_stream_state_owner();
+}
+
+void detail::ProgramImpl::validate_worker_stream_state() const {
+    using Owner = tt::worker_stream_state::Owner;
+    TT_FATAL(worker_stream_state_owner_ == Owner::SdkCircularBuffers || worker_stream_state_owner_ == Owner::Program,
+             "Unknown worker stream state owner");
+    if (worker_stream_state_owner_ == Owner::Program) {
+        TT_FATAL(MetalContext::instance(context_id_).hal().get_arch() == tt::ARCH::BLACKHOLE,
+                 "Program-owned worker stream state currently requires Blackhole firmware");
+        TT_FATAL(circular_buffers_.empty() && dataflow_buffers_.empty() && cross_node_dfbs_.empty() &&
+                     prefetcher_pipe_slots_.empty(),
+                 "Program-owned worker stream state cannot contain SDK CB or DFB resources");
+    }
+}
+
+void detail::ProgramImpl::set_worker_stream_state_owner(tt::worker_stream_state::Owner owner) {
+    using Owner = tt::worker_stream_state::Owner;
+    TT_FATAL(!worker_stream_state_internal_owner_, "Internal SDK worker owner is frozen by its actual producer");
+    TT_FATAL(owner == Owner::SdkCircularBuffers || owner == Owner::Program, "Unknown worker stream state owner");
+    TT_FATAL(!worker_stream_state_owner_frozen_ && compiled_.empty() && !finalized_,
+             "Cannot change worker stream state owner after program projection or compilation");
+    // Validate before committing the new fact. Failure preserves the old owner.
+    if (owner == Owner::Program) {
+        TT_FATAL(MetalContext::instance(context_id_).hal().get_arch() == tt::ARCH::BLACKHOLE,
+                 "Program-owned worker stream state currently requires Blackhole firmware");
+        TT_FATAL(circular_buffers_.empty() && dataflow_buffers_.empty() && cross_node_dfbs_.empty() &&
+                     prefetcher_pipe_slots_.empty(),
+                 "Program-owned worker stream state cannot contain SDK CB or DFB resources");
+    }
+    worker_stream_state_owner_ = owner;
+}
 
 uint32_t detail::ProgramImpl::get_sem_base_addr(IDevice* device, CoreCoord /*logical_core*/, CoreType core_type) {
     HalProgrammableCoreType programmable_core_type = tt::tt_metal::hal_programmable_core_type_from_core_type(core_type);

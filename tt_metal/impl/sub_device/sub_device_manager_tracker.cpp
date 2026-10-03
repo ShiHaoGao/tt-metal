@@ -63,6 +63,7 @@ SubDeviceManagerTracker::~SubDeviceManagerTracker() {
 
 SubDeviceManagerId SubDeviceManagerTracker::create_sub_device_manager(
     ttsl::Span<const SubDevice> sub_devices, DeviceAddr local_l1_size) {
+    MetalContext::instance(extract_context_id(device_)).validate_worker_stream_state_access();
     auto sub_device_manager = std::make_unique<SubDeviceManager>(sub_devices, local_l1_size, device_);
     auto sub_device_manager_id = sub_device_manager->id();
     sub_device_managers_.insert_or_assign(sub_device_manager_id, std::move(sub_device_manager));
@@ -70,6 +71,7 @@ SubDeviceManagerId SubDeviceManagerTracker::create_sub_device_manager(
 }
 
 void SubDeviceManagerTracker::reset_sub_device_state(const std::unique_ptr<SubDeviceManager>& sub_device_manager) {
+    MetalContext::instance(extract_context_id(device_)).validate_worker_stream_state_access();
     auto num_sub_devices = sub_device_manager->num_sub_devices();
     std::vector<uint32_t> workers_per_sub_device;
     workers_per_sub_device.reserve(num_sub_devices);
@@ -104,6 +106,7 @@ void SubDeviceManagerTracker::reset_sub_device_state(const std::unique_ptr<SubDe
 }
 
 void SubDeviceManagerTracker::load_sub_device_manager(SubDeviceManagerId sub_device_manager_id) {
+    MetalContext::instance(extract_context_id(device_)).validate_worker_stream_state_access();
     TT_FATAL(
         tt::tt_metal::MetalContext::instance(extract_context_id(device_)).rtoptions().get_fast_dispatch(),
         "Using sub device managers is unsupported with slow dispatch");
@@ -132,6 +135,7 @@ void SubDeviceManagerTracker::clear_loaded_sub_device_manager() {
 }
 
 void SubDeviceManagerTracker::remove_sub_device_manager(SubDeviceManagerId sub_device_manager_id) {
+    MetalContext::instance(extract_context_id(device_)).validate_worker_stream_state_access();
     if (active_sub_device_manager_ != nullptr) {
         TT_FATAL(
             sub_device_manager_id != active_sub_device_manager_->id(),

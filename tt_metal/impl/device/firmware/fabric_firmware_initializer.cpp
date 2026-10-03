@@ -427,10 +427,12 @@ void FabricFirmwareInitializer::post_teardown() {
 bool FabricFirmwareInitializer::is_initialized() const { return initialized_.test(); }
 
 void FabricFirmwareInitializer::compile_and_configure_fabric() {
+    auto client = descriptor_->metal_context().retain_worker_stream_state_client();
     std::vector<std::shared_future<Device*>> events;
     events.reserve(devices_.size());
     for (auto* dev : devices_) {
-        events.emplace_back(detail::async([dev]() {
+        events.emplace_back(detail::async([dev, client]() {
+            WorkerStreamStateAccess access(client);
             if (dev->compile_fabric()) {
                 return dev;
             }

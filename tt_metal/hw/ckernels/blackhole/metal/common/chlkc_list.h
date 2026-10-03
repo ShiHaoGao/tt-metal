@@ -27,12 +27,16 @@ using namespace ckernel;
 #endif
 
 uint run_kernel() {
+// The generated role source supplies this selector from KernelBodyMode.
+// Native descriptors retain storage metadata without any LLK math policy.
+#if !TT_METAL_NATIVE_BODY
 #ifdef UCK_CHLKC_MATH
     zeroacc();
 #endif
 
 #ifdef UCK_CHLKC_UNPACK
     zerosrc();
+#endif
 #endif
 
     kernel_main();

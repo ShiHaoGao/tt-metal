@@ -19,6 +19,7 @@
 #include "hostdev/profiler_common.h"
 #include "internal/risc_attribs.h"
 #include "internal/hw_thread.h"
+#include "tools/profiler/profiler_counter.hpp"
 
 #if defined(ARCH_QUASAR)
 // Quasar NEO_REGS_0 wall-clock register addresses
@@ -231,6 +232,21 @@ inline __attribute__((always_inline)) uint64_t quasar_read_wall_clock_64() {
 }
 #endif
 
+inline __attribute__((always_inline)) WallClockSample read_profiler_wall_clock() {
+    volatile tt_reg_ptr uint32_t* p_reg = reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
+#if defined(ARCH_QUASAR)
+    // Retain the existing Quasar accumulate flush/push register choice and
+    // high-then-low sequence. Its normal marker and SUM paths use the separate
+    // quasar_read_wall_clock_64 helper above.
+    const uint32_t high = p_reg[WALL_CLOCK_HIGH_INDEX];
+    const uint32_t low = p_reg[WALL_CLOCK_LOW_INDEX];
+    return {high, low};
+#else
+    return read_coherent_wall_clock(
+        [p_reg] { return p_reg[WALL_CLOCK_HIGH_INDEX]; }, [p_reg] { return p_reg[WALL_CLOCK_LOW_INDEX]; });
+#endif
+}
+
 inline __attribute__((always_inline)) void mark_time_at_index_inlined(uint32_t index, uint32_t timer_id) {
 #if defined(ARCH_QUASAR)
     uint64_t wall_clock = quasar_read_wall_clock_64();
@@ -241,11 +257,11 @@ inline __attribute__((always_inline)) void mark_time_at_index_inlined(uint32_t i
         (time_high & PROFILER_MARKER_TS_HIGH_MASK);
     profiler_data_buffer[myRiscID].data[index + 1] = time_low;
 #else
-    volatile tt_reg_ptr uint32_t* p_reg = reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
+    const auto wall_clock = read_profiler_wall_clock();
     profiler_data_buffer[myRiscID].data[index] =
         PROFILER_MARKER_VALID | ((timer_id & PROFILER_MARKER_TIMER_ID_MASK) << PROFILER_MARKER_TIMER_ID_SHIFT) |
-        (p_reg[WALL_CLOCK_HIGH_INDEX] & PROFILER_MARKER_TS_HIGH_MASK);
-    profiler_data_buffer[myRiscID].data[index + 1] = p_reg[WALL_CLOCK_LOW_INDEX];
+        (wall_clock.high & PROFILER_MARKER_TS_HIGH_MASK);
+    profiler_data_buffer[myRiscID].data[index + 1] = wall_clock.low;
 #endif
 }
 
@@ -403,10 +419,7 @@ __attribute__((noinline)) void finish_profiler(bool do_accumulate = DO_ACCUMULAT
 
             // Guaranteed-marker slots are free in accumulate mode, so time the push (slots 1/2) and nested NOC flush
             // (slots 3/4) there.
-            volatile tt_reg_ptr uint32_t* push_clk =
-                reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
-            uint32_t push_start_h = push_clk[WALL_CLOCK_HIGH_INDEX];
-            uint32_t push_start_l = push_clk[WALL_CLOCK_LOW_INDEX];
+            const auto push_start = read_profiler_wall_clock();
 
             NocRegisterStateSave noc_state;
             for (uint32_t riscID = 0; riscID < PROCESSOR_COUNT; riscID++) {
@@ -470,28 +483,25 @@ __attribute__((noinline)) void finish_profiler(bool do_accumulate = DO_ACCUMULAT
                 profiler_control_buffer[deviceIndex] = 0;
             }
 
-            uint32_t flush_start_h = push_clk[WALL_CLOCK_HIGH_INDEX];
-            uint32_t flush_start_l = push_clk[WALL_CLOCK_LOW_INDEX];
+            const auto flush_start = read_profiler_wall_clock();
             profiler_noc_async_flush_posted_write();
-            uint32_t flush_end_h = push_clk[WALL_CLOCK_HIGH_INDEX];
-            uint32_t flush_end_l = push_clk[WALL_CLOCK_LOW_INDEX];
+            const auto flush_end = read_profiler_wall_clock();
             // Host pairs guaranteed markers by timestamp, so inner NOC-FLUSH end must be strictly before outer
             // DRAM-PUSH end: emit flush first, sample push_end after.
             {
                 SrcLocNameToHash("PROFILER-NOC-FLUSH");
                 mark_time_at_index_with_stamp(
-                    GUARANTEED_MARKER_3_H, get_const_id(hash, ZONE_START), flush_start_h, flush_start_l);
+                    GUARANTEED_MARKER_3_H, get_const_id(hash, ZONE_START), flush_start.high, flush_start.low);
                 mark_time_at_index_with_stamp(
-                    GUARANTEED_MARKER_4_H, get_const_id(hash, ZONE_END), flush_end_h, flush_end_l);
+                    GUARANTEED_MARKER_4_H, get_const_id(hash, ZONE_END), flush_end.high, flush_end.low);
             }
-            uint32_t push_end_h = push_clk[WALL_CLOCK_HIGH_INDEX];
-            uint32_t push_end_l = push_clk[WALL_CLOCK_LOW_INDEX];
+            const auto push_end = read_profiler_wall_clock();
             {
                 SrcLocNameToHash("PROFILER-DRAM-PUSH");
                 mark_time_at_index_with_stamp(
-                    GUARANTEED_MARKER_1_H, get_const_id(hash, ZONE_START), push_start_h, push_start_l);
+                    GUARANTEED_MARKER_1_H, get_const_id(hash, ZONE_START), push_start.high, push_start.low);
                 mark_time_at_index_with_stamp(
-                    GUARANTEED_MARKER_2_H, get_const_id(hash, ZONE_END), push_end_h, push_end_l);
+                    GUARANTEED_MARKER_2_H, get_const_id(hash, ZONE_END), push_end.high, push_end.low);
             }
             profiler_control_buffer[RUN_COUNTER]++;
         }
@@ -882,9 +892,7 @@ struct profileScopeAccumulate {
 #if defined(ARCH_QUASAR)
         return quasar_read_wall_clock_64();
 #else
-        volatile tt_reg_ptr uint32_t* p_reg =
-            reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
-        return ((uint64_t)p_reg[WALL_CLOCK_HIGH_INDEX] << 32) | p_reg[WALL_CLOCK_LOW_INDEX];
+        return read_profiler_wall_clock().value();
 #endif
     }
 

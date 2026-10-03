@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <vector>
+#include "hostdev/worker_stream_state_contract.h"
 
 namespace tt::tt_metal {
 
@@ -47,6 +48,12 @@ public:
 
     void set_runtime_id(ProgramId id);
     ProgramId get_runtime_id() const;
+
+    // Set before compilation or kernel-group projection. This is an explicit
+    // worker-state contract, independent of kernel source/body mode. Program
+    // ownership requires an admitted firmware provider and exclusive lifetime.
+    void set_worker_stream_state_owner(tt::worker_stream_state::Owner owner);
+    tt::worker_stream_state::Owner get_worker_stream_state_owner() const;
 
     //////////////////////////////
     // Buffer related functions:

@@ -290,6 +290,9 @@ void SDMeshCommandQueue::dispatch_program(const MeshCoordinateRange& coord_range
 }
 
 void SDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool blocking) {
+    for (const auto& [range, program] : mesh_workload.get_programs())
+        program.impl().validate_worker_stream_state_client(
+            MetalContext::instance(mesh_device_->impl().get_context_id()));
     if (this->get_target_device_type() == tt::TargetDevice::Mock) {
         return;  // Skip workload execution for mock devices
     }
@@ -453,19 +456,37 @@ void SDMeshCommandQueue::reset_worker_state(
     uint32_t,
     const vector_aligned<uint32_t>&,
     const std::vector<std::pair<CoreRangeSet, uint32_t>>&,
-    ttsl::Span<const uint32_t>) {}
+    ttsl::Span<const uint32_t>) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
+}
 
 void SDMeshCommandQueue::record_begin(const MeshTraceId&, const std::shared_ptr<MeshTraceDescriptor>&) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     TT_THROW("Not supported for slow dispatch");
 }
 
-void SDMeshCommandQueue::record_end() { TT_THROW("Not supported for slow dispatch"); }
+void SDMeshCommandQueue::record_end() {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
+    TT_THROW("Not supported for slow dispatch");
+}
 
-void SDMeshCommandQueue::enqueue_trace(const MeshTraceId&, bool) { TT_THROW("Not supported for slow dispatch"); }
+void SDMeshCommandQueue::enqueue_trace(const MeshTraceId&, bool) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
+    TT_THROW("Not supported for slow dispatch");
+}
 
-void SDMeshCommandQueue::enable_asynchronous_slow_dispatch() { asynchronous_slow_dispatch_enabled_ = true; }
+void SDMeshCommandQueue::set_configure_only(bool enable) {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
+    configure_only_ = enable;
+}
+
+void SDMeshCommandQueue::enable_asynchronous_slow_dispatch() {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
+    asynchronous_slow_dispatch_enabled_ = true;
+}
 
 void SDMeshCommandQueue::disable_asynchronous_slow_dispatch() {
+    MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
     auto lock = lock_api_function_();
     wait_for_cores_idle();
     asynchronous_slow_dispatch_enabled_ = false;
