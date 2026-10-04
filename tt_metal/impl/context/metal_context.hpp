@@ -46,6 +46,7 @@ class ContextDescriptor;
 class DataCollector;
 class DeviceManager;
 class RiscFirmwareInitializer;
+namespace experimental::native_detail { class LoadedFirmware; }
 class FabricFirmwareInitializer;
 class dispatch_core_manager;
 class DispatchQueryManager;
@@ -92,7 +93,11 @@ public:
     void validate_worker_stream_state_client(const std::shared_ptr<const WorkerStreamStateClient>& client) const;
     void validate_worker_stream_state_access() const;
     void validate_worker_stream_state_trace() const;
+    // Caller holds WorkerStreamStateAdmission; inspect live slots without
+    // constructing a default context or using its legacy fallback.
+    static void validate_all_worker_stream_state_traces();
     std::shared_ptr<const WorkerStreamStateProvider> worker_stream_state_provider(ChipId device_id) const;
+    std::shared_ptr<const experimental::native_detail::LoadedFirmware> native_firmware(ChipId device_id) const;
 
     // Returns the id of this instance. The ID cannot be used to uniquely identify the context.
     // IDs are recycled after instances are destroyed.
@@ -244,6 +249,18 @@ public:
 
 private:
     friend class ttsl::Indestructible<MetalContext>;
+    friend class MetalEnvImpl;
+    struct EnvironmentWorkerClient {
+        ContextId context_id;
+        std::shared_ptr<const WorkerStreamStateClient> client;
+    };
+    static EnvironmentWorkerClient create_worker_stream_state_context(MetalEnv& env);
+    static ContextId create_instance_locked(
+        MetalEnv& env, std::shared_ptr<const WorkerStreamStateClient> client = {});
+    static void validate_registered_environment(
+        ContextId id, MetalEnv& env, const std::shared_ptr<const WorkerStreamStateClient>& client);
+    static void destroy_registered_environment(
+        ContextId id, MetalEnvImpl& env, const std::shared_ptr<const WorkerStreamStateClient>& client);
 
     // Construct MetalContext to use the given MetalEnv and assign it context id. The MetalEnv must not be
     // destroyed while its associated MetalContext instance is alive.

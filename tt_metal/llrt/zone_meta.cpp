@@ -73,11 +73,11 @@ ZoneMetaRegistry& ZoneMetaRegistry::instance() {
     return inst;
 }
 
-void ZoneMetaRegistry::ingest_elf(const std::string& elf_path) {
+static void ingest_image(const std::string& elf_path, std::span<const std::byte> image) {
     State& s = state();
     {
         std::shared_lock rd(s.mtx);
-        if (s.ingested.contains(elf_path)) {
+        if (image.empty() && s.ingested.contains(elf_path)) {
             return;
         }
     }
@@ -86,7 +86,8 @@ void ZoneMetaRegistry::ingest_elf(const std::string& elf_path) {
     bool skipped_foreign = false;
     try {
         ll_api::ElfFile elf;
-        elf.ReadImage(elf_path);
+        if (image.empty()) elf.ReadImage(elf_path);
+        else elf.ReadImage(image, "native profile image");
         uint64_t meta_vma = 0;
         auto meta = elf.GetSectionContents(".tt_zone_meta", meta_vma);
         if (!meta.empty()) {
@@ -131,7 +132,7 @@ void ZoneMetaRegistry::ingest_elf(const std::string& elf_path) {
     }
 
     std::unique_lock wr(s.mtx);
-    if (!s.ingested.insert(elf_path).second) {
+    if (image.empty() && !s.ingested.insert(elf_path).second) {
         return;
     }
     if (skipped_foreign) {
@@ -171,6 +172,11 @@ void ZoneMetaRegistry::ingest_elf(const std::string& elf_path) {
     if (s.listener && !added.empty()) {
         s.listener(added);
     }
+}
+
+void ZoneMetaRegistry::ingest_elf(const std::string& path) { ingest_image(path, {}); }
+void ZoneMetaRegistry::ingest_elf(std::span<const std::byte> image) {
+    if (!image.empty()) ingest_image("<native image>", image);
 }
 
 void ZoneMetaRegistry::set_listener(Listener listener) {

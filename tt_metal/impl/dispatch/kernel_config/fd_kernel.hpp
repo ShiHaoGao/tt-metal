@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "impl/experimental/published_deployment/configuration.hpp"
 
 #include <tt-metalium/program.hpp>
 #include <tt-metalium/kernel_types.hpp>
@@ -35,11 +36,7 @@ enum NOC : uint8_t;
 #define UNUSED_LOGICAL_CORE tt_cxy_pair(device_->id(), 0, 0)
 #define UNUSED_SEM_ID 0
 
-struct noc_selection_t {
-    tt::tt_metal::NOC non_dispatch_noc;  // For communicating with workers/DRAM/host
-    tt::tt_metal::NOC upstream_noc;      // For communicating with upstream dispatch modules
-    tt::tt_metal::NOC downstream_noc;    // For communicating with downstream dispatch modules
-};
+
 
 enum class FDKernelType : uint32_t {
     UNSET = 0,
@@ -60,28 +57,6 @@ struct TerminationInfo {
     }
 };
 
-static std::vector<std::string> dispatch_kernel_file_names = {
-    "tt_metal/impl/dispatch/kernels/cq_prefetch.cpp",              // PREFETCH
-    "tt_metal/impl/dispatch/kernels/cq_prefetch.cpp",              // PREFETCH_HD
-    "tt_metal/impl/dispatch/kernels/cq_prefetch.cpp",              // PREFETCH_H
-    "tt_metal/impl/dispatch/kernels/cq_prefetch.cpp",              // PREFETCH_D
-    "tt_metal/impl/dispatch/kernels/cq_dispatch.cpp",              // DISPATCH
-    "tt_metal/impl/dispatch/kernels/cq_dispatch.cpp",              // DISPATCH_HD
-    "tt_metal/impl/dispatch/kernels/cq_dispatch.cpp",              // DISPATCH_H
-    "tt_metal/impl/dispatch/kernels/cq_dispatch.cpp",              // DISPATCH_D
-    "tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp",  // DISPATCH_S
-    "",                                                            // MUX
-    "tt_metal/impl/dispatch/kernels/packet_mux.cpp",               // MUX_D
-    "tt_metal/impl/dispatch/kernels/packet_demux.cpp",             // DEMUX
-    "",                                                            // DEMUX_D
-    "tt_metal/impl/dispatch/kernels/vc_eth_tunneler.cpp",          // US_TUNNELER_LOCAL
-    "tt_metal/impl/dispatch/kernels/vc_eth_tunneler.cpp",          // US_TUNNELER_REMOTE
-    "tt_metal/impl/dispatch/kernels/vc_packet_router.cpp",         // PACKET_ROUTER_MUX
-    "tt_metal/impl/dispatch/kernels/vc_packet_router.cpp",         // PACKET_ROUTER_DEMUX
-    "tt_metal/fabric/impl/kernels/tt_fabric_mux.cpp",              // FABRIC_MUX
-    "tt_metal/fabric/impl/kernels/tt_fabric_mux.cpp",              // FABRIC_RETURN_MUX
-    ""                                                             // COUNT
-};
 
 // Use getters because they may be recreated between calls to Generate() and ConfigureCore()
 // E.g., Changing fabric mode from Disabled to Enabled constructs a new control plane
@@ -187,6 +162,8 @@ public:
 
 protected:
     const DispatchMemMap& get_dispatch_mem_map() const;
+    experimental::DispatchResolvedConfiguration resolve_dispatch_options() const;
+    experimental::DispatchKernelConfiguration resolve_dispatch_configuration() const;
 
     // Attributes for an EDM client to connect to the router
     struct FDKernelEdmConnectionAttributes {

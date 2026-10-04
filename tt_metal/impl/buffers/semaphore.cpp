@@ -5,8 +5,8 @@
 #include "semaphore.hpp"
 #include <cstdint>
 
-#include "hal_types.hpp"
-#include "impl/context/metal_context.hpp"
+#include <limits>
+#include <stdexcept>
 #include <umd/device/types/core_coordinates.hpp>
 
 namespace tt::tt_metal {
@@ -29,9 +29,12 @@ bool Semaphore::initialized_on_logical_core(const CoreCoord& logical_core) const
     return this->core_range_set_.contains(logical_core);
 }
 
-uint32_t Semaphore::offset() const {
-    uint32_t offset = MetalContext::instance().hal().get_alignment(HalMemType::L1) * id_;
-    return offset;
+uint32_t Semaphore::offset(uint32_t l1_alignment) const {
+    if (!l1_alignment || (l1_alignment & (l1_alignment - 1)) ||
+        l1_alignment < sizeof(uint32_t) || id_ >= NUM_SEMAPHORES ||
+        uint64_t(l1_alignment) * id_ > std::numeric_limits<uint32_t>::max())
+        throw std::invalid_argument("invalid semaphore slot or L1 alignment");
+    return l1_alignment * id_;
 }
 
 }  // namespace tt::tt_metal

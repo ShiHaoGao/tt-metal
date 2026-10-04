@@ -67,7 +67,6 @@
 #include "tt_metal/impl/program/program_command_sequence.hpp"
 #include "tt_metal/impl/dataflow_buffer/dataflow_buffer_impl.hpp"
 #include "tt_metal/impl/allocator/allocator.hpp"
-#include "tt_metal/jit_build/build_env_manager.hpp"
 #include <umd/device/types/core_coordinates.hpp>
 #include <umd/device/types/xy_pair.hpp>
 #include "impl/dispatch/vector_aligned.hpp"
@@ -630,9 +629,7 @@ uint32_t finalize_kernel_bins(
         std::ranges::fill(kg->kernel_text_offsets, 0);
         for (auto kernel_id : kg->kernel_ids) {
             const auto& kernel = kernels.at(kernel_id);
-            const auto& binaries = kernel->binaries(BuildEnvManager::get_instance(extract_context_id(device))
-                                                        .get_device_build_env(device->build_id())
-                                                        .build_key());
+            const auto& binaries = kernel->binaries(*device);
             uint32_t num_binaries = kernel->expected_num_binaries();
             TT_ASSERT(kernel->get_kernel_programmable_core_type() == programmable_core_type);
             for (uint32_t i = 0; i < num_binaries; i++) {
@@ -1427,7 +1424,7 @@ public:
                 for (const auto& dst_noc_info : dst_noc_multicast_info) {
                     const auto& core_range = std::get<CoreRange>(dst_noc_info.cores);
                     auto noc_xy_addr = device->get_noc_multicast_encoding(constants.noc_index, core_range);
-                    uint32_t start_addr = semaphore.offset() + program.get_program_config(index).sem_offset;
+                    uint32_t start_addr = semaphore.offset(hal.get_alignment(HalMemType::L1)) + program.get_program_config(index).sem_offset;
                     LOG_TRACE_LAZY(
                         tt::LogDispatch,
                         "Semaphore (MCAST/WORKER): core_range={}, noc_xy=0x{:x}, num_dests={}, "
@@ -1446,7 +1443,7 @@ public:
                                   reinterpret_cast<const uint8_t*>(&semaphore_data.back()), sizeof(uint32_t))}}};
                 }
             } else if (semaphore.core_type() == CoreType::ETH) {
-                unicast_semaphore_cmds.push_back({.dst = semaphore.offset(), .size = sizeof(uint32_t)});
+                unicast_semaphore_cmds.push_back({.dst = semaphore.offset(hal.get_alignment(HalMemType::L1)), .size = sizeof(uint32_t)});
                 auto& unicast_cmds = unicast_semaphore_cmds.back();
                 // TODO: we only fast dispatch to active eth...
                 std::vector<std::pair<transfer_info_cores, uint32_t>> dst_noc_unicast_info =
@@ -1455,7 +1452,7 @@ public:
                     tt::LogDispatch,
                     "Semaphore (UNICAST/ETH): num_cores={}, L1_offset=0x{:x}, initial_value={}",
                     dst_noc_unicast_info.size(),
-                    semaphore.offset(),
+                    semaphore.offset(hal.get_alignment(HalMemType::L1)),
                     semaphore_data.back());
                 for (const auto& dst_noc_info : dst_noc_unicast_info) {
                     const auto& virtual_core = std::get<CoreCoord>(dst_noc_info.first);

@@ -149,6 +149,10 @@ SECTIONS
   {
     KEEP(*(.tt_worker_stream_state))
   } :NONE
+  .tt_native_image 0x6900000 (INFO) :
+  {
+    KEEP(*(.tt_native_image))
+  } :NONE
 #endif
   /* DEVICE_PRINT string table – file-only section, VMA = 0x6400000 */
   .device_print_strings 0x6400000 (INFO) :

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dispatch.hpp"
+#include "impl/experimental/published_deployment/dispatch_plan.hpp"
 
 #include <tt-logger/tt-logger.hpp>
 #include <tt_metal.hpp>
@@ -462,15 +463,12 @@ void DispatchKernel::CreateKernel() {
     uint32_t num_virtual_active_eth_cores = get_max_num_eth_cores();
     uint32_t num_physical_active_eth_cores =
         get_control_plane_ref().get_active_ethernet_cores(device_->id(), /*skip_reserved_tunnel_cores*/ true).size();
-    bool virtualize_num_eth_cores = num_virtual_active_eth_cores > num_physical_active_eth_cores;
 
     const auto& compute_grid_size = device_->compute_with_storage_grid_size();
     CoreRange device_worker_cores = CoreRange({0, 0}, {compute_grid_size.x - 1, compute_grid_size.y - 1});
     auto virtual_start = device_->virtual_core_from_logical_core(device_worker_cores.start_coord, CoreType::WORKER);
     auto virtual_end = device_->virtual_core_from_logical_core(device_worker_cores.end_coord, CoreType::WORKER);
     auto virtual_core_range = CoreRange(virtual_start, virtual_end);
-
-    std::vector<uint32_t> compile_args = {};
 
     auto my_virtual_core = get_virtual_core_coord(descriptor_, logical_core_, GetCoreType());
     auto upstream_virtual_core =
@@ -488,114 +486,24 @@ void DispatchKernel::CreateKernel() {
     auto downstream_s_virtual_noc_coords =
         device_->virtual_noc0_coordinate(noc_selection_.downstream_noc, downstream_s_virtual_core);
 
-    std::map<std::string, std::string> defines = {
-        {"MY_NOC_X", std::to_string(my_virtual_noc_coords.x)},
-        {"MY_NOC_Y", std::to_string(my_virtual_noc_coords.y)},
-        {"UPSTREAM_NOC_INDEX", std::to_string(noc_selection_.upstream_noc)},
-        {"UPSTREAM_NOC_X", std::to_string(upstream_virtual_noc_coords.x)},
-        {"UPSTREAM_NOC_Y", std::to_string(upstream_virtual_noc_coords.y)},
-        {"DOWNSTREAM_NOC_X", std::to_string(downstream_virtual_noc_coords.x)},
-        {"DOWNSTREAM_NOC_Y", std::to_string(downstream_virtual_noc_coords.y)},
-        {"DOWNSTREAM_SUBORDINATE_NOC_X", std::to_string(downstream_s_virtual_noc_coords.x)},
-        {"DOWNSTREAM_SUBORDINATE_NOC_Y", std::to_string(downstream_s_virtual_noc_coords.y)},
-
-        // Add all the dispatch-specific defines
-        {"DISPATCH_CB_BASE", std::to_string(static_config_.dispatch_cb_base.value())},
-        {"DISPATCH_CB_LOG_PAGE_SIZE", std::to_string(static_config_.dispatch_cb_log_page_size.value())},
-        {"DISPATCH_CB_PAGES", std::to_string(static_config_.dispatch_cb_pages.value())},
-        {"MY_DISPATCH_CB_SEM_ID", std::to_string(static_config_.my_dispatch_cb_sem_id.value())},
-        {"UPSTREAM_DISPATCH_CB_SEM_ID", std::to_string(dependent_config_.upstream_dispatch_cb_sem_id.value())},
-        {"DISPATCH_D_SHUTDOWN_SEM_ID", std::to_string(dependent_config_.dispatch_d_shutdown_sem_id.value())},
-        {"DISPATCH_CB_BLOCKS", std::to_string(static_config_.dispatch_cb_blocks.value())},
-        {"UPSTREAM_SYNC_SEM", std::to_string(dependent_config_.upstream_sync_sem.value())},
-        {"IS_CQ_DRAM_BACKED", std::to_string(device_->sysmem_manager().is_dram_backed())},
-        {"COMMAND_QUEUE_BASE_ADDR", std::to_string(static_config_.command_queue_base_addr.value())},
-        {"COMPLETION_QUEUE_BASE_ADDR", std::to_string(static_config_.completion_queue_base_addr.value())},
-        {"COMPLETION_QUEUE_SIZE", std::to_string(static_config_.completion_queue_size.value())},
-        {"DOWNSTREAM_CB_BASE", std::to_string(dependent_config_.downstream_cb_base.value())},
-        {"DOWNSTREAM_CB_SIZE", std::to_string(dependent_config_.downstream_cb_size.value())},
-        {"MY_DOWNSTREAM_CB_SEM_ID", std::to_string(static_config_.my_downstream_cb_sem_id.value())},
-        {"DOWNSTREAM_CB_SEM_ID", std::to_string(dependent_config_.downstream_cb_sem_id.value())},
-        {"SPLIT_PREFETCH", std::to_string(dependent_config_.split_prefetch.value())},
-        {"PREFETCH_H_NOC_XY", std::to_string(dependent_config_.prefetch_h_noc_xy.value())},
-        {"PREFETCH_H_LOCAL_DOWNSTREAM_SEM_ADDR",
-         std::to_string(dependent_config_.prefetch_h_local_downstream_sem_addr.value())},
-        {"PREFETCH_H_MAX_CREDITS", std::to_string(static_config_.prefetch_h_max_credits.value())},
-        {"PACKED_WRITE_MAX_UNICAST_SUB_CMDS", std::to_string(static_config_.packed_write_max_unicast_sub_cmds.value())},
-        {"DISPATCH_S_SYNC_SEM_BASE_ADDR", std::to_string(static_config_.dispatch_s_sync_sem_base_addr.value())},
-        {"MAX_NUM_WORKER_SEMS", std::to_string(static_config_.max_num_worker_sems.value())},
-        {"MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES",
-         std::to_string(static_config_.max_num_go_signal_noc_data_entries.value())},
-        {"MCAST_GO_SIGNAL_ADDR", std::to_string(static_config_.mcast_go_signal_addr.value())},
-        {"UNICAST_GO_SIGNAL_ADDR", std::to_string(static_config_.unicast_go_signal_addr.value())},
-        {"DISTRIBUTED_DISPATCHER", std::to_string(static_config_.distributed_dispatcher.value())},
-        {"HOST_COMPLETION_Q_WR_PTR", std::to_string(static_config_.host_completion_q_wr_ptr.value())},
-        {"DEV_COMPLETION_Q_WR_PTR", std::to_string(static_config_.dev_completion_q_wr_ptr.value())},
-        {"DEV_COMPLETION_Q_RD_PTR", std::to_string(static_config_.dev_completion_q_rd_ptr.value())},
-        {"DEV_DISPATCH_PROGRESS_PTR", std::to_string(static_config_.dev_dispatch_progress_ptr.value())},
-        {"FIRST_STREAM_USED", std::to_string(static_config_.first_stream_used.value())},
-        {"COMPLETION_COUNTER_OFFSET", std::to_string(static_config_.completion_counter_offset.value())},
-        {"VIRTUALIZE_UNICAST_CORES", std::to_string(virtualize_num_eth_cores)},
-        {"NUM_VIRTUAL_UNICAST_CORES", std::to_string(num_virtual_active_eth_cores)},
-        {"NUM_PHYSICAL_UNICAST_CORES", std::to_string(num_physical_active_eth_cores)},
-        {"FABRIC_HEADER_RB_BASE", std::to_string(static_config_.fabric_header_rb_base.value())},
-        {"FABRIC_HEADER_RB_ENTRIES", std::to_string(static_config_.fabric_header_rb_entries.value())},
-        {"MY_FABRIC_SYNC_STATUS_ADDR", std::to_string(static_config_.my_fabric_sync_status_addr.value())},
-        {"REALTIME_PROFILER_MSG_ADDR", std::to_string(static_config_.realtime_profiler_msg_addr.value())},
-        {"DISPATCH_TELEMETRY_ADDR", std::to_string(static_config_.dispatch_telemetry_addr.value())},
-        {"DISPATCH_TELEMETRY_CONTROL_ADDR", std::to_string(static_config_.dispatch_telemetry_control_addr.value())},
-        {"DISPATCH_TELEMETRY_DISABLED", std::to_string(static_config_.dispatch_telemetry_disabled.value_or(false))},
-        {"FABRIC_MUX_X", std::to_string(dependent_config_.fabric_mux_client_config.virtual_x.value_or(0))},
-        {"FABRIC_MUX_Y", std::to_string(dependent_config_.fabric_mux_client_config.virtual_y.value_or(0))},
-        {"FABRIC_MUX_NUM_BUFFERS_PER_CHANNEL",
-         std::to_string(dependent_config_.fabric_mux_client_config.num_buffers_per_channel.value_or(0))},
-        {"FABRIC_MUX_CHANNEL_BUFFER_SIZE_BYTES",
-         std::to_string(dependent_config_.fabric_mux_client_config.channel_buffer_size_bytes.value_or(0))},
-        {"FABRIC_MUX_CHANNEL_BASE_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.channel_base_address.value_or(0))},
-        {"FABRIC_MUX_CONNECTION_INFO_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.connection_info_address.value_or(0))},
-        {"FABRIC_MUX_CONNECTION_HANDSHAKE_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.connection_handshake_address.value_or(0))},
-        {"FABRIC_MUX_FLOW_CONTROL_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.flow_control_address.value_or(0))},
-        {"FABRIC_MUX_BUFFER_INDEX_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.buffer_index_address.value_or(0))},
-        {"FABRIC_MUX_STATUS_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.status_address.value_or(0))},
-        {"FABRIC_MUX_TERMINATION_SIGNAL_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.termination_signal_address.value_or(0))},
-        {"WORKER_CREDITS_STREAM_ID",
-         std::to_string(dependent_config_.fabric_mux_client_config.worker_credits_stream_id.value_or(0))},
-        {"FABRIC_WORKER_FLOW_CONTROL_SEM", std::to_string(edm_connection_attributes_.worker_flow_control_sem)},
-        {"FABRIC_WORKER_TEARDOWN_SEM", std::to_string(edm_connection_attributes_.worker_teardown_sem)},
-        {"FABRIC_WORKER_BUFFER_INDEX_SEM", std::to_string(edm_connection_attributes_.worker_buffer_index_sem)},
-        {"NUM_HOPS", std::to_string(dependent_config_.num_hops.value())},
-        {"EW_DIM", std::to_string(dependent_config_.ew_dim.value_or(0))},
-        {"TO_MESH_ID", std::to_string(dependent_config_.to_mesh_id.value_or(0))},
-        {"WORKER_MCAST_GRID",
-         std::to_string(device_->get_noc_multicast_encoding(noc_selection_.downstream_noc, virtual_core_range))},
-        {"NUM_WORKER_CORES_TO_MCAST", std::to_string(device_worker_cores.size())},
-        {"IS_D_VARIANT", std::to_string(static_config_.is_d_variant.value())},
-        {"IS_H_VARIANT", std::to_string(static_config_.is_h_variant.value())},
-    };
-    if (!is_hd()) {
-        defines["FABRIC_RELAY"] = "1";
-        if (static_config_.is_2d_fabric.value_or(false)) {
-            defines["FABRIC_2D"] = "1";
-        }
-    }
-    if (device_->sysmem_manager().is_dram_backed()) {
-        defines["DRAM_BACKED_CQ_BANK_ID"] = std::to_string(device_->sysmem_manager().get_dram_region_bank_id());
-    }
-    // Runtime args offsets
-    defines["OFFSETOF_MY_DEV_ID"] = std::to_string(static_config_.offsetof_my_dev_id.value_or(0));
-    defines["OFFSETOF_TO_DEV_ID"] = std::to_string(static_config_.offsetof_to_dev_id.value_or(0));
-    defines["OFFSETOF_ROUTER_DIRECTION"] = std::to_string(static_config_.offsetof_router_direction.value_or(0));
-
-    // Compile at Os on IERISC to fit in code region.
-    auto optimization_level = (GetCoreType() == CoreType::ETH) ? KernelBuildOptLevel::Os : KernelBuildOptLevel::O2;
-    configure_kernel_variant(dispatch_kernel_file_names[DISPATCH], compile_args, defines, optimization_level);
+    auto configuration = resolve_dispatch_configuration();
+    configuration.kernel = experimental::DispatcherConfiguration{static_config_, dependent_config_};
+    auto& resolved = *configuration.resolved;
+    resolved.virtual_core = my_virtual_core;
+    resolved.my_noc = my_virtual_noc_coords;
+    resolved.upstream_noc = upstream_virtual_noc_coords;
+    resolved.downstream_noc = downstream_virtual_noc_coords;
+    resolved.subordinate_noc = downstream_s_virtual_noc_coords;
+    resolved.virtual_eth_cores = num_virtual_active_eth_cores;
+    resolved.physical_eth_cores = num_physical_active_eth_cores;
+    resolved.worker_multicast = device_->get_noc_multicast_encoding(noc_selection_.downstream_noc, virtual_core_range);
+    resolved.worker_count = device_worker_cores.size();
+    resolved.fabric_flow_control_sem = edm_connection_attributes_.worker_flow_control_sem;
+    resolved.fabric_teardown_sem = edm_connection_attributes_.worker_teardown_sem;
+    resolved.fabric_buffer_index_sem = edm_connection_attributes_.worker_buffer_index_sem;
+    auto plan = experimental::plan_dispatch_kernel(device_->arch(), configuration);
+    auto& kernel = plan.kernels.front();
+    configure_kernel_variant(std::string(experimental::dispatch_source_path(kernel.kind)), {}, kernel.defines, kernel.opt_level);
 }
 
 void DispatchKernel::ConfigureCore() {

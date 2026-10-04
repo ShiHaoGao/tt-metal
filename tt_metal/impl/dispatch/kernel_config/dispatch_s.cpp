@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 #include "dispatch_s.hpp"
+#include "impl/experimental/published_deployment/dispatch_plan.hpp"
 
 #include <span>
 #include <tt_metal.hpp>
@@ -278,7 +279,6 @@ void DispatchSKernel::CreateKernel() {
     uint32_t num_virtual_active_eth_cores = get_max_num_eth_cores();
     uint32_t num_physical_active_eth_cores =
         get_control_plane_ref().get_active_ethernet_cores(device_->id(), /*skip_reserved_tunnel_cores*/ true).size();
-    bool virtualize_num_eth_cores = num_virtual_active_eth_cores > num_physical_active_eth_cores;
 
     const auto& compute_grid_size = device_->compute_with_storage_grid_size();
     CoreRange device_worker_cores = CoreRange({0, 0}, {compute_grid_size.x - 1, compute_grid_size.y - 1});
@@ -301,80 +301,28 @@ void DispatchSKernel::CreateKernel() {
     auto downstream_s_virtual_noc_coords =
         device_->virtual_noc0_coordinate(noc_selection_.downstream_noc, downstream_s_virtual_core);
 
-    std::map<std::string, std::string> defines = {
-        {"MY_NOC_X", std::to_string(my_virtual_noc_coords.x)},
-        {"MY_NOC_Y", std::to_string(my_virtual_noc_coords.y)},
-        {"UPSTREAM_NOC_INDEX", std::to_string(noc_selection_.upstream_noc)},  // Unused, remove later
-        {"UPSTREAM_NOC_X", std::to_string(upstream_virtual_noc_coords.x)},
-        {"UPSTREAM_NOC_Y", std::to_string(upstream_virtual_noc_coords.y)},
-        {"DOWNSTREAM_NOC_X", std::to_string(downstream_virtual_noc_coords.x)},
-        {"DOWNSTREAM_NOC_Y", std::to_string(downstream_virtual_noc_coords.y)},
-        {"DOWNSTREAM_SUBORDINATE_NOC_X", std::to_string(downstream_s_virtual_noc_coords.x)},  // Unused, remove later
-        {"DOWNSTREAM_SUBORDINATE_NOC_Y", std::to_string(downstream_s_virtual_noc_coords.y)},  // Unused, remove later
-        {"CB_BASE", std::to_string(static_config_.cb_base.value())},
-        {"CB_LOG_PAGE_SIZE", std::to_string(static_config_.cb_log_page_size.value())},
-        {"CB_SIZE", std::to_string(static_config_.cb_size.value())},
-        {"MY_DISPATCH_CB_SEM_ID", std::to_string(static_config_.my_dispatch_cb_sem_id.value())},
-        {"DISPATCH_D_SHUTDOWN_SEM_ID", std::to_string(static_config_.dispatch_d_shutdown_sem_id.value())},
-        {"UPSTREAM_DISPATCH_CB_SEM_ID", std::to_string(dependent_config_.upstream_dispatch_cb_sem_id.value())},
-        {"DISPATCH_S_SYNC_SEM_BASE_ADDR", std::to_string(static_config_.dispatch_s_sync_sem_base_addr.value())},
-        {"MCAST_GO_SIGNAL_ADDR", std::to_string(static_config_.mcast_go_signal_addr.value())},
-        {"UNICAST_GO_SIGNAL_ADDR", std::to_string(static_config_.unicast_go_signal_addr.value())},
-        {"DISTRIBUTED_DISPATCHER", std::to_string(static_config_.distributed_dispatcher.value())},
-        {"FIRST_STREAM_USED", std::to_string(static_config_.first_stream_used.value())},
-        {"COMPLETION_COUNTER_OFFSET", std::to_string(static_config_.completion_counter_offset.value())},
-        {"MAX_NUM_WORKER_SEMS", std::to_string(static_config_.max_num_worker_sems.value())},
-        {"MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES",
-         std::to_string(static_config_.max_num_go_signal_noc_data_entries.value())},
-        {"VIRTUALIZE_UNICAST_CORES", std::to_string(virtualize_num_eth_cores)},
-        {"NUM_VIRTUAL_UNICAST_CORES", std::to_string(num_virtual_active_eth_cores)},
-        {"NUM_PHYSICAL_UNICAST_CORES", std::to_string(num_physical_active_eth_cores)},
-        {"WORKER_MCAST_GRID",
-         std::to_string(device_->get_noc_multicast_encoding(noc_selection_.downstream_noc, virtual_core_range))},
-        {"NUM_WORKER_CORES_TO_MCAST", std::to_string(device_worker_cores.size())},
-        {"REALTIME_PROFILER_MSG_ADDR", std::to_string(static_config_.realtime_profiler_msg_addr.value())},
-        {"DISPATCH_TELEMETRY_ADDR", std::to_string(static_config_.dispatch_telemetry_addr.value())},
-        {"DISPATCH_TELEMETRY_DISABLED", std::to_string(static_config_.dispatch_telemetry_disabled.value_or(false))},
-        {"DISPATCH_TELEMETRY_CONTROL_ADDR", std::to_string(static_config_.dispatch_telemetry_control_addr.value())},
-        {"DEVICE_PRINT_DISPATCH_ENABLED", std::to_string(static_config_.device_print_dispatch_enabled.value_or(0))},
-        // For each per-device dispatch_s build, MaxNocLocations equals the actual print-core count
-        // for that device — passed as a compile-time #define so DevicePrintDispatch<>'s LDM arrays
-        // (rw_noc_addresses, cache_buffer_offsets, cache_buffer_sizes, noc_locations_to_process)
-        // are sized to actual usage instead of device_print_dispatch::DEFAULT_MAX_NOC_LOCATIONS.
-        {"DEVICE_PRINT_MAX_NOC_LOCATIONS", std::to_string(static_config_.device_print_noc_locations_count.value_or(0))},
-        {"DEVICE_PRINT_NOC_LOCATIONS_ADDR", std::to_string(static_config_.device_print_noc_locations_addr.value_or(0))},
-        {"DEVICE_PRINT_NOC_LOCATIONS_COUNT",
-         std::to_string(static_config_.device_print_noc_locations_count.value_or(0))},
-        {"DEVICE_PRINT_L1_CACHE_ADDR", std::to_string(static_config_.device_print_l1_cache_addr.value_or(0))},
-        {"DEVICE_PRINT_L1_CACHE_SIZE", std::to_string(static_config_.device_print_l1_cache_size.value_or(0))},
-        {"DEVICE_PRINT_DRAM_X", std::to_string(static_config_.device_print_dram_x.value_or(0))},
-        {"DEVICE_PRINT_DRAM_Y", std::to_string(static_config_.device_print_dram_y.value_or(0))},
-        {"DEVICE_PRINT_DRAM_RW_PTRS", std::to_string(static_config_.device_print_dram_rw_ptrs.value_or(0)) + "ULL"},
-        {"DEVICE_PRINT_DRAM_BUF_ADDR", std::to_string(static_config_.device_print_dram_buf_addr.value_or(0)) + "ULL"},
-        {"DEVICE_PRINT_DRAM_BUF_SIZE", std::to_string(static_config_.device_print_dram_buf_size.value_or(0))},
-        {"DEVICE_PRINT_CYCLES_FOR_STALL",
-         std::to_string(static_config_.device_print_cycles_for_stall.value_or(0)) + "ULL"},
-        {"DEVICE_PRINT_CYCLES_FOR_FULL",
-         std::to_string(static_config_.device_print_cycles_for_full.value_or(0)) + "ULL"},
-    };
-    configure_kernel_variant(dispatch_kernel_file_names[DISPATCH_S], {}, defines);
-
-    if (GetCoreType() == CoreType::WORKER && device_->arch() != tt::ARCH::QUASAR) {
-        const std::string compute_kernel_path = "tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate_compute.cpp";
-        std::map<std::string, std::string> compute_defines = {
-            {"DISPATCH_KERNEL", "1"},
-            {"FIRST_STREAM_INDEX", std::to_string(static_config_.first_stream_used.value())},
-            {"NUM_STREAMS_TO_MONITOR", std::to_string(static_config_.max_num_worker_sems.value())},
-            {"REALTIME_PROFILER_MSG_ADDR", std::to_string(static_config_.realtime_profiler_msg_addr.value())},
-            {"DISPATCH_TELEMETRY_ADDR", std::to_string(static_config_.dispatch_telemetry_addr.value())},
-            {"DISPATCH_TELEMETRY_DISABLED", std::to_string(static_config_.dispatch_telemetry_disabled.value_or(false))},
-            {"TOTAL_SUB_DEVICES", std::to_string(static_config_.max_num_worker_sems.value())},
-            {"DISPATCH_TELEMETRY_CONTROL_ADDR", std::to_string(static_config_.dispatch_telemetry_control_addr.value())},
-            {"NUM_WORKER_CORES", std::to_string(device_worker_cores.size())},
-        };
+    auto configuration = resolve_dispatch_configuration();
+    configuration.kernel = experimental::SubordinateConfiguration{static_config_, dependent_config_};
+    auto& resolved = *configuration.resolved;
+    resolved.virtual_core = my_virtual_core;
+    resolved.my_noc = my_virtual_noc_coords;
+    resolved.upstream_noc = upstream_virtual_noc_coords;
+    resolved.downstream_noc = downstream_virtual_noc_coords;
+    resolved.subordinate_noc = downstream_s_virtual_noc_coords;
+    resolved.virtual_eth_cores = num_virtual_active_eth_cores;
+    resolved.physical_eth_cores = num_physical_active_eth_cores;
+    resolved.worker_multicast = device_->get_noc_multicast_encoding(noc_selection_.downstream_noc, virtual_core_range);
+    resolved.worker_count = device_worker_cores.size();
+    auto plan = experimental::plan_dispatch_kernel(device_->arch(), configuration);
+    auto& kernel = plan.kernels.front();
+    configure_kernel_variant(std::string(experimental::dispatch_source_path(kernel.kind)), {}, kernel.defines, kernel.opt_level);
+    if (plan.kernels.size() == 2) {
+        const auto& compute = plan.kernels[1];
         tt::tt_metal::ComputeConfig compute_config;
-        compute_config.defines = compute_defines;
-        tt::tt_metal::CreateKernel(*program_, compute_kernel_path, logical_core_, compute_config);
+        compute_config.defines = compute.defines;
+        compute_config.opt_level = compute.opt_level;
+        tt::tt_metal::CreateKernel(
+            *program_, std::string(experimental::dispatch_source_path(compute.kind)), logical_core_, compute_config);
     }
 }
 

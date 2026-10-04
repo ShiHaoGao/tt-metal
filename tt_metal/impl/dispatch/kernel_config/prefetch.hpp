@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "impl/experimental/published_deployment/configuration.hpp"
 
 #include <stdint.h>
 #include <optional>
@@ -17,78 +18,9 @@
 
 namespace tt::tt_metal {
 
-struct prefetch_static_config_t {
-    std::optional<uint32_t> my_downstream_cb_sem_id;
 
-    std::optional<uint32_t> pcie_base;
-    std::optional<uint32_t> pcie_size;
-    std::optional<uint32_t> prefetch_q_base;
-    std::optional<uint32_t> prefetch_q_size;
-    std::optional<uint32_t> prefetch_q_rd_ptr_addr;
-    std::optional<uint32_t> prefetch_q_pcie_rd_ptr_addr;
 
-    std::optional<uint32_t> cmddat_q_base;
-    std::optional<uint32_t> cmddat_q_size;
 
-    // Used for prefetch_h
-    std::optional<uint32_t> scratch_db_base;
-    std::optional<uint32_t> scratch_db_size;
-    std::optional<uint32_t> downstream_sync_sem_id;
-    std::optional<uint32_t> ringbuffer_size;
-
-    // Used for prefetch_d
-    std::optional<uint32_t> cmddat_q_pages;
-    std::optional<uint32_t> my_upstream_cb_sem_id;
-    std::optional<uint32_t> cmddat_q_log_page_size;
-
-    // Used for prefetch_d <--> dispatch_s data path
-    std::optional<uint32_t> dispatch_s_buffer_base;
-    std::optional<uint32_t> my_dispatch_s_cb_sem_id;
-    std::optional<uint32_t> dispatch_s_buffer_size;
-    std::optional<uint32_t> dispatch_s_cb_log_page_size;
-
-    std::optional<uint32_t> fabric_header_rb_base;
-    std::optional<uint32_t> fabric_header_rb_entries;
-    std::optional<uint32_t> my_fabric_sync_status_addr;
-
-    std::optional<uint32_t> dispatch_telemetry_addr;
-    std::optional<bool> dispatch_telemetry_disabled;
-
-    std::optional<bool> is_2d_fabric;
-
-    std::optional<bool> is_d_variant;
-    std::optional<bool> is_h_variant;
-
-    // Offsets of runtime args
-    std::optional<uint32_t> offsetof_my_dev_id;
-    std::optional<uint32_t> offsetof_to_dev_id;
-    std::optional<uint32_t> offsetof_router_direction;
-};
-
-struct prefetch_dependent_config_t {
-    std::optional<tt_cxy_pair> upstream_logical_core;
-    std::optional<tt_cxy_pair> downstream_logical_core;
-    std::optional<tt_cxy_pair> downstream_s_logical_core;
-
-    std::optional<uint32_t> downstream_cb_base;
-    std::optional<uint32_t> downstream_cb_log_page_size;
-    std::optional<uint32_t> downstream_cb_pages;
-    std::optional<uint32_t> downstream_cb_sem_id;
-
-    std::optional<uint32_t> upstream_cb_sem_id;
-
-    std::optional<uint32_t> downstream_dispatch_s_cb_sem_id;
-
-    std::optional<uint32_t> num_hops;
-
-    tt::tt_metal::relay_mux_client_config fabric_mux_client_config;
-
-    std::optional<uint32_t> my_dev_id;
-    std::optional<uint32_t> ew_dim;
-    std::optional<uint32_t> to_mesh_id;
-    std::optional<uint32_t> to_dev_id;
-    std::optional<uint32_t> router_direction;
-};
 
 class PrefetchKernel : public FDKernel {
 public:

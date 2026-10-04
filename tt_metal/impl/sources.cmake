@@ -1,4 +1,14 @@
 set(IMPL_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/published_deployment/configuration.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/published_deployment/archive.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/published_deployment/dispatch_plan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/published_deployment/dispatch_kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/published_deployment/dispatch_program_plan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/published_deployment/dispatch_program_adapter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/published_deployment/published_deployment.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/native_kernel/native_image.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/native_kernel/native_kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/external_binary_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/experimental/core_subset_write/mesh_command_queue.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/experimental/core_subset_write/tensor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/internal/disaggregation/kv_chunk_address_table.cpp
@@ -18,6 +28,7 @@ set(IMPL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/device/firmware/command_queue_initializer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/firmware/profiler_initializer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/firmware/risc_firmware_initializer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/device/firmware/firmware_images.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/experimental/device.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/device.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/mock_device.cpp
@@ -107,6 +118,7 @@ set(IMPL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/dispatch_mem_map.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/dispatch_telemetry.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/system_memory_cq_interface.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/system_memory_queue_plan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/system_memory_manager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/hardware_command_queue.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/launch_message_ring_buffer_state.cpp

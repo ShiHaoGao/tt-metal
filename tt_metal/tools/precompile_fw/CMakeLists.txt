@@ -31,7 +31,11 @@ if(NOT TT_METAL_SKIP_LINKING)
         DEPENDS
             precompile_fw
             ${PROJECT_SOURCE_DIR}/tt_metal/hw/firmware/src/tt-1xx/brisc.cc
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/firmware/src/tt-1xx/ncrisc.cc
             ${PROJECT_SOURCE_DIR}/tt_metal/hw/firmware/src/tt-1xx/trisc.cc
+            ${PROJECT_SOURCE_DIR}/tt_metal/hostdevcommon/api/hostdev/native_kernel_contract.h
+            ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/internal/native_firmware_contract.h
+            ${PROJECT_SOURCE_DIR}/tt_metal/tools/profiler/kernel_profiler.hpp
             ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/hostdev/worker_stream_state_contract.h
             ${PROJECT_SOURCE_DIR}/tt_metal/hw/toolchain/main.ld
             ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/internal/tt-1xx/blackhole/dst_initialization.h

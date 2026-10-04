@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <iosfwd>
 
 namespace tt::tt_metal {
 
@@ -13,6 +14,17 @@ using DeviceAddr = std::uint64_t;
 enum class HalProcessorClassType : uint8_t { DM = 0, COMPUTE = 1 };
 
 enum class HalProgrammableCoreType { TENSIX = 0, ACTIVE_ETH = 1, IDLE_ETH = 2, DRAM = 3, DISPATCH = 4, COUNT = 5 };
+
+// Struct of core type, processor class, and processor type to uniquely identify any processor.
+struct HalProcessorIdentifier {
+    HalProgrammableCoreType core_type = HalProgrammableCoreType::TENSIX;
+    HalProcessorClassType processor_class = HalProcessorClassType::DM;
+    int processor_type = 0;
+};
+
+std::ostream& operator<<(std::ostream&, const HalProcessorIdentifier&);
+bool operator<(const HalProcessorIdentifier&, const HalProcessorIdentifier&);
+bool operator==(const HalProcessorIdentifier&, const HalProcessorIdentifier&);
 
 static constexpr uint32_t NumHalProgrammableCoreTypes = static_cast<uint32_t>(HalProgrammableCoreType::COUNT);
 

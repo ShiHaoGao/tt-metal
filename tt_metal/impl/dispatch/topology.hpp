@@ -18,6 +18,7 @@
 #include "tt_metal/impl/dispatch/kernel_config/fd_kernel.hpp"
 #include "tt_metal/impl/dispatch/dispatch_core_common.hpp"
 #include "tt_metal/impl/context/context_descriptor.hpp"
+#include "impl/experimental/published_deployment/dispatch_program_plan.hpp"
 
 namespace tt::tt_fabric {
 class ControlPlane;
@@ -71,6 +72,7 @@ public:
     void populate_fd_kernels(const std::vector<DispatchKernelNode>& nodes);
 
     void populate_cq_static_args(Device* device);
+    experimental::DispatchProgramInputs capture_program_inputs(Device* device) const;
     void create_cq_program(Device* device);
     void compile_cq_programs();
     std::unique_ptr<Program> get_compiled_cq_program(Device* device);
@@ -93,6 +95,8 @@ private:
     GetMaxNumEthCoresFn get_max_num_eth_cores_;
     GetReadsDispatchCoresFn get_reads_dispatch_cores_;
     std::vector<FDKernel*> node_id_to_kernel_;
+    std::vector<DispatchKernelNode> placed_graph_;
+    std::unordered_map<ChipId, experimental::DispatchProgramPlan> published_program_plans_;
     std::unique_ptr<detail::ProgramCompileGroup> command_queue_compile_group_;
     std::unordered_map<ChipId, std::unordered_set<CoreCoord>> dispatch_cores_;
     std::unordered_map<ChipId, std::unordered_set<CoreCoord>> routing_cores_;

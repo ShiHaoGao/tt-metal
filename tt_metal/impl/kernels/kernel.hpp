@@ -23,6 +23,8 @@
 #include "jit_build/jit_build_settings.hpp"
 #include "impl/program/program_impl.hpp"
 #include "impl/kernels/kernel_source.hpp"
+#include "impl/experimental/native_kernel/native_image.hpp"
+#include <tt-metalium/experimental/published_deployment.hpp>
 #include <enchantum/enchantum.hpp>
 #include "tt_cluster.hpp"
 
@@ -183,6 +185,17 @@ struct TensorBindingSequenceHandle {
     std::vector<std::string> members;
 };
 
+struct NativeElfImages {
+    std::vector<experimental::KernelElfImage> images;
+};
+struct PublishedDispatchImages {
+    std::shared_ptr<const experimental::PublishedDeployment> deployment;
+    uint32_t node;
+    std::vector<HalProcessorIdentifier> processors;
+    std::string label;
+};
+using KernelInput = std::variant<KernelSource, NativeElfImages, PublishedDispatchImages>;
+
 class Kernel : public JitBuildSettings {
 public:
     using Config = std::variant<
@@ -191,13 +204,19 @@ public:
         ComputeConfig,
         DramConfig,
         experimental::quasar::QuasarDataMovementConfig,
-        experimental::quasar::QuasarComputeConfig>;
+        experimental::quasar::QuasarComputeConfig,
+        experimental::NativeDataMovementConfig, experimental::NativeComputeConfig>;
 
     ~Kernel() override = default;
 
     std::string name() const;
 
-    const KernelSource& kernel_source() const { return kernel_src_; }
+    const KernelSource& kernel_source() const { return std::get<KernelSource>(input_); }
+    bool is_external_binary() const { return !std::holds_alternative<KernelSource>(input_); }
+    bool is_published_dispatch() const { return std::holds_alternative<PublishedDispatchImages>(input_); }
+    const PublishedDispatchImages& published_dispatch_images() const { return std::get<PublishedDispatchImages>(input_); }
+    bool is_native() const { return std::holds_alternative<NativeElfImages>(input_); }
+    const NativeElfImages& native_images() const { return std::get<NativeElfImages>(input_); }
 
     const CoreRangeSet& core_range_set() const { return core_range_set_; }
 
@@ -259,7 +278,7 @@ public:
     uint64_t compute_hash() const;
 
     const std::string& get_full_kernel_name() const override;
-    std::string get_profiler_zone_src_id() const override { return this->kernel_src_.profiler_zone_src_id(); }
+    std::string get_profiler_zone_src_id() const override { return kernel_source().profiler_zone_src_id(); }
     void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
     void process_compile_time_args(std::function<void(const std::vector<uint32_t>& values)>) const override;
     void process_named_compile_time_args(
@@ -348,6 +367,7 @@ public:
 
     // Binary management (moved from KernelImpl)
     const std::vector<const ll_api::memory*>& binaries(uint64_t build_key) const;
+    const std::vector<const ll_api::memory*>& binaries(const IDevice& device) const;
     void set_binaries(uint64_t build_key, std::vector<const ll_api::memory*>&& binaries);
     bool binaries_exist_on_disk(const IDevice* device, const std::string& binary_root) const;
 
@@ -390,7 +410,7 @@ protected:
         ContextId context_id,
         HalProgrammableCoreType programmable_core_type,
         HalProcessorClassType processor_class,
-        const KernelSource& kernel_src,
+        const KernelInput& input,
         const CoreRangeSet& core_range_set,
         const std::vector<uint32_t>& compile_args,
         const std::map<std::string, std::string>& defines,
@@ -410,7 +430,7 @@ protected:
     HalProcessorClassType processor_class_;
 
     int watcher_kernel_id_{};
-    KernelSource kernel_src_;
+    KernelInput input_;
     std::string kernel_full_name_;  // Name + hash
     CoreRangeSet core_range_set_;
     std::vector<uint32_t> compile_time_args_;

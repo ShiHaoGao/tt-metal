@@ -203,6 +203,13 @@ std::shared_ptr<DevicePrintParser> DevicePrintParser::get_parser_for_elf(const s
     return new_parser;
 }
 
+std::shared_ptr<DevicePrintParser> DevicePrintParser::from_elf_bytes(std::span<const std::byte> bytes) {
+    auto elf = ttexalens::native_elf::ElfFile::from_bytes(bytes);
+    if (elf.get_pointer_size() == 8)
+        return std::make_shared<DevicePrintParserImpl<8>>("<native image>", std::move(elf));
+    return std::make_shared<DevicePrintParserImpl<4>>("<native image>", std::move(elf));
+}
+
 template <uint8_t PointerSize>
 std::string_view DevicePrintParserImpl<PointerSize>::format_message(
     uint32_t info_id, std::span<const std::byte> payload_bytes, FormatMessageBuffer& buffer) {

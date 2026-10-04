@@ -14,6 +14,7 @@
 
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/experimental/profiler.hpp>
+#include <tt-metalium/experimental/context/device_profiler_config.hpp>
 #include "profiler.hpp"
 
 namespace tt {
@@ -40,6 +41,10 @@ void LaunchIntervalBasedProfilerReadThread(const std::vector<IDevice*>& active_d
 uint32_t get_profiler_dram_bank_size_per_risc_bytes(llrt::RunTimeOptions& rtoptions);
 uint32_t get_profiler_dram_bank_size_per_risc_bytes();
 uint32_t get_profiler_dram_bank_size_for_hal_allocation(llrt::RunTimeOptions& rtoptions);
+// Canonical deployment defaults, without paths, environment or a MetalContext.
+// Pass the byte-sized enum by reference across GCC/Clang boundaries: their
+// x86-64 by-value calling conventions disagree on upper argument-register bits.
+uint32_t get_profiler_dram_bank_size_for_hal_allocation(const DeviceProfilerMode& mode);
 
 struct ProfilerStateManager {
 public:

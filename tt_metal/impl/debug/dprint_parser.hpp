@@ -69,6 +69,7 @@ public:
 
     // Factory: reads EI_CLASS from the ELF header and returns the correct 32-bit or 64-bit parser.
     static std::shared_ptr<DevicePrintParser> get_parser_for_elf(const std::string& elf_path);
+    static std::shared_ptr<DevicePrintParser> from_elf_bytes(std::span<const std::byte> bytes);
 
     virtual std::string_view format_message(
         uint32_t info_id, std::span<const std::byte> payload_bytes, FormatMessageBuffer& buffer) = 0;

@@ -103,6 +103,12 @@ constexpr int WALL_CLOCK_LOW_INDEX = 0;
 volatile tt_l1_ptr uint32_t* profiler_control_buffer =
     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(GET_MAILBOX_ADDRESS_DEV(profiler.control_vector));
 
+// Native kernel support imports this actual firmware-owned pointer object.
+// Keep it through firmware LTO even when all firmware uses constant-fold its
+// mailbox initializer. SDK C++ kernels retain their existing header definition.
+#if !defined(KERNEL_BUILD)
+__attribute__((used))
+#endif
 volatile tt_l1_ptr profiler_msg_buffer_t* profiler_data_buffer =
     reinterpret_cast<volatile tt_l1_ptr profiler_msg_buffer_t*>(GET_MAILBOX_ADDRESS_DEV(profiler.buffer));
 

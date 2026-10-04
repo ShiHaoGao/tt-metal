@@ -1852,6 +1852,7 @@ static void collect_kernels(
             }
         }
         for (auto& [kernel_id, kernel] : kernels) {
+            TT_FATAL(!kernel->is_external_binary(), "Native RISC-V ELF cannot execute through source-based emulation");
             const auto& ksrc = kernel->kernel_source();
             std::string src_path = resolve_kernel_source_path(ksrc, inline_src_temps);
             if (ksrc.source_type_ == KernelSource::FILE_PATH) {

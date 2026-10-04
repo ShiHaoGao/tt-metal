@@ -25,6 +25,7 @@
 #include "tools/profiler/perf_counters.hpp"
 #include "hostdev/dev_msgs.h"
 #include "hostdev/worker_stream_state_contract.h"
+#include "internal/native_firmware_contract.h"
 #include "hostdev/remote_dfb_constants.h"
 #include "internal/risc_attribs.h"
 #include "internal/circular_buffer_interface.h"

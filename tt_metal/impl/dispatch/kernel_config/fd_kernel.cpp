@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "fd_kernel.hpp"
+#include "impl/experimental/published_deployment/dispatch_plan.hpp"
 
 #include <tt-metalium/experimental/fabric/control_plane.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -251,30 +252,36 @@ CoreCoord FDKernel::get_virtual_core_coord(
     return descriptor.cluster().get_virtual_coordinate_from_logical_coordinates(logical_cxy, core_type);
 }
 
+experimental::DispatchResolvedConfiguration FDKernel::resolve_dispatch_options() const {
+    experimental::DispatchResolvedConfiguration resolved{};
+    resolved.force_watcher_no_inline = force_watcher_no_inline_;
+    resolved.watcher_dispatch_disabled = descriptor_.rtoptions().watcher_dispatch_disabled();
+    resolved.reads_dispatch_cores = get_reads_dispatch_cores_ && get_reads_dispatch_cores_(device_->id());
+    resolved.galaxy_cluster = descriptor_.cluster().is_galaxy_cluster();
+    return resolved;
+}
+
+experimental::DispatchKernelConfiguration FDKernel::resolve_dispatch_configuration() const {
+    auto resolved = resolve_dispatch_options();
+    resolved.command_queue_size = device_->sysmem_manager().get_cq_size();
+    resolved.prefetch_q_entry_bits = get_dispatch_mem_map().prefetch_q_entry_size_bytes() * 8;
+    resolved.dram_backed_cq = device_->sysmem_manager().is_dram_backed();
+    if (resolved.dram_backed_cq) resolved.dram_bank = device_->sysmem_manager().get_dram_region_bank_id();
+    const auto core = GetCoreType() == CoreType::WORKER ? HalProgrammableCoreType::TENSIX
+        : GetCoreType() == CoreType::DISPATCH ? HalProgrammableCoreType::DISPATCH : HalProgrammableCoreType::IDLE_ETH;
+    return {.node_id = static_cast<uint32_t>(node_id_), .device_id = device_id_,
+        .servicing_device_id = servicing_device_id_, .cq_id = cq_id_,
+        .processor = {core, HalProcessorClassType::DM, GetCoreType() == CoreType::WORKER && !send_to_brisc_ ? 1 : 0},
+        .logical_core = {logical_core_.x, logical_core_.y}, .nocs = noc_selection_, .resolved = resolved};
+}
+
 KernelHandle FDKernel::configure_kernel_variant(
     const std::string& path,
     const std::vector<uint32_t>& compile_args,
     std::map<std::string, std::string> defines_in,
     KernelBuildOptLevel opt_level) {
-    std::map<std::string, std::string> defines = {
-        {"DISPATCH_KERNEL", "1"},
-    };
-    if (force_watcher_no_inline_) {
-        defines.insert({"WATCHER_NOINLINE", std::to_string(force_watcher_no_inline_)});
-    }
-    const auto& rt_options = descriptor_.rtoptions();
-    if (rt_options.watcher_dispatch_disabled()) {
-        defines["FORCE_WATCHER_OFF"] = "1";
-    }
-    if (!(get_reads_dispatch_cores_ && get_reads_dispatch_cores_(device_->id()))) {
-        defines["FORCE_DPRINT_OFF"] = "1";
-    }
+    auto defines = experimental::render_dispatch_common(resolve_dispatch_options());
     defines.insert(defines_in.begin(), defines_in.end());
-    if (descriptor_.cluster().is_galaxy_cluster()) {
-        // TG specific fabric routing
-        // TODO: https://github.com/tenstorrent/tt-metal/issues/24413
-        defines["GALAXY_CLUSTER"] = "1";
-    }
 
     if (GetCoreType() == CoreType::WORKER) {
         if (device_->arch() == tt::ARCH::QUASAR) {

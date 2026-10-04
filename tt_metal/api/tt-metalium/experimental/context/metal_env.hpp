@@ -6,6 +6,8 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <tt-metalium/experimental/published_deployment.hpp>
 #include <umd/device/types/arch.hpp>
 #include <tt-metalium/experimental/context/device_profiler_config.hpp>
 #include <tt-metalium/experimental/fabric/fabric_types.hpp>
@@ -14,6 +16,7 @@
 #include <tt-metalium/system_mesh.hpp>
 
 namespace tt::tt_metal {
+class WorkerStreamStateClient;
 
 // Describes the fabric topology and routing configuration for the devices in the environment.
 // These parameters determine how devices are interconnected and how data is routed between them.
@@ -48,13 +51,29 @@ public:
     const std::string& mock_cluster_desc_path() const { return *mock_cluster_desc_path_; }
     const FabricConfigDescriptor& fabric_config_descriptor() const { return fabric_config_desc_; }
     std::optional<DeviceProfilerMode> device_profiler_mode() const { return device_profiler_mode_; }
-    void set_device_profiler_mode(DeviceProfilerMode mode) { device_profiler_mode_ = mode; }
+    void set_device_profiler_mode(DeviceProfilerMode mode) {
+        if (published_deployment_ && published_deployment_->configuration().profiler_mode() != mode)
+            throw std::invalid_argument("profiler mode differs from published deployment");
+        device_profiler_mode_ = mode;
+    }
+    const std::shared_ptr<const experimental::PublishedDeployment>& published_deployment() const { return published_deployment_; }
+    // Only an admitted immutable value can select publication mode. There is
+    // no null setter that could silently restore source/JIT fallback.
+    void set_published_deployment(experimental::PublishedDeployment deployment) {
+        const auto mode = deployment.configuration().profiler_mode();
+        if (device_profiler_mode_ && *device_profiler_mode_ != mode)
+            throw std::invalid_argument("published deployment differs from selected profiler mode");
+        auto owned = std::make_shared<const experimental::PublishedDeployment>(std::move(deployment));
+        device_profiler_mode_ = mode;
+        published_deployment_ = std::move(owned);
+    }
 
 protected:
     std::optional<std::string> mock_cluster_desc_path_ = std::nullopt;
     FabricConfigDescriptor fabric_config_desc_;
     // Absence preserves the existing environment-driven SDK behavior.
     std::optional<DeviceProfilerMode> device_profiler_mode_;
+    std::shared_ptr<const experimental::PublishedDeployment> published_deployment_;
 };
 
 class MetalEnvImpl;
@@ -72,6 +91,11 @@ class MetalEnv {
 public:
     // Construct and initialize a MetalEnv using the provided descriptor.
     explicit MetalEnv(MetalEnvDescriptor descriptor = {});
+    // Acquire exclusive worker state in this environment before creating its
+    // meshes. The descriptor must select an explicit profiler mode. Existing
+    // contexts and repeated acquisition are rejected. The environment retains
+    // the client until its context is retired.
+    std::shared_ptr<const WorkerStreamStateClient> acquire_worker_stream_state_client();
     ~MetalEnv();
 
     MetalEnv(const MetalEnv&) = delete;

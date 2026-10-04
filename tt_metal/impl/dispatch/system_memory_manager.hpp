@@ -6,6 +6,7 @@
 
 // needed for private members
 #include "system_memory_cq_interface.hpp"
+#include "system_memory_queue_plan.hpp"
 #include <umd/device/io_window/io_window.hpp>     // for tt::umd::IoWindow
 #include <umd/device/types/xy_pair.hpp>           // for tt_cxy_pair
 #include <atomic>
@@ -115,7 +116,12 @@ public:
 
     uint32_t get_channel_offset() const { return channel_offset; }
 
+    const SystemMemoryQueueInputs& queue_inputs() const;
+    const SystemMemoryQueuePlan& queue_plan() const;
+
 private:
+    std::optional<SystemMemoryQueueInputs> queue_inputs_;
+    std::optional<SystemMemoryQueuePlan> queue_plan_;
     bool is_mock_device() const;
 
     void init_dispatch_core_interfaces(uint8_t num_hw_cqs, uint16_t channel);

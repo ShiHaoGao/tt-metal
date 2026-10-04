@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "prefetch.hpp"
+#include "impl/experimental/published_deployment/dispatch_plan.hpp"
 
 #include <tt_metal.hpp>
 #include "impl/buffers/semaphore.hpp"
@@ -459,109 +460,20 @@ void PrefetchKernel::CreateKernel() {
     auto downstream_s_virtual_noc_coords =
         device_->virtual_noc0_coordinate(noc_selection_.downstream_noc, downstream_s_virtual_core);
 
-    std::map<std::string, std::string> defines = {
-        {"MY_NOC_X", std::to_string(my_virtual_noc_coords.x)},
-        {"MY_NOC_Y", std::to_string(my_virtual_noc_coords.y)},
-        {"UPSTREAM_NOC_INDEX", std::to_string(noc_selection_.upstream_noc)},  // Unused, remove later
-        {"UPSTREAM_NOC_X", std::to_string(upstream_virtual_noc_coords.x)},
-        {"UPSTREAM_NOC_Y", std::to_string(upstream_virtual_noc_coords.y)},
-        {"DOWNSTREAM_NOC_X", std::to_string(downstream_virtual_noc_coords.x)},
-        {"DOWNSTREAM_NOC_Y", std::to_string(downstream_virtual_noc_coords.y)},
-        {"DOWNSTREAM_SUBORDINATE_NOC_X", std::to_string(downstream_s_virtual_noc_coords.x)},
-        {"DOWNSTREAM_SUBORDINATE_NOC_Y", std::to_string(downstream_s_virtual_noc_coords.y)},
-
-        // Direct configuration values
-        {"DOWNSTREAM_CB_BASE", std::to_string(dependent_config_.downstream_cb_base.value())},
-        {"DOWNSTREAM_CB_LOG_PAGE_SIZE", std::to_string(dependent_config_.downstream_cb_log_page_size.value())},
-        {"DOWNSTREAM_CB_PAGES", std::to_string(dependent_config_.downstream_cb_pages.value())},
-        {"MY_DOWNSTREAM_CB_SEM_ID", std::to_string(static_config_.my_downstream_cb_sem_id.value())},
-        {"DOWNSTREAM_CB_SEM_ID", std::to_string(dependent_config_.downstream_cb_sem_id.value())},
-        {"IS_CQ_DRAM_BACKED", std::to_string(device_->sysmem_manager().is_dram_backed())},
-        {"PCIE_BASE", std::to_string(static_config_.pcie_base.value())},
-        {"PCIE_SIZE", std::to_string(static_config_.pcie_size.value())},
-        {"PREFETCH_Q_BASE", std::to_string(static_config_.prefetch_q_base.value())},
-        {"PREFETCH_Q_SIZE", std::to_string(static_config_.prefetch_q_size.value())},
-        {"PREFETCH_Q_RD_PTR_ADDR", std::to_string(static_config_.prefetch_q_rd_ptr_addr.value())},
-        {"PREFETCH_Q_PCIE_RD_PTR_ADDR", std::to_string(static_config_.prefetch_q_pcie_rd_ptr_addr.value())},
-        {"CMDDAT_Q_BASE", std::to_string(static_config_.cmddat_q_base.value())},
-        {"CMDDAT_Q_SIZE", std::to_string(static_config_.cmddat_q_size.value())},
-        {"SCRATCH_DB_BASE", std::to_string(static_config_.scratch_db_base.value())},
-        {"SCRATCH_DB_SIZE", std::to_string(static_config_.scratch_db_size.value())},
-        {"DOWNSTREAM_SYNC_SEM_ID", std::to_string(static_config_.downstream_sync_sem_id.value())},
-        {"CMDDAT_Q_PAGES", std::to_string(static_config_.cmddat_q_pages.value())},
-        {"MY_UPSTREAM_CB_SEM_ID", std::to_string(static_config_.my_upstream_cb_sem_id.value())},
-        {"UPSTREAM_CB_SEM_ID", std::to_string(dependent_config_.upstream_cb_sem_id.value())},
-        {"CMDDAT_Q_LOG_PAGE_SIZE", std::to_string(static_config_.cmddat_q_log_page_size.value())},
-        {"DISPATCH_S_BUFFER_BASE", std::to_string(static_config_.dispatch_s_buffer_base.value())},
-        {"MY_DISPATCH_S_CB_SEM_ID", std::to_string(static_config_.my_dispatch_s_cb_sem_id.value())},
-        {"DOWNSTREAM_DISPATCH_S_CB_SEM_ID", std::to_string(dependent_config_.downstream_dispatch_s_cb_sem_id.value())},
-        {"DISPATCH_S_BUFFER_SIZE", std::to_string(static_config_.dispatch_s_buffer_size.value())},
-        {"DISPATCH_S_CB_LOG_PAGE_SIZE", std::to_string(static_config_.dispatch_s_cb_log_page_size.value())},
-        {"RINGBUFFER_SIZE", std::to_string(static_config_.ringbuffer_size.value())},
-        // Fabric configuration
-        {"FABRIC_HEADER_RB_BASE", std::to_string(static_config_.fabric_header_rb_base.value())},
-        {"FABRIC_HEADER_RB_ENTRIES", std::to_string(static_config_.fabric_header_rb_entries.value())},
-        {"MY_FABRIC_SYNC_STATUS_ADDR", std::to_string(static_config_.my_fabric_sync_status_addr.value())},
-        {"DISPATCH_TELEMETRY_ADDR", std::to_string(static_config_.dispatch_telemetry_addr.value())},
-        {"DISPATCH_TELEMETRY_DISABLED", std::to_string(static_config_.dispatch_telemetry_disabled.value_or(false))},
-
-        {"FABRIC_MUX_X", std::to_string(dependent_config_.fabric_mux_client_config.virtual_x.value_or(0))},
-        {"FABRIC_MUX_Y", std::to_string(dependent_config_.fabric_mux_client_config.virtual_y.value_or(0))},
-        {"FABRIC_MUX_NUM_BUFFERS_PER_CHANNEL",
-         std::to_string(dependent_config_.fabric_mux_client_config.num_buffers_per_channel.value_or(0))},
-        {"FABRIC_MUX_CHANNEL_BUFFER_SIZE_BYTES",
-         std::to_string(dependent_config_.fabric_mux_client_config.channel_buffer_size_bytes.value_or(0))},
-        {"FABRIC_MUX_CHANNEL_BASE_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.channel_base_address.value_or(0))},
-        {"FABRIC_MUX_CONNECTION_INFO_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.connection_info_address.value_or(0))},
-        {"FABRIC_MUX_CONNECTION_HANDSHAKE_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.connection_handshake_address.value_or(0))},
-        {"FABRIC_MUX_FLOW_CONTROL_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.flow_control_address.value_or(0))},
-        {"FABRIC_MUX_BUFFER_INDEX_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.buffer_index_address.value_or(0))},
-        {"FABRIC_MUX_STATUS_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.status_address.value_or(0))},
-        {"FABRIC_MUX_TERMINATION_SIGNAL_ADDRESS",
-         std::to_string(dependent_config_.fabric_mux_client_config.termination_signal_address.value_or(0))},
-        {"WORKER_CREDITS_STREAM_ID",
-         std::to_string(dependent_config_.fabric_mux_client_config.worker_credits_stream_id.value_or(0))},
-
-        {"FABRIC_WORKER_FLOW_CONTROL_SEM", std::to_string(edm_connection_attributes_.worker_flow_control_sem)},
-        {"FABRIC_WORKER_TEARDOWN_SEM", std::to_string(edm_connection_attributes_.worker_teardown_sem)},
-        {"FABRIC_WORKER_BUFFER_INDEX_SEM", std::to_string(edm_connection_attributes_.worker_buffer_index_sem)},
-
-        {"NUM_HOPS", std::to_string(dependent_config_.num_hops.value())},
-
-        {"EW_DIM", std::to_string(dependent_config_.ew_dim.value_or(0))},
-        {"TO_MESH_ID", std::to_string(dependent_config_.to_mesh_id.value_or(0))},
-        {"IS_D_VARIANT", std::to_string(static_config_.is_d_variant.value())},
-        {"IS_H_VARIANT", std::to_string(static_config_.is_h_variant.value())},
-    };
-
-    const auto& my_dispatch_constants = get_dispatch_mem_map();
-    defines["PREFETCH_Q_ENTRY_BITS"] = std::to_string(my_dispatch_constants.prefetch_q_entry_size_bytes() * 8);
-
-    if (!is_hd()) {
-        defines["FABRIC_RELAY"] = "1";
-        if (static_config_.is_2d_fabric.value_or(false)) {
-            defines["FABRIC_2D"] = "1";
-        }
-    }
-
-    if (device_->sysmem_manager().is_dram_backed()) {
-        defines["DRAM_BACKED_CQ_BANK_ID"] = std::to_string(device_->sysmem_manager().get_dram_region_bank_id());
-    }
-
-    // Runtime args offsets
-    defines["OFFSETOF_MY_DEV_ID"] = std::to_string(static_config_.offsetof_my_dev_id.value_or(0));
-    defines["OFFSETOF_TO_DEV_ID"] = std::to_string(static_config_.offsetof_to_dev_id.value_or(0));
-    defines["OFFSETOF_ROUTER_DIRECTION"] = std::to_string(static_config_.offsetof_router_direction.value_or(0));
-
-    // Compile at Os on IERISC to fit in code region.
-    auto optimization_level = (GetCoreType() == CoreType::ETH) ? KernelBuildOptLevel::Os : KernelBuildOptLevel::O2;
-    configure_kernel_variant(dispatch_kernel_file_names[PREFETCH], {}, defines, optimization_level);
+    auto configuration = resolve_dispatch_configuration();
+    configuration.kernel = experimental::PrefetchConfiguration{static_config_, dependent_config_};
+    auto& resolved = *configuration.resolved;
+    resolved.virtual_core = my_virtual_core;
+    resolved.my_noc = my_virtual_noc_coords;
+    resolved.upstream_noc = upstream_virtual_noc_coords;
+    resolved.downstream_noc = downstream_virtual_noc_coords;
+    resolved.subordinate_noc = downstream_s_virtual_noc_coords;
+    resolved.fabric_flow_control_sem = edm_connection_attributes_.worker_flow_control_sem;
+    resolved.fabric_teardown_sem = edm_connection_attributes_.worker_teardown_sem;
+    resolved.fabric_buffer_index_sem = edm_connection_attributes_.worker_buffer_index_sem;
+    auto plan = experimental::plan_dispatch_kernel(device_->arch(), configuration);
+    auto& kernel = plan.kernels.front();
+    configure_kernel_variant(std::string(experimental::dispatch_source_path(kernel.kind)), {}, kernel.defines, kernel.opt_level);
 }
 
 void PrefetchKernel::ConfigureCore() {

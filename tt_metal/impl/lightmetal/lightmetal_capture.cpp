@@ -32,8 +32,7 @@ bool LightMetalCaptureContext::is_tracing() const { return is_tracing_.load(std:
 
 void LightMetalCaptureContext::begin_capture() {
     WorkerStreamStateAdmission admission;
-    if (MetalContext::instance_exists())
-        MetalContext::instance().validate_worker_stream_state_trace();
+    MetalContext::validate_all_worker_stream_state_traces();
     TT_FATAL(!is_tracing(), "Light Metal Capture is already enabled.");
     reset();
     is_tracing_.store(true, std::memory_order_release);

@@ -31,7 +31,7 @@ public:
 
     uint32_t id() const { return id_; }
 
-    uint32_t offset() const;
+    uint32_t offset(uint32_t l1_alignment) const;
 
     CoreRangeSet core_range_set() const { return core_range_set_; }
 

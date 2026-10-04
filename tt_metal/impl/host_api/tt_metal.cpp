@@ -1,3 +1,4 @@
+#include "impl/experimental/native_kernel/native_kernel.hpp"
 // SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -103,9 +104,13 @@ DataMovementConfigStatus CheckDataMovementConfig(
         [&](const std::shared_ptr<Kernel>& kernel, bool& local_noc0_usage, bool& local_noc1_usage) {
             int noc_value;
             switch (programmable_core) {
-                case HalProgrammableCoreType::TENSIX:
-                    noc_value = enchantum::to_underlying(std::get<DataMovementConfig>(kernel->config()).noc);
+                case HalProgrammableCoreType::TENSIX: {
+                    auto config = kernel->config();
+                    if (const auto* native = std::get_if<experimental::NativeDataMovementConfig>(&config))
+                        noc_value = enchantum::to_underlying(native->noc);
+                    else noc_value = enchantum::to_underlying(std::get<DataMovementConfig>(config).noc);
                     break;
+                }
                 case HalProgrammableCoreType::ACTIVE_ETH:
                 case HalProgrammableCoreType::IDLE_ETH:
                     noc_value = enchantum::to_underlying(std::get<EthernetConfig>(kernel->config()).noc);
@@ -1490,6 +1495,34 @@ bool CloseDevice(IDevice* device) {
 }
 
 Program CreateProgram() { return Program(); }
+
+KernelHandle experimental::CreateKernelFromElf(
+    Program& program, const CoreRangeSet& cores, const NativeDataMovementConfig& config) {
+    TT_FATAL(config.image.role() == TensixKernelRole::Brisc || config.image.role() == TensixKernelRole::Ncrisc,
+             "Native DM requires BRISC or NCRISC");
+    TT_FATAL(config.noc == NOC::NOC_0 || config.noc == NOC::NOC_1, "Invalid native NoC placement");
+    TT_FATAL(config.noc_mode == NOC_MODE::DM_DEDICATED_NOC || config.noc_mode == NOC_MODE::DM_DYNAMIC_NOC,
+             "Invalid native NoC mode");
+    const auto status = CheckDataMovementConfig(HalProgrammableCoreType::TENSIX, program, cores);
+    const auto brisc = config.image.role() == TensixKernelRole::Brisc;
+    TT_FATAL(!(brisc ? status.riscv0_in_use : status.riscv1_in_use), "Native DM processor already in use");
+    TT_FATAL(!(config.noc == NOC::NOC_0 ? status.noc0_in_use : status.noc1_in_use), "Native DM NoC already in use");
+    const auto id = program.impl().get_context_id();
+    auto context = KernelBuildContext::from_runtime(id);
+    TT_FATAL(context.hal.get_arch() == tt::ARCH::BLACKHOLE, "Native ELF requires Blackhole");
+    auto kernel = std::make_shared<NativeElfKernel>(context, id, cores, config);
+    return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
+}
+
+KernelHandle experimental::CreateKernelFromElf(
+    Program& program, const CoreRangeSet& cores, const NativeComputeConfig& config) {
+    experimental::native_detail::NativeImageAccess::validate_compute(config);
+    const auto id = program.impl().get_context_id();
+    auto context = KernelBuildContext::from_runtime(id);
+    TT_FATAL(context.hal.get_arch() == tt::ARCH::BLACKHOLE, "Native ELF requires Blackhole");
+    auto kernel = std::make_shared<NativeElfKernel>(context, id, cores, config);
+    return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
+}
 
 KernelHandle CreateDataMovementKernel(
     Program& program,

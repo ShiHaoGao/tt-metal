@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <string>
@@ -22,6 +23,7 @@
 #include "jit_build/jit_device_config.hpp"
 #include "llrt/hal.hpp"
 #include "llrt/rtoptions.hpp"
+#include "llrt/tt_elffile.hpp"
 
 namespace tt::tt_metal {
 
@@ -345,9 +347,52 @@ void BuildEnvManager::build_firmware(ChipId device_id, bool ignore_precompiled) 
             tt::LogBuildKernels,
             "Using pre-compiled firmware from: {}",
             build_env.build_env.get_firmware_binary_root());
+        retain_native_firmware(device_id);
         return;
     }
     jit_build_once(build_env.build_key(), [&build_env] { jit_build_subset(build_env.firmware_build_states, nullptr); });
+    retain_native_firmware(device_id);
+}
+
+void BuildEnvManager::retain_native_firmware(ChipId device_id) {
+    const auto& selected = get_device_build_env(device_id);
+    if (selected.build_env.get_arch() != tt::ARCH::BLACKHOLE) return;
+    {
+        const std::lock_guard<std::mutex> guard(lock);
+        if (selected.native_firmware) return;
+    }
+    const auto core = HalProgrammableCoreType::TENSIX;
+    // Blackhole TENSIX is the first programmable core in the SDK mapping.
+    const auto core_index = static_cast<uint32_t>(core);
+    std::array<std::vector<std::byte>, TT_NATIVE_ROLE_COUNT> bytes;
+    std::array<std::span<const std::byte>, TT_NATIVE_ROLE_COUNT> spans;
+    unsigned records = 0;
+    for (uint32_t role = 0; role != TT_NATIVE_ROLE_COUNT; ++role) {
+        const auto path = get_firmware_binary_path(device_id, core_index,
+            static_cast<uint32_t>(role < 2 ? HalProcessorClassType::DM : HalProcessorClassType::COMPUTE),
+            role < 2 ? role : role - 2);
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        TT_FATAL(file.good(), "Cannot snapshot firmware {}", path);
+        const auto size = file.tellg();
+        TT_FATAL(size > 0, "Empty firmware {}", path);
+        bytes[role].resize(static_cast<size_t>(size));
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(bytes[role].data()), size);
+        TT_FATAL(file.good(), "Incomplete firmware read {}", path);
+        spans[role] = bytes[role];
+        ll_api::ElfFile elf;
+        elf.ReadImage(spans[role], path);
+        records += !elf.GetMetadataSection(TT_NATIVE_IMAGE_SECTION).empty();
+    }
+    // Independent legacy SDK bundles remain usable, but cannot admit native
+    // images or mint a native firmware receipt.
+    if (!records) return;
+    TT_FATAL(records == TT_NATIVE_ROLE_COUNT, "Incomplete native firmware role bundle");
+    auto bundle = experimental::FirmwareBundle::from_images(spans);
+    const std::lock_guard<std::mutex> guard(lock);
+    auto& target = device_id_to_build_env_.at(device_id).native_firmware;
+    if (target) TT_FATAL(target->matches(bundle), "Firmware changed while capturing native bundle");
+    else target = std::move(bundle);
 }
 
 std::string BuildEnvManager::get_firmware_binary_path(

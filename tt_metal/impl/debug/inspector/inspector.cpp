@@ -203,6 +203,28 @@ void Inspector::program_kernel_compile_finished(
     }
 }
 
+void Inspector::program_kernel_native_prepared(
+    const detail::ProgramImpl* program, const std::shared_ptr<Kernel>& kernel) noexcept {
+    if (!is_enabled()) return;
+    auto* data = get_inspector_data();
+    if (!data) return;
+    try {
+        std::lock_guard<std::mutex> lock(data->programs_mutex);
+        auto& program_data = data->programs_data[program->get_id()];
+        auto& kernel_data = program_data.kernels[kernel->get_watcher_kernel_id()];
+        kernel_data.kernel = kernel;
+        kernel_data.watcher_kernel_id = kernel->get_watcher_kernel_id();
+        kernel_data.name = kernel->name();
+        kernel_data.source.clear();
+        kernel_data.path.clear();
+        kernel_data.processor_elf_paths.clear();
+        data->kernel_id_to_program_id[kernel->get_watcher_kernel_id()] = program->get_id();
+        data->logger.log_program_kernel_compile_finished(program_data, kernel_data);
+    } catch (const std::exception& e) {
+        TT_INSPECTOR_LOG("Failed to record native ELF preparation: {}", e.what());
+    }
+}
+
 void Inspector::program_compile_finished(
     const detail::ProgramImpl* program, const IDevice* /*device*/, uint64_t /*build_key*/) noexcept {
     if (!is_enabled()) {
@@ -711,6 +733,24 @@ void Inspector::enable_kernel_path_collection() {
     } catch (const std::exception& e) {
         TT_INSPECTOR_LOG("Failed to enable kernel path collection: {}", e.what());
     }
+}
+
+std::optional<experimental::KernelElfImage> Inspector::get_kernel_elf_image(int watcher_id, uint32_t role) {
+    if (!is_enabled()) return {};
+    auto* data = get_inspector_data();
+    if (!data) return {};
+    std::lock_guard<std::mutex> lock(data->programs_mutex);
+    auto program = data->kernel_id_to_program_id.find(watcher_id);
+    if (program == data->kernel_id_to_program_id.end()) return {};
+    auto found = data->programs_data.find(program->second);
+    if (found == data->programs_data.end()) return {};
+    auto stored = found->second.kernels.find(watcher_id);
+    if (stored == found->second.kernels.end()) return {};
+    auto kernel = stored->second.kernel.lock();
+    if (!kernel || !kernel->is_native()) return {};
+    for (const auto& image : kernel->native_images().images)
+        if (static_cast<uint32_t>(image.role()) == role) return image;
+    return {};
 }
 
 std::string Inspector::get_kernel_elf_path(int watcher_kernel_id, uint32_t processor_index) {

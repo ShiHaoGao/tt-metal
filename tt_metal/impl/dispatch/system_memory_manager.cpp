@@ -5,6 +5,7 @@
 #include <tt_stl/fmt.hpp>
 #include "impl/context/metal_context.hpp"
 #include "system_memory_manager.hpp"
+#include "system_memory_queue_plan.hpp"
 #include <tt-metalium/tt_align.hpp>
 #include <algorithm>
 #include <array>
@@ -146,101 +147,87 @@ SystemMemoryManager::SystemMemoryManager(ContextId context_id, ChipId device_id,
     }
 
     auto& ctx = tt::tt_metal::MetalContext::instance(context_id);
-
-    if (is_dram_backed()) {
+    const auto& mem_map = ctx.dispatch_mem_map();
+    const bool dram_backed = is_dram_backed();
+    const uint32_t alignment = ctx.hal().get_alignment(dram_backed ? HalMemType::DRAM : HalMemType::HOST);
+    SystemMemoryQueueInputs input{
+        .backing = HostQueueBacking{},
+        .num_hw_cqs = num_hw_cqs,
+        .cq_start = mem_map.get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED),
+        .alignment = alignment,
+        .minimum_issue_size = uint64_t(mem_map.max_prefetch_command_size()) *
+            (uint64_t(mem_map.prefetch_q_entries()) + 1 + PrefetchConstants::PREFETCH_MAX_OUTSTANDING_PCIE_READS)};
+    ChipId mmio_device_id = device_id;
+    uint16_t channel = 0;
+    if (dram_backed) {
+        const IDevice* device = ctx.device_manager()->get_active_device(this->device_id);
+        TT_FATAL(
+            device->is_mmio_capable() || ctx.get_cluster().get_target_device_type() == tt::TargetDevice::Simulator,
+            "Device {} is not an MMIO device", this->device_id);
+        input.backing = DramQueueBacking{
+            ctx.hal().get_dev_size(HalDramMemAddrType::DRAM_BACKED_COMMAND_QUEUES),
+            this->get_dram_region_base_addr()};
+    } else {
+        mmio_device_id = ctx.get_cluster().get_associated_mmio_device(device_id);
+        channel = ctx.get_cluster().get_assigned_channel_for_device(device_id);
+        std::optional<uint32_t> override_size;
+        if (const char* value = std::getenv("TT_METAL_CQ_SIZE_OVERRIDE"))
+            override_size = std::stoi(std::string(value));
+        input.backing = HostQueueBacking{
+            channel, ctx.get_cluster().get_host_channel_size(mmio_device_id, channel),
+            ctx.get_cluster().is_galaxy_cluster(), d2h_uses_hugepage_fallback(ctx), override_size};
+    }
+    const auto plan = plan_system_memory_queues(input);
+    queue_inputs_ = input;
+    queue_plan_ = plan;
+    this->cq_size = plan.cq_size;
+    this->channel_offset = plan.channel_offset;
+    if (dram_backed) {
         log_warning(
             tt::LogMetal,
             "DRAM-backed CQs are enabled; this feature is intended for niche use-cases such as simulator "
             "environments, may not work in all configurations, and will result in significantly slower fast dispatch "
             "performance due to DRAM read/write latency replacing direct host memory access.");
-        const uint32_t dram_backed_command_queues_size =
-            ctx.hal().get_dev_size(HalDramMemAddrType::DRAM_BACKED_COMMAND_QUEUES);
-        TT_ASSERT(dram_backed_command_queues_size > 0);
-        TT_FATAL(
-            (dram_backed_command_queues_size % num_hw_cqs) == 0,
-            "Size of DRAM region reserved for command queues {}B is not divisible by number of command queues {}",
-            dram_backed_command_queues_size,
-            num_hw_cqs);
-        this->cq_size = dram_backed_command_queues_size / num_hw_cqs;
-        TT_ASSERT((this->cq_size % ctx.hal().get_alignment(tt::tt_metal::HalMemType::DRAM)) == 0);
-        const IDevice* device = ctx.device_manager()->get_active_device(this->device_id);
-        TT_FATAL(
-            device->is_mmio_capable() || ctx.get_cluster().get_target_device_type() == tt::TargetDevice::Simulator,
-            "Device {} is not an MMIO device",
-            this->device_id);
-        // Host mirror of the DRAM-backed CQ sysmem region: the host edits this buffer and
-        // write_dram_vec/read_dram_vec sync it to each chip's DRAM (no PCIe hugepage).
-        this->dram_region_staging_buffer = std::make_unique<char[]>(dram_backed_command_queues_size);
+        this->dram_region_staging_buffer =
+            std::make_unique<char[]>(std::get<DramQueueBacking>(input.backing).region_size);
         this->cq_sysmem_start = this->dram_region_staging_buffer.get();
-        this->channel_offset = 0;
-
-        // Carve out the hugepage "auxiliary" tail (same layout as the MMIO path below).
-        // Per HW CQ we reserve two TRANSFER_PAGE_SIZE (4 KiB) pages outside the issue/completion
-        // fifo layout; they are pooled after all CQ slots in free_region_* and allocated via
-        // allocate_region() when host code needs extra device-visible sysmem (e.g. D2H socket
-        // hugepage fallback for fifo data and bytes-sent counters).
-        static constexpr uint32_t AUX_PAGES_PER_CQ_SIM = 2;
-        uint32_t per_cq_reduction_sim = AUX_PAGES_PER_CQ_SIM * DispatchSettings::TRANSFER_PAGE_SIZE;
-        this->cq_size -= per_cq_reduction_sim;
-        uint32_t total_cq_space_sim = static_cast<uint32_t>(num_hw_cqs) * this->cq_size;
-        this->free_region_start_ = this->channel_offset + total_cq_space_sim;
-        this->free_region_size_ = static_cast<uint32_t>(num_hw_cqs) * per_cq_reduction_sim;
-        this->free_region_host_ptr_ = this->cq_sysmem_start + total_cq_space_sim;
-        this->free_region_bump_ = 0;
-        this->init_dispatch_core_interfaces(num_hw_cqs, 0);
-        return;
-    }
-
-    // Real hardware initialization below
-    ChipId mmio_device_id = ctx.get_cluster().get_associated_mmio_device(device_id);
-    uint16_t channel = ctx.get_cluster().get_assigned_channel_for_device(device_id);
-    char* hugepage_start = static_cast<char*>(ctx.get_cluster().host_dma_address(0, mmio_device_id, channel));
-    hugepage_start += (channel >> 2) * DispatchSettings::MAX_DEV_CHANNEL_SIZE;
-    this->cq_sysmem_start = hugepage_start;
-
-    // TODO(abhullar): Remove env var and expose sizing at the API level
-    char* cq_size_override_env = std::getenv("TT_METAL_CQ_SIZE_OVERRIDE");
-    if (cq_size_override_env != nullptr) {
-        uint32_t cq_size_override = std::stoi(std::string(cq_size_override_env));
-        this->cq_size = cq_size_override;
     } else {
-        this->cq_size = ctx.get_cluster().get_host_channel_size(mmio_device_id, channel) / num_hw_cqs;
-        if (ctx.get_cluster().is_galaxy_cluster()) {
-            // We put 4 galaxy devices per huge page since number of hugepages available is less than number of
-            // devices.
-            this->cq_size = this->cq_size / DispatchSettings::DEVICES_PER_UMD_CHANNEL;
-        }
+        this->cq_sysmem_start =
+            static_cast<char*>(ctx.get_cluster().host_dma_address(0, mmio_device_id, channel)) + plan.host_view_offset;
     }
-    this->channel_offset = DispatchSettings::MAX_HUGEPAGE_SIZE * get_umd_channel(channel) +
-                           (channel >> 2) * DispatchSettings::MAX_DEV_CHANNEL_SIZE;
-
-    static constexpr uint32_t AUX_PAGES_PER_CQ = 2;
-    uint32_t per_cq_reduction = AUX_PAGES_PER_CQ * DispatchSettings::TRANSFER_PAGE_SIZE;
-    if (d2h_uses_hugepage_fallback(ctx)) {
-        per_cq_reduction += tt::align(
-            (DispatchSettings::HUGEPAGE_D2H_FALLBACK_RESERVE_BYTES + num_hw_cqs - 1) / num_hw_cqs,
-            DispatchSettings::TRANSFER_PAGE_SIZE);
-    }
-    TT_FATAL(
-        this->cq_size > per_cq_reduction,
-        "Command queue size {} B is too small for the {} B aux reservation",
-        this->cq_size,
-        per_cq_reduction);
-    this->cq_size -= per_cq_reduction;
-
-    uint32_t total_cq_space = static_cast<uint32_t>(num_hw_cqs) * this->cq_size;
-    this->free_region_start_ = this->channel_offset + total_cq_space;
-    this->free_region_size_ = static_cast<uint32_t>(num_hw_cqs) * per_cq_reduction;
-    this->free_region_host_ptr_ = this->cq_sysmem_start + total_cq_space;
+    // The allocator retains its existing channel-relative convention for DRAM.
+    // CQ device addresses independently retain the actual DRAM base in each layout.
+    this->free_region_start_ = this->channel_offset + plan.auxiliary_offset;
+    this->free_region_size_ = plan.auxiliary_size;
+    this->free_region_host_ptr_ = this->cq_sysmem_start + plan.auxiliary_offset;
     this->free_region_bump_ = 0;
-
+    this->cq_interfaces.reserve(plan.queues.size());
+    for (const auto& queue : plan.queues) this->cq_interfaces.emplace_back(queue);
     this->init_dispatch_core_interfaces(num_hw_cqs, channel);
+}
+
+const SystemMemoryQueueInputs& SystemMemoryManager::queue_inputs() const {
+    TT_FATAL(queue_inputs_.has_value(), "Mock SystemMemoryManager has no actual command queue input");
+    return *queue_inputs_;
+}
+
+const SystemMemoryQueuePlan& SystemMemoryManager::queue_plan() const {
+    TT_FATAL(queue_plan_.has_value(), "Mock SystemMemoryManager has no actual command queue plan");
+    TT_FATAL(cq_interfaces.size() == queue_plan_->queues.size(), "Live command queue count changed after planning");
+    for (size_t index = 0; index != cq_interfaces.size(); ++index) {
+        const auto& live = cq_interfaces[index];
+        const auto& frozen = queue_plan_->queues[index];
+        TT_FATAL(live.id == frozen.id && live.offset == frozen.device_offset &&
+                 live.cq_start == frozen.cq_start && live.issue_fifo_size == (frozen.command_issue_region_size >> 4) &&
+                 live.completion_fifo_size == (frozen.command_completion_region_size >> 4),
+                 "Live command queue layout changed after planning");
+    }
+    return *queue_plan_;
 }
 
 void SystemMemoryManager::init_dispatch_core_interfaces(uint8_t num_hw_cqs, uint16_t channel) {
     auto& ctx = tt::tt_metal::MetalContext::instance(context_id);
     const CoreType core_type = ctx.get_dispatch_core_manager().get_dispatch_core_type();
-    const uint32_t cq_start = ctx.dispatch_mem_map().get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED);
     const auto& mem_map = ctx.dispatch_mem_map();
     for (uint8_t cq_id = 0; cq_id < num_hw_cqs; cq_id++) {
         // L1 addresses differ per cq_id when this CQ's dispatch kernels share their dispatch core's L1 with another
@@ -287,21 +274,6 @@ void SystemMemoryManager::init_dispatch_core_interfaces(uint8_t num_hw_cqs, uint
             {.size = completion_q_rd_ptr + sizeof(uint32_t)}));
         this->completion_byte_addrs[cq_id] = completion_q_rd_ptr;
 
-        const uint32_t alignment =
-            is_dram_backed() ? ctx.hal().get_alignment(HalMemType::DRAM) : ctx.hal().get_alignment(HalMemType::HOST);
-        const uint32_t base = is_dram_backed() ? this->get_dram_region_base_addr() : 0;
-        this->cq_interfaces.emplace_back(channel, cq_id, this->cq_size, cq_start, alignment, base);
-        // Prefetch queue acts as the sync mechanism to ensure that issue queue has space to write, so issue queue
-        // must be as large as the max amount of space the prefetch queue can specify Plus 1 to handle wrapping plus
-        // PREFETCH_MAX_OUTSTANDING_PCIE_READS to allow us to start writing to issue queue
-        // before we reserve space in the prefetch queue
-        TT_FATAL(
-            mem_map.max_prefetch_command_size() *
-                    (mem_map.prefetch_q_entries() + 1U + PrefetchConstants::PREFETCH_MAX_OUTSTANDING_PCIE_READS) <=
-                this->get_issue_queue_size(cq_id),
-            "Issue queue for cq_id {} has size of {} which is too small",
-            cq_id,
-            this->get_issue_queue_size(cq_id));
         this->cq_to_event.push_back(0);
         this->cq_to_last_completed_event.push_back(0);
         this->prefetch_q_dev_ptrs[cq_id] = prefetch_q_base;

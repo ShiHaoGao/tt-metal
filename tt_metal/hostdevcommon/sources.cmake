@@ -1,4 +1,5 @@
 set(HOSTDEVCOMMON_JIT_API_HEADERS
+    api/hostdev/native_kernel_contract.h
     api/hostdevcommon/common_values.hpp
     api/hostdevcommon/dispatch_telemetry_types.hpp
     api/hostdevcommon/dprint_common.h

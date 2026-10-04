@@ -29,6 +29,7 @@
 #include "impl/context/metal_env_accessor.hpp"
 #include "tt_memory.h"
 #include "tt_metal/jit_build/build_env_manager.hpp"
+#include "impl/experimental/native_kernel/native_kernel.hpp"
 #include "tt_metal/jit_build/genfiles.hpp"
 #include <umd/device/types/core_coordinates.hpp>
 #include <umd/device/types/arch.hpp>
@@ -188,7 +189,7 @@ Kernel::Kernel(
     ContextId context_id,
     HalProgrammableCoreType programmable_core_type,
     HalProcessorClassType processor_class,
-    const KernelSource& kernel_src,
+    const KernelInput& input,
     const CoreRangeSet& core_range_set,
     const std::vector<uint32_t>& compile_args,
     const std::map<std::string, std::string>& defines,
@@ -203,7 +204,7 @@ Kernel::Kernel(
     context_id_(context_id),
     programmable_core_type_(programmable_core_type),
     processor_class_(processor_class),
-    kernel_src_(kernel_src),
+    input_(input),
     core_range_set_(core_range_set),
     compile_time_args_(compile_args),
     named_compile_time_args_(named_compile_args),
@@ -221,6 +222,8 @@ Kernel::Kernel(
         build_context.options.get_watcher_enabled() && !build_context.options.watcher_assert_disabled()),
     watcher_count_word_offset_(watcher_assert_enabled_ ? 1 : 0) {
     validate_user_defines(defines_);
+    TT_FATAL(!is_external_binary() || !build_context.options.get_watcher_enabled(),
+             "Native ELF support does not implement Watcher deployment");
     this->register_kernel_with_watcher(build_context.watcher);
 
     size_t max_x = 0, max_y = 0;
@@ -247,15 +250,19 @@ Kernel::Kernel(
 }
 
 void Kernel::register_kernel_with_watcher(WatcherServer* watcher) {
+    if (is_external_binary()) {
+        watcher_kernel_id_ = watcher ? watcher->register_kernel(name()) : -1;
+        return;
+    }
     if (!watcher) {
         // Offline and mock/emulated runtime construction can omit the watcher.
         this->watcher_kernel_id_ = -1;
         return;
     }
-    if (this->kernel_src_.source_type_ == KernelSource::FILE_PATH) {
-        this->watcher_kernel_id_ = watcher->register_kernel(this->kernel_src_.source_);
+    if (this->kernel_source().source_type_ == KernelSource::FILE_PATH) {
+        this->watcher_kernel_id_ = watcher->register_kernel(this->kernel_source().source_);
     } else {
-        TT_FATAL(this->kernel_src_.source_type_ == KernelSource::SOURCE_CODE, "Unsupported kernel source type!");
+        TT_FATAL(this->kernel_source().source_type_ == KernelSource::SOURCE_CODE, "Unsupported kernel source type!");
         this->watcher_kernel_id_ = watcher->register_kernel(this->name());
     }
 }
@@ -271,7 +278,11 @@ void Kernel::register_kernel_elf_paths_with_watcher(IDevice& device, const std::
     watcher->register_kernel_elf_paths(this->watcher_kernel_id_, paths);
 }
 
-std::string Kernel::name() const { return this->kernel_src_.name(); }
+std::string Kernel::name() const {
+    if (is_native()) return std::string(native_images().images.front().label());
+    if (is_published_dispatch()) return published_dispatch_images().label;
+    return kernel_source().name();
+}
 
 const std::set<CoreCoord>& Kernel::logical_cores() const { return this->logical_cores_; }
 
@@ -437,8 +448,8 @@ void Kernel::process_include_paths(const std::function<void(const std::string& p
     // For FILE_PATH kernels, add the kernel source directory to the include path.
     // This enables relative includes (e.g., #include "foo.inc") to work when the kernel
     // source is transformed and inlined (as with simplified compute kernel syntax).
-    if (kernel_src_.source_type_ == KernelSource::FILE_PATH) {
-        callback(kernel_src_.path_.parent_path().string());
+    if (kernel_source().source_type_ == KernelSource::FILE_PATH) {
+        callback(kernel_source().path_.parent_path().string());
     }
     for (const auto& path : this->resolved_compiler_include_paths_) {
         callback(path);
@@ -536,6 +547,7 @@ uint8_t ComputeKernel::expected_num_binaries() const {
 }
 
 const std::vector<const ll_api::memory*>& Kernel::binaries(uint64_t build_key) const {
+    TT_FATAL(!is_external_binary(), "External ELF binaries do not have a source build key");
     auto iter = binaries_.find(build_key);
     TT_FATAL(iter != binaries_.end(), "binary not found");
     if (iter->second.size() != expected_num_binaries()) {
@@ -546,6 +558,12 @@ const std::vector<const ll_api::memory*>& Kernel::binaries(uint64_t build_key) c
             this->name());
     }
     return iter->second;
+}
+
+const std::vector<const ll_api::memory*>& Kernel::binaries(const IDevice& device) const {
+    if (is_external_binary()) return static_cast<const ExternalBinaryKernel&>(*this).owned_binaries();
+    return binaries(BuildEnvManager::get_instance(extract_context_id(&device))
+                        .get_device_build_env(device.build_id()).build_key());
 }
 
 uint32_t DataMovementKernel::get_kernel_processor_type(int index) const {
@@ -625,6 +643,7 @@ std::string ComputeKernel::config_hash() const {
 }
 
 uint64_t Kernel::compute_hash() const {
+    if (is_external_binary()) throw std::logic_error("External ELF has no source compilation hash");
     tt::StableHasher hasher;
     for (const auto& [define, value] : this->defines_) {
         hasher.update(define);
@@ -740,7 +759,7 @@ uint64_t Kernel::compute_hash() const {
         }
     }
     ////////////////////////////////////////////////////////////
-    hasher.update(this->kernel_src_.source_);
+    hasher.update(this->kernel_source().source_);
     hasher.update(this->compile_time_args_.begin(), this->compile_time_args_.end());
     // Prefix length baked into kernel_args_generated.h (array size / accessor bounds).
     // Independent of compile_time_args_ values: same words with a different split must not collide.
@@ -962,9 +981,10 @@ detail::KernelMeta Kernel::meta(IDevice* device) const {
     static constexpr std::string_view inline_source_string = "Inline source";
     detail::KernelMeta result{
         .name = this->kernel_full_name_,
-        .source = this->kernel_src_.source_type_ == KernelSource::SourceType::SOURCE_CODE
+        .source = is_native() ? native_images().images.front().label() : is_published_dispatch() ?
+            std::string_view{published_dispatch_images().label} : this->kernel_source().source_type_ == KernelSource::SourceType::SOURCE_CODE
                       ? inline_source_string
-                      : std::string_view{this->kernel_src_.source_},
+                      : std::string_view{this->kernel_source().source_},
         .processor_class = get_kernel_processor_class(),
         .programmable_core_type = get_kernel_programmable_core_type(),
     };
@@ -991,6 +1011,7 @@ detail::KernelMeta Kernel::meta(IDevice* device) const {
 }
 
 uint32_t Kernel::get_binary_packed_size(IDevice* device, int index) const {
+    if (is_external_binary()) return static_cast<const ExternalBinaryKernel&>(*this).owned_binaries().at(index)->get_packed_size();
     // In testing situations we can query the size w/o a binary
     auto iter = binaries_.find(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_key());
@@ -998,6 +1019,7 @@ uint32_t Kernel::get_binary_packed_size(IDevice* device, int index) const {
 }
 
 uint32_t Kernel::get_binary_text_size(IDevice* device, int index) const {
+    if (is_external_binary()) return static_cast<const ExternalBinaryKernel&>(*this).owned_binaries().at(index)->get_text_size();
     // In testing situations we can query the size w/o a binary
     auto iter = binaries_.find(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_key());
@@ -1025,7 +1047,7 @@ void DataMovementKernel::generate_binaries(IDevice* device, JitBuildOptions& /*b
     jit_build_genfiles_kernel_include(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_env,
         *this,
-        this->kernel_src_);
+        this->kernel_source());
     uint32_t tensix_core_type = MetalContext::instance(this->get_context_id())
                                     .hal()
                                     .get_programmable_core_type_index(this->get_kernel_programmable_core_type());
@@ -1041,7 +1063,7 @@ void EthernetKernel::generate_binaries(IDevice* device, JitBuildOptions& /*build
     jit_build_genfiles_kernel_include(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_env,
         *this,
-        this->kernel_src_);
+        this->kernel_source());
     uint32_t erisc_core_type = MetalContext::instance(this->get_context_id())
                                    .hal()
                                    .get_programmable_core_type_index(this->get_kernel_programmable_core_type());
@@ -1057,7 +1079,7 @@ void DramKernel::generate_binaries(IDevice* device, JitBuildOptions& /*build_opt
     jit_build_genfiles_kernel_include(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_env,
         *this,
-        this->kernel_src_);
+        this->kernel_source());
     uint32_t dram_core_type = MetalContext::instance(this->get_context_id())
                                   .hal()
                                   .get_programmable_core_type_index(this->get_kernel_programmable_core_type());
@@ -1072,7 +1094,7 @@ void ComputeKernel::generate_binaries(IDevice* device, JitBuildOptions& /*build_
     jit_build_genfiles_triscs_src(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_env,
         *this,
-        this->kernel_src_);
+        this->kernel_source());
     uint32_t tensix_core_type = MetalContext::instance(this->get_context_id())
                                     .hal()
                                     .get_programmable_core_type_index(this->get_kernel_programmable_core_type());
@@ -1083,6 +1105,7 @@ void ComputeKernel::generate_binaries(IDevice* device, JitBuildOptions& /*build_
 }
 
 void Kernel::set_binaries(uint64_t build_key, std::vector<const ll_api::memory*>&& binaries) {
+    TT_FATAL(!is_external_binary(), "External ELF binaries cannot be installed under a source build key");
     // Try inserting an empty vector, as that is cheap to construct
     // and avoids an additional move.
     auto pair = binaries_.insert({build_key, {}});
@@ -1293,7 +1316,7 @@ void experimental::quasar::DispatchEngineKernel::generate_binaries(IDevice* devi
     jit_build_genfiles_kernel_include(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_env,
         *this,
-        this->kernel_src_);
+        this->kernel_source());
     const uint32_t dispatch_core_type =
         MetalContext::instance(this->get_context_id())
             .hal()
@@ -1450,7 +1473,7 @@ void QuasarDataMovementKernel::generate_binaries(IDevice* device, JitBuildOption
     jit_build_genfiles_kernel_include(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_env,
         *this,
-        this->kernel_src_);
+        this->kernel_source());
     const uint32_t tensix_core_type = MetalContext::instance(this->get_context_id())
                                           .hal()
                                           .get_programmable_core_type_index(this->get_kernel_programmable_core_type());
@@ -1589,7 +1612,7 @@ void QuasarComputeKernel::generate_binaries(IDevice* device, JitBuildOptions&) c
     jit_build_genfiles_triscs_src(
         BuildEnvManager::get_instance(extract_context_id(device)).get_device_build_env(device->build_id()).build_env,
         *this,
-        this->kernel_src_);
+        this->kernel_source());
     const uint32_t tensix_core_type = MetalContext::instance(this->get_context_id())
                                           .hal()
                                           .get_programmable_core_type_index(this->get_kernel_programmable_core_type());

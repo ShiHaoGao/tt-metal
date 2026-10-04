@@ -106,7 +106,13 @@ public:
     int ensure_context_registered(MetalEnv& env);
 
     // True once ensure_context_registered has created the env-owned context.
-    bool has_registered_context() const { return registered_context_id_.has_value(); }
+    bool has_registered_context() const;
+    std::shared_ptr<const WorkerStreamStateClient> acquire_worker_stream_state_client(MetalEnv& env);
+    struct MeshContext {
+        int context_id;
+        bool environment_owned;
+    };
+    MeshContext acquire_mesh_context(MetalEnv& env);
 
     // Destroy the env-owned context created by ensure_context_registered, if any. Must be called from
     // MetalEnv::~MetalEnv() while MetalEnv::impl_ is still valid (MetalContext::teardown() reaches back
@@ -202,6 +208,11 @@ private:
 
     std::unordered_map<CoreDescriptorCacheKey, tt::core_descriptor_t, CoreDescriptorCacheKeyHash>
         core_descriptor_cache_;
+
+    // Serialize ordinary registration and exclusive acquisition. The env
+    // retains its client until context teardown even if the caller drops it.
+    mutable std::mutex context_registration_mutex_;
+    std::shared_ptr<const WorkerStreamStateClient> worker_stream_state_client_;
 
     static std::mutex s_registry_mutex_;
     static std::set<MetalEnvImpl*> s_registry_;

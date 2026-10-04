@@ -896,9 +896,10 @@ void JitBuildState::link(const string& out_dir, const JitBuildSettings* settings
     // Append user args
     cmd += fmt::format("-{} ", settings ? settings->get_linker_opt_level() : this->default_linker_opt_level_);
 
-    // Elf file has dependencies other than object files:
+    // Compiled sources are tracked separately; the ELF also depends on:
     // 1. Linker script
     // 2. Weakened firmware elf (for kernels)
+    // 3. Extra link objects compiled offline
     std::vector<std::string> link_deps = {this->linker_script_};
     if (!this->is_fw_) {
         link_deps.push_back(this->weakened_firmware_name_);
@@ -906,6 +907,9 @@ void JitBuildState::link(const string& out_dir, const JitBuildSettings* settings
             cmd += "-Wl,--just-symbols=";
         }
         cmd += this->weakened_firmware_name_ + " ";
+    }
+    for (auto& obj : jit_build::utils::tokenize_flags(this->extra_link_objs_)) {
+        link_deps.push_back(std::move(obj));
     }
 
     // Append common args provided by the build state

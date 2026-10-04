@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <limits>
 #include <sstream>
@@ -281,6 +282,23 @@ enum class EnvVarID {
 constexpr auto TT_METAL_RUNTIME_ROOT_ENV_VAR = "TT_METAL_RUNTIME_ROOT";
 
 namespace {
+std::string installed_runtime_root() {
+#if defined(TT_METAL_RUNTIME_ROOT_FROM_LIBDIR)
+    // A private data address identifies this SDK image even when public SDK
+    // symbols are interposed or the caller lives in another executable/DSO.
+    static const char sdk_image_anchor = 0;
+    Dl_info image{};
+    if (dladdr(&sdk_image_anchor, &image) && image.dli_fname) {
+        std::error_code error;
+        const auto library = std::filesystem::weakly_canonical(image.dli_fname, error);
+        if (error) return {};
+        const auto root = (library.parent_path() / TT_METAL_RUNTIME_ROOT_FROM_LIBDIR).lexically_normal();
+        if (std::filesystem::is_directory(root / "tt_metal", error) && !error) return root.string();
+    }
+#endif
+    return {};
+}
+
 // Helper function to normalize directory paths using std::filesystem
 std::string normalize_path(const char* path, const std::string& subdir = "") {
     std::filesystem::path p(path);
@@ -334,26 +352,18 @@ RunTimeOptions::RunTimeOptions() : RunTimeOptions(std::nullopt) {}
 RunTimeOptions::RunTimeOptions(std::optional<tt_metal::DeviceProfilerMode> profiler_mode)
     : system_kernel_dir("/usr/share/tenstorrent/kernels/") {
     if (profiler_mode) {
-        switch (*profiler_mode) {
-            case tt_metal::DeviceProfilerMode::Disabled: break;
-            case tt_metal::DeviceProfilerMode::Program:
-#if !defined(TRACY_ENABLE)
-                TT_THROW("Program device profiler deployment requires a Tracy-enabled build of tt-metal.");
-#else
-                profiler_enabled = true;
-#endif
-                break;
-            default: TT_THROW("Invalid device profiler deployment mode.");
-        }
+        apply_device_profiler_mode(*profiler_mode);
     }
     // TTNN may need these process-wide options while its Python module is being initialized, before a MetalContext
     // (and therefore a RunTimeOptions instance) exists. It reads the same lazy snapshot through a native binding.
     // Touch it here as well to guarantee that it is initialized no later than RunTimeOptions construction.
     (void)get_trace_allocation_options();
 
-// Default assume package install path
+    // Prefer data installed beside this SDK image over the distribution default.
+    // Explicit environment/API roots below retain their existing precedence.
+    this->root_dir = installed_runtime_root();
 #ifdef TT_METAL_INSTALL_ROOT
-    if (std::filesystem::is_directory(std::filesystem::path(TT_METAL_INSTALL_ROOT))) {
+    if (this->root_dir.empty() && std::filesystem::is_directory(std::filesystem::path(TT_METAL_INSTALL_ROOT))) {
         this->root_dir = std::filesystem::path(TT_METAL_INSTALL_ROOT).string();
     }
     log_debug(tt::LogMetal, "initial root_dir: {}", this->root_dir);
@@ -477,8 +487,23 @@ void RunTimeOptions::validate_device_profiler_mode(tt_metal::DeviceProfilerMode 
     }
 }
 
+void RunTimeOptions::apply_device_profiler_mode(tt_metal::DeviceProfilerMode mode) {
+    switch (mode) {
+        case tt_metal::DeviceProfilerMode::Disabled: break;
+        case tt_metal::DeviceProfilerMode::Program:
+#if !defined(TRACY_ENABLE)
+            TT_THROW("Program device profiler deployment requires a Tracy-enabled build of tt-metal.");
+#else
+            profiler_enabled = true;
+#endif
+            break;
+        default: TT_THROW("Invalid device profiler deployment mode.");
+    }
+}
+
 RunTimeOptions::RunTimeOptions(ExplicitBuildOptions options)
     : system_kernel_dir("/usr/share/tenstorrent/kernels/") {
+    apply_device_profiler_mode(options.profiler_mode);
     if (options.root_dir.empty()) {
         TT_THROW("explicit offline build options require a non-empty root_dir");
     }

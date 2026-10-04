@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "topology.hpp"
+#include "impl/experimental/published_deployment/dispatch_program_adapter.hpp"
+#include "impl/experimental/published_deployment/dispatch_kernel.hpp"
+#include "jit_build/jit_device_config.hpp"
 
 #include "device/device_manager.hpp"
 #include <host_api.hpp>
@@ -607,6 +610,8 @@ void DispatchTopology::populate_fd_kernels(const std::set<ChipId>& device_ids, u
 }
 
 void DispatchTopology::populate_fd_kernels(const std::vector<DispatchKernelNode>& nodes) {
+    placed_graph_ = nodes;
+    published_program_plans_.clear();
     // If we already had nodes from a previous run, clear them (since we could have a different # of devices or CQs).
     if (!node_id_to_kernel_.empty()) {
         for (auto& kernel : node_id_to_kernel_) {
@@ -697,13 +702,38 @@ void DispatchTopology::populate_fd_kernels(const std::vector<DispatchKernelNode>
     }
 }
 
+experimental::DispatchProgramInputs DispatchTopology::capture_program_inputs(Device* device) const {
+    TT_FATAL(device != nullptr && static_cast<bool>(get_max_num_eth_cores_), "Dispatch capture requires actual device facts");
+    std::vector<tt_cxy_pair> placements;
+    placements.reserve(node_id_to_kernel_.size());
+    for (const auto* kernel : node_id_to_kernel_) placements.push_back(kernel->GetLogicalCore());
+    const auto channel = descriptor_.cluster().get_assigned_channel_for_device(device->id());
+    auto completion = dispatch_core_manager_.completion_queue_writer_core(device->id(), channel, 0);
+    return experimental::capture_dispatch_program(*device, descriptor_, placed_graph_, placements, completion,
+        get_max_num_eth_cores_(), get_reads_dispatch_cores_ && get_reads_dispatch_cores_(device->id()));
+}
+
 void DispatchTopology::populate_cq_static_args(Device* device) {
     descriptor_.metal_context().validate_worker_stream_state_access();
     TT_ASSERT(
         !node_id_to_kernel_.empty(),
         "Tried to populate static args on nodes without the nodes populated (need to run populate_fd_kernels()");
+    if (const auto& deployment = descriptor_.env_impl().get_descriptor().published_deployment()) {
+        auto plan = experimental::plan_dispatch_program(capture_program_inputs(device));
+        auto actual = experimental::DeploymentConfiguration::from_sdk(
+            create_jit_device_config(device->id(), device->num_hw_cqs(), device->get_context_id()),
+            descriptor_.rtoptions(), plan);
+        deployment->validate_configuration(actual);
+        auto program = std::make_unique<Program>(std::make_shared<detail::ProgramImpl>(device->get_context_id()));
+        for (const auto& semaphore : plan.semaphores())
+            program->impl().add_semaphore(CoreRangeSet(CoreRange(semaphore.logical)), semaphore.id,
+                semaphore.initial_value, CoreType::WORKER);
+        published_program_plans_.emplace(device->id(), std::move(plan));
+        command_queue_compile_group_->add_program(device, std::move(program));
+        return;
+    }
     // First pass, add device/program to all kernels for this device and generate static configs.
-    auto cq_program_ptr = std::make_unique<Program>();
+    auto cq_program_ptr = std::make_unique<Program>(std::make_shared<detail::ProgramImpl>(device->get_context_id()));
     for (auto* node_and_kernel : node_id_to_kernel_) {
         // GetDeviceId() uses Id from topology as IDevice* is not present yet
         if (node_and_kernel->GetDeviceId() == device->id()) {
@@ -726,13 +756,22 @@ void DispatchTopology::create_cq_program(Device* device) {
         "Tried to create and compile CQ program on device {} without static args populated (need to run "
         "populate_cq_static_args())",
         device->id());
-    // Third pass, populate dependent configs, runtime configs, and create kernels for each node
-    for (auto* node_and_kernel : node_id_to_kernel_) {
-        if (node_and_kernel->GetDeviceId() == device->id()) {
-            node_and_kernel->GenerateDependentConfigs();
-            node_and_kernel->InitializeRuntimeArgsValues();
-            node_and_kernel->CreateKernel();
-            node_and_kernel->SetRuntimeArgs();
+    if (const auto found = published_program_plans_.find(device->id()); found != published_program_plans_.end()) {
+        const auto& plan = found->second;
+        const auto& deployment = descriptor_.env_impl().get_descriptor().published_deployment();
+        TT_FATAL(deployment != nullptr, "Published dispatch owner disappeared");
+        std::lock_guard lock(command_queue_compile_group_->mutex_);
+        auto& program = *command_queue_compile_group_->program_device_map_.at(device);
+        experimental::CreateDispatchKernelsFromPublishedDeployment(program, deployment, plan);
+    } else {
+        // Third pass, populate dependent configs, runtime configs, and create kernels for each node
+        for (auto* node_and_kernel : node_id_to_kernel_) {
+            if (node_and_kernel->GetDeviceId() == device->id()) {
+                node_and_kernel->GenerateDependentConfigs();
+                node_and_kernel->InitializeRuntimeArgsValues();
+                node_and_kernel->CreateKernel();
+                node_and_kernel->SetRuntimeArgs();
+            }
         }
     }
 
@@ -810,6 +849,13 @@ std::unique_ptr<Program> DispatchTopology::get_compiled_cq_program(Device* devic
 }
 
 void DispatchTopology::configure_dispatch_cores(Device* device) {
+    if (const auto found = published_program_plans_.find(device->id()); found != published_program_plans_.end()) {
+        const auto actual = experimental::plan_dispatch_program(capture_program_inputs(device));
+        TT_FATAL(std::ranges::equal(found->second.canonical_record(), actual.canonical_record()),
+            "Actual dispatch configuration changed before initialization");
+        experimental::initialize_dispatch_program(*device, found->second);
+        return;
+    }
     // Set up completion_queue_writer core. This doesn't actually have a kernel so keep it out of the struct and config
     // it here. TODO: should this be in the struct?
     CoreType dispatch_core_type = this->dispatch_core_manager_.get_dispatch_core_type();
@@ -902,6 +948,8 @@ void DispatchTopology::reset() {
         delete kernel;
     }
     node_id_to_kernel_.clear();
+    placed_graph_.clear();
+    published_program_plans_.clear();
     command_queue_compile_group_->clear();
     dispatch_cores_.clear();
     routing_cores_.clear();

@@ -13,9 +13,11 @@
 
 #include "dispatch/kernel_config/fd_kernel.hpp"
 #include "firmware_initializer.hpp"
+#include "firmware_images.hpp"
 #include "llrt/hal/generated/dev_msgs.hpp"
 #include "llrt/worker_stream_state_provider.hpp"
 #include "llrt/tt_memory.h"
+#include "impl/experimental/native_kernel/native_image.hpp"
 #include <array>
 #include <memory>
 
@@ -47,6 +49,7 @@ public:
     void run_async_build_phase(const std::set<tt::ChipId>& device_ids);
     void run_launch_phase(const std::set<tt::ChipId>& device_ids);
     std::shared_ptr<const WorkerStreamStateProvider> worker_stream_state_provider(tt::ChipId device_id) const;
+    std::shared_ptr<const experimental::native_detail::LoadedFirmware> native_firmware(tt::ChipId device_id) const;
 
 private:
     void withdraw_worker_stream_state();
@@ -91,6 +94,8 @@ private:
         dev_msgs::go_msg_t::ConstView go_msg,
         std::optional<CoreCoord> end_core = std::nullopt);
     void initialize_and_launch_firmware(tt::ChipId device_id);
+    const ll_api::memory& firmware_image(tt::ChipId, HalProcessorIdentifier) const;
+    const experimental::FirmwareBundle* native_firmware_bundle(tt::ChipId) const;
     dev_msgs::core_info_msg_t populate_core_info_msg(
         tt::ChipId device_id, HalProgrammableCoreType programmable_core_type) const;
     uint32_t get_active_erisc_launch_flag_addr();
@@ -125,7 +130,10 @@ private:
         bool mismatch = false;
     };
     std::unordered_map<tt::ChipId, WorkerImages> worker_images_;
+    std::unordered_map<tt::ChipId, FirmwareImages> firmware_images_;
     std::unordered_map<tt::ChipId, std::shared_ptr<const WorkerStreamStateProvider>> worker_providers_;
+    std::unordered_map<tt::ChipId, uint8_t> native_loaded_roles_;
+    std::unordered_map<tt::ChipId, std::shared_ptr<const experimental::native_detail::LoadedFirmware>> native_firmware_;
     bool initialized_ = false;
 };
 

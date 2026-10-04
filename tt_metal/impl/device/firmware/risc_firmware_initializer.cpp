@@ -29,6 +29,7 @@
 #include "impl/dispatch/dispatch_engine_cores.hpp"
 #include "jit_build/build.hpp"
 #include "jit_build/build_env_manager.hpp"
+#include "jit_build/jit_device_config.hpp"
 #include "llrt/llrt.hpp"
 #include "common/executor.hpp"
 #include <experimental/fabric/control_plane.hpp>
@@ -108,10 +109,26 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
     // This phase can clear worker L1 before firmware compilation starts. No
     // earlier boot receipt may remain visible during a rebuild or its failure.
     withdraw_worker_stream_state();
+    firmware_images_.clear();
     ZoneScopedN("FW builds and Device Inits");
 
     std::vector<std::shared_future<void>> futures;
     futures.reserve(device_ids.size());
+
+    decltype(firmware_images_) admitted_images;
+    const auto& published = descriptor_->env_impl().get_descriptor().published_deployment();
+    if (published) {
+        TT_FATAL(cluster_.get_target_device_type() != tt::TargetDevice::Emule,
+                 "Published RISC-V firmware cannot boot through source-based emulation");
+        TT_FATAL(!rtoptions_.get_skip_loading_fw(), "Published firmware requires loading the admitted bytes");
+        // Validate and retain all images before any asynchronous device writes.
+        // This branch never creates a source/JIT build environment.
+        admitted_images.reserve(device_ids.size());
+        const auto context_id = descriptor_->metal_context().get_context_id();
+        for (const auto device_id : device_ids)
+            admitted_images.try_emplace(
+                device_id, *published, create_jit_device_config(device_id, num_hw_cqs_, context_id), rtoptions_);
+    }
 
     // Reserve tables per device ID (single-threaded)
     dram_bank_offset_map_.reserve(device_ids.size());
@@ -179,25 +196,17 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
                     device_id, *refs.worker_logical_col_to_virtual_col, *refs.worker_logical_row_to_virtual_row);
             }
 
-            // Register the build env unconditionally so JIT compilation (CompileProgram) works on mock
-            // and emulated devices too. The build env is HAL/arch-derived and does not probe hardware.
-            const ContextId ctx_id = descriptor_->metal_context().get_context_id();
-            BuildEnvManager::get_instance(ctx_id).add_build_env(device_id, num_hw_cqs_, ctx_id);
-            // build_firmware() is a pure compile/link step that doesn't touch hardware, and the
-            // resulting ELFs export symbols (e.g. __fw_export_text_end) that kernel linker scripts
-            // depend on -- without them, JIT-compiling kernels on a mock device fails with
-            // "non constant or forward reference address expression". So we run it for mock as
-            // well as real devices, with two exceptions:
-            //   1. Mock devices whose arch has no firmware sources packaged (currently Quasar).
-            //      cc1plus would fatal on missing source files; mock kernel JIT on Quasar is not
-            //      yet supported and would require a separate sources fix.
-            //   2. Emule devices on any arch. Emule's kernel JIT uses an x86 toolchain, so the
-            //      riscv firmware ELFs are never linked or consumed.
-            const bool skip_fw_build = cluster_.get_target_device_type() == tt::TargetDevice::Emule ||
-                                       (cluster_.get_target_device_type() == tt::TargetDevice::Mock &&
-                                        !mock_firmware_sources_available_for(cluster_.arch()));
-            if (!skip_fw_build) {
-                BuildEnvManager::get_instance(ctx_id).build_firmware(device_id);
+            if (!descriptor_->env_impl().get_descriptor().published_deployment()) {
+                // Ordinary SDK source programs retain their build environment, including mock/emulated devices.
+                const ContextId ctx_id = descriptor_->metal_context().get_context_id();
+                BuildEnvManager::get_instance(ctx_id).add_build_env(device_id, num_hw_cqs_, ctx_id);
+                // Source kernel linking also needs firmware exports on supported mock devices.
+                // Emule uses x86 kernels; Quasar mock has no packaged firmware sources.
+                const bool skip_fw_build = cluster_.get_target_device_type() == tt::TargetDevice::Emule ||
+                                           (cluster_.get_target_device_type() == tt::TargetDevice::Mock &&
+                                            !mock_firmware_sources_available_for(cluster_.arch()));
+                if (!skip_fw_build)
+                    BuildEnvManager::get_instance(ctx_id).build_firmware(device_id);
             }
             if (!cluster_.is_mock_or_emulated()) {
                 // Clear the entire launch message ring buffer on ethernet cores before application firmware is
@@ -213,6 +222,9 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
     for (auto& fut : futures) {
         fut.get();
     }
+    // Publish the entire prepared set only after admission and preparation
+    // succeed. A failed rebuild cannot leave a partially admitted launch set.
+    firmware_images_ = std::move(admitted_images);
 }
 
 void RiscFirmwareInitializer::run_launch_phase(const std::set<tt::ChipId>& device_ids) {
@@ -220,6 +232,15 @@ void RiscFirmwareInitializer::run_launch_phase(const std::set<tt::ChipId>& devic
     // device boots stay inaccessible if a later device fails; a subsequent phase
     // also cannot expose receipts left over from that incomplete attempt.
     withdraw_worker_stream_state();
+    if (descriptor_->env_impl().get_descriptor().published_deployment()) {
+        // Validate every requested device before resets or any firmware writes.
+        // Withdrawing a boot receipt must retain the admitted immutable images
+        // that this launch is about to consume.
+        for (const auto device_id : device_ids) {
+            TT_FATAL(firmware_images_.contains(device_id),
+                     "Published firmware was not admitted for device {}", device_id);
+        }
+    }
     // Launch FW on each device sequentially, since a multithreaded launch leads to initialization hangs.
     // See https://github.com/tenstorrent/tt-metal/issues/35701
     ZoneScopedN("Resets and FW Launch");
@@ -272,6 +293,7 @@ void RiscFirmwareInitializer::teardown_simulator_ethernet_cores() {
 
 void RiscFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& /*init_done*/) {
     withdraw_worker_stream_state();
+    firmware_images_.clear();
     auto all_devices = cluster_.all_chip_ids();
 
     if (!cluster_.is_mock_or_emulated()) {
@@ -309,6 +331,9 @@ bool RiscFirmwareInitializer::is_initialized() const { return initialized_; }
 
 void RiscFirmwareInitializer::withdraw_worker_stream_state() {
     initialized_ = false;
+    for (const auto& [device, firmware] : native_firmware_) firmware->withdraw();
+    native_firmware_.clear();
+    native_loaded_roles_.clear();
     worker_providers_.clear();
     worker_images_.clear();
 }
@@ -1095,6 +1120,39 @@ dev_msgs::core_info_msg_t RiscFirmwareInitializer::populate_core_info_msg(
     return buffer;
 }
 
+const experimental::FirmwareBundle* RiscFirmwareInitializer::native_firmware_bundle(tt::ChipId device_id) const {
+    if (descriptor_->env_impl().get_descriptor().published_deployment()) {
+        auto found = firmware_images_.find(device_id);
+        TT_FATAL(found != firmware_images_.end(), "Published firmware was not admitted for this device");
+        return &found->second.tensix();
+    }
+    const auto& native = BuildEnvManager::get_instance(descriptor_->metal_context().get_context_id())
+                             .get_device_build_env(device_id).native_firmware;
+    return native ? &*native : nullptr;
+}
+
+const ll_api::memory& RiscFirmwareInitializer::firmware_image(
+    tt::ChipId device_id, HalProcessorIdentifier processor) const {
+    if (descriptor_->env_impl().get_descriptor().published_deployment()) {
+        auto found = firmware_images_.find(device_id);
+        TT_FATAL(found != firmware_images_.end(), "Published firmware was not admitted for this device");
+        return found->second.image(processor);
+    }
+    if (processor.core_type == HalProgrammableCoreType::TENSIX) {
+        if (const auto* native = native_firmware_bundle(device_id)) {
+            const auto role = static_cast<experimental::TensixKernelRole>(
+                processor.processor_class == HalProcessorClassType::DM
+                    ? processor.processor_type : 2 + processor.processor_type);
+            return experimental::native_detail::NativeImageAccess::memory(*native, role);
+        }
+    }
+    const auto path = BuildEnvManager::get_instance(descriptor_->metal_context().get_context_id())
+                          .get_firmware_binary_path(
+                              device_id, hal_.get_programmable_core_type_index(processor.core_type),
+                              static_cast<uint32_t>(processor.processor_class), processor.processor_type);
+    return llrt::get_risc_binary(path);
+}
+
 void RiscFirmwareInitializer::initialize_firmware(
     tt::ChipId device_id,
     const HalProgrammableCoreType& core_type,
@@ -1103,8 +1161,6 @@ void RiscFirmwareInitializer::initialize_firmware(
     dev_msgs::go_msg_t::ConstView go_msg,
     std::optional<CoreCoord> end_core) {
     ZoneScoped;
-
-    const ContextId ctx_id = descriptor_->metal_context().get_context_id();
 
     TT_FATAL(
         core_type != HalProgrammableCoreType::TENSIX or end_core.has_value(),
@@ -1187,13 +1243,15 @@ void RiscFirmwareInitializer::initialize_firmware(
 
     switch (core_type) {
         case HalProgrammableCoreType::TENSIX: {
+            const auto* native = native_firmware_bundle(device_id);
             for (uint32_t processor_class = 0; processor_class < processor_class_count; processor_class++) {
-                auto [_, num_build_states] = BuildEnvManager::get_instance(ctx_id).get_build_index_and_state_count(
-                    core_type_idx, processor_class, true);
+                const auto num_build_states = hal_.get_processor_class_num_fw_binaries(core_type_idx, processor_class);
                 for (uint32_t riscv_id = 0; riscv_id < num_build_states; riscv_id++) {
-                    auto fw_path = BuildEnvManager::get_instance(ctx_id).get_firmware_binary_path(
-                        device_id, core_type_idx, processor_class, riscv_id);
-                    const ll_api::memory& binary_mem = llrt::get_risc_binary(fw_path);
+                    const auto role = static_cast<experimental::TensixKernelRole>(
+                        processor_class == static_cast<uint32_t>(HalProcessorClassType::DM) ? riscv_id : 2 + riscv_id);
+                    const ll_api::memory& binary_mem = firmware_image(
+                        device_id, {core_type, static_cast<HalProcessorClassType>(processor_class),
+                                    static_cast<int>(riscv_id)});
                     uint32_t fw_size = binary_mem.get_text_size();
                     hal_.set_iram_text_size(
                         launch_msg, core_type, static_cast<HalProcessorClassType>(processor_class), riscv_id, fw_size);
@@ -1208,6 +1266,7 @@ void RiscFirmwareInitializer::initialize_firmware(
                             core_type_idx,
                             processor_class,
                             riscv_id);
+                        if (native) native_loaded_roles_[device_id] |= 1u << static_cast<uint8_t>(role);
                         if (cluster_.arch() == ARCH::BLACKHOLE && riscv_id == 0 && processor_class < 2) {
                             auto& images = worker_images_[device_id];
                             auto*& slot = images.loaded[processor_class];
@@ -1269,9 +1328,9 @@ void RiscFirmwareInitializer::initialize_firmware(
                 for (uint32_t processor_class = 0; processor_class < processor_class_count; processor_class++) {
                     auto num_build_states = hal_.get_processor_types_count(core_type_idx, processor_class);
                     for (uint32_t eriscv_id = 0; eriscv_id < num_build_states; eriscv_id++) {
-                        auto fw_path = BuildEnvManager::get_instance(ctx_id).get_firmware_binary_path(
-                            device_id, core_type_idx, processor_class, eriscv_id);
-                        const ll_api::memory& binary_mem = llrt::get_risc_binary(fw_path);
+                        const ll_api::memory& binary_mem = firmware_image(
+                            device_id, {core_type, static_cast<HalProcessorClassType>(processor_class),
+                                        static_cast<int>(eriscv_id)});
                         llrt::test_load_write_read_risc_binary(
                             descriptor_->env_impl(),
                             binary_mem,
@@ -1328,9 +1387,9 @@ void RiscFirmwareInitializer::initialize_firmware(
                 for (uint32_t processor_class = 0; processor_class < processor_class_count; processor_class++) {
                     auto num_build_states = hal_.get_processor_types_count(core_type_idx, processor_class);
                     for (uint32_t drisc_id = 0; drisc_id < num_build_states; drisc_id++) {
-                        auto fw_path = BuildEnvManager::get_instance(ctx_id).get_firmware_binary_path(
-                            device_id, core_type_idx, processor_class, drisc_id);
-                        const ll_api::memory& binary_mem = llrt::get_risc_binary(fw_path);
+                        const ll_api::memory& binary_mem = firmware_image(
+                            device_id, {core_type, static_cast<HalProcessorClassType>(processor_class),
+                                        static_cast<int>(drisc_id)});
                         llrt::test_load_write_read_risc_binary(
                             descriptor_->env_impl(),
                             binary_mem,
@@ -1374,9 +1433,9 @@ void RiscFirmwareInitializer::initialize_firmware(
                 for (uint32_t processor_class = 0; processor_class < processor_class_count; processor_class++) {
                     auto num_build_states = hal_.get_processor_types_count(core_type_idx, processor_class);
                     for (uint32_t dm_id = 0; dm_id < num_build_states; dm_id++) {
-                        auto fw_path = BuildEnvManager::get_instance(ctx_id).get_firmware_binary_path(
-                            device_id, core_type_idx, processor_class, dm_id);
-                        const ll_api::memory& binary_mem = llrt::get_risc_binary(fw_path);
+                        const ll_api::memory& binary_mem = firmware_image(
+                            device_id, {core_type, static_cast<HalProcessorClassType>(processor_class),
+                                        static_cast<int>(dm_id)});
                         uint32_t fw_size = binary_mem.get_text_size();
                         hal_.set_iram_text_size(
                             launch_msg,
@@ -1642,6 +1701,19 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
                 new WorkerStreamStateProvider(kVersion));
         }
     }
+    if (native_loaded_roles_[device_id] == (1u << TT_NATIVE_ROLE_COUNT) - 1) {
+        const auto* native = native_firmware_bundle(device_id);
+        TT_FATAL(native, "Loaded native firmware snapshot disappeared");
+        native_firmware_[device_id] = std::shared_ptr<const experimental::native_detail::LoadedFirmware>(
+            new experimental::native_detail::LoadedFirmware(*native));
+    }
+}
+
+std::shared_ptr<const experimental::native_detail::LoadedFirmware>
+RiscFirmwareInitializer::native_firmware(tt::ChipId device_id) const {
+    if (!initialized_) return {};
+    auto found = native_firmware_.find(device_id);
+    return found == native_firmware_.end() ? nullptr : found->second;
 }
 
 std::shared_ptr<const WorkerStreamStateProvider>

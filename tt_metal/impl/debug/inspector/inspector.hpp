@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "tt-metalium/experimental/native_kernel.hpp"
 
 #include <memory>
 #include <optional>
@@ -49,6 +50,8 @@ public:
         const std::shared_ptr<Kernel>& kernel,
         const tt::tt_metal::JitBuildOptions& build_options,
         const std::string& binary_root) noexcept;
+    static void program_kernel_native_prepared(
+        const detail::ProgramImpl*, const std::shared_ptr<Kernel>&) noexcept;
     static void program_compile_finished(
         const detail::ProgramImpl* program, const IDevice* device, uint64_t build_key) noexcept;
 
@@ -110,6 +113,7 @@ public:
     // correctly resolves riscs that share a single binary. Returns an empty string if data is not available.
     static std::string get_kernel_elf_path(int watcher_kernel_id, uint32_t processor_index);
     static void enable_kernel_path_collection();
+    static std::optional<experimental::KernelElfImage> get_kernel_elf_image(int watcher_id, uint32_t role);
 
     static inspector::RpcServer& get_rpc_server();
 

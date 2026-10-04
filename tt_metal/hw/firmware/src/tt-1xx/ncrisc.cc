@@ -8,6 +8,7 @@
 #include "noc_overlay_parameters.h"
 #include "noc_nonblocking_api.h"
 #include "hostdev/dev_msgs.h"
+#include "internal/native_firmware_contract.h"
 #include "stream_io_map.h"
 #include "internal/firmware_common.h"
 #include "tools/profiler/kernel_profiler.hpp"

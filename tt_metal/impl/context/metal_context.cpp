@@ -396,6 +396,11 @@ MetalContext::worker_stream_state_provider(ChipId device_id) const {
     return risc_firmware_initializer_ ? risc_firmware_initializer_->worker_stream_state_provider(device_id) : nullptr;
 }
 
+std::shared_ptr<const experimental::native_detail::LoadedFirmware>
+MetalContext::native_firmware(ChipId device_id) const {
+    return risc_firmware_initializer_ ? risc_firmware_initializer_->native_firmware(device_id) : nullptr;
+}
+
 WorkerStreamStateAdmission::WorkerStreamStateAdmission()
     : lock_([]() -> std::mutex& { static std::mutex mutex; return mutex; }()) {}
 
@@ -465,6 +470,12 @@ std::shared_ptr<const WorkerStreamStateClient> MetalContext::retain_worker_strea
 void MetalContext::validate_worker_stream_state_trace() const {
     TT_FATAL(!has_exclusive_worker_stream_state(),
              "SDK trace capture and replay have no retained worker stream-state client/provider binding");
+}
+
+void MetalContext::validate_all_worker_stream_state_traces() {
+    std::lock_guard lock(g_instance_mutex);
+    for (const auto& slot : g_instances)
+        if (auto* context = slot.load(std::memory_order_acquire)) context->validate_worker_stream_state_trace();
 }
 
 bool MetalContext::instance_exists(ContextId context_id) {
@@ -580,26 +591,72 @@ ContextId MetalContext::create_default_instance_implicit_locked(
 
 ContextId MetalContext::create_instance(MetalEnv& env_to_use) {
     std::lock_guard lock(g_instance_mutex);
-    register_handlers_locked();
+    return create_instance_locked(env_to_use);
+}
 
-    // Allow only one instance connected to a silicon cluster
-    if (!MetalEnvAccessor(env_to_use).impl().get_rtoptions().get_mock_enabled()) {
-        if (g_instances[DEFAULT_CONTEXT_ID.get()].load(std::memory_order_acquire) != nullptr) {
-            TT_THROW("Only one silicon MetalContext instance may exist; context_id 0 is already in use.");
+ContextId MetalContext::create_instance_locked(
+    MetalEnv& env, std::shared_ptr<const WorkerStreamStateClient> client) {
+    // Preserve ordinary mock contexts, but never let an ordinary factory race
+    // an exclusive acquisition into a second context for the same environment.
+    for (const auto& slot : g_instances) {
+        if (auto* existing = slot.load(std::memory_order_acquire); existing && existing->env_ == &env) {
+            TT_FATAL(!client && !existing->has_exclusive_worker_stream_state(),
+                     "Worker stream-state deployment cannot reuse an uncoordinated SDK context or create a second context");
         }
-        MetalContext* instance = new MetalContext(DEFAULT_CONTEXT_ID, env_to_use);
-        g_instances[DEFAULT_CONTEXT_ID.get()].store(instance, std::memory_order_release);
-        // Seed the per-context BuildEnvManager slot with this context's HAL on first call.
-        // By-HAL form avoids re-entering MetalContext::instance() while holding g_instance_mutex.
-        BuildEnvManager::seed_if_unseeded_with_hal(DEFAULT_CONTEXT_ID, instance->hal());
-        return DEFAULT_CONTEXT_ID;
     }
+    auto& options = MetalEnvAccessor(env).impl().get_rtoptions();
+    const ContextId id = options.get_mock_enabled() ? find_free_context_id_locked() : DEFAULT_CONTEXT_ID;
+    TT_FATAL(!g_instances[id.get()].load(std::memory_order_acquire),
+             "Only one silicon MetalContext instance may exist; context_id 0 is already in use.");
+    std::shared_ptr<const WorkerStreamStateClientState> state;
+    if (client) state = std::make_shared<const WorkerStreamStateClientState>(client);
+    register_handlers_locked();
+    // The local deleter can access the private destructor. Both construction
+    // and build-environment seeding finish before any lock-free reader sees it.
+    auto deleter = [](MetalContext* context) { delete context; };
+    std::unique_ptr<MetalContext, decltype(deleter)> instance(new MetalContext(id, env), deleter);
+    BuildEnvManager::seed_if_unseeded_with_hal(id, instance->hal());
+    instance->worker_stream_state_client_state_.store(std::move(state), std::memory_order_release);
+    g_instances[id.get()].store(instance.release(), std::memory_order_release);
+    return id;
+}
 
-    ContextId context_id = find_free_context_id_locked();
-    MetalContext* instance = new MetalContext(context_id, env_to_use);
-    g_instances[context_id.get()].store(instance, std::memory_order_release);
-    BuildEnvManager::seed_if_unseeded_with_hal(context_id, instance->hal());
-    return context_id;
+MetalContext::EnvironmentWorkerClient MetalContext::create_worker_stream_state_context(MetalEnv& env) {
+    const auto mode = env.get_descriptor().device_profiler_mode();
+    TT_FATAL(mode.has_value(), "Worker stream-state environment requires an explicitly selected profiler mode");
+    auto& options = MetalEnvAccessor(env).impl().get_rtoptions();
+    options.validate_device_profiler_mode(*mode);
+    TT_FATAL(!options.get_profiler_sync_enabled() && !options.get_streaming_profiler_enabled(),
+             "Worker stream-state deployment cannot run uncoordinated profiler worker programs");
+    WorkerStreamStateAdmission admission;
+    TT_FATAL(!LightMetalCaptureContext::get().is_tracing(),
+             "Worker stream-state clients cannot enter an active LightMetal capture");
+    std::lock_guard lock(g_instance_mutex);
+    auto client = std::shared_ptr<const WorkerStreamStateClient>(new WorkerStreamStateClient);
+    const ContextId id = create_instance_locked(env, client);
+    return {id, std::move(client)};
+}
+
+void MetalContext::validate_registered_environment(
+    ContextId id, MetalEnv& env, const std::shared_ptr<const WorkerStreamStateClient>& client) {
+    check_context_id(id);
+    std::lock_guard lock(g_instance_mutex);
+    auto* context = g_instances[id.get()].load(std::memory_order_acquire);
+    TT_FATAL(context && context->env_ == &env, "Registered MetalEnv context is absent or belongs to another environment");
+    context->validate_worker_stream_state_client(client);
+}
+
+void MetalContext::destroy_registered_environment(
+    ContextId id, MetalEnvImpl& env, const std::shared_ptr<const WorkerStreamStateClient>& client) {
+    check_context_id(id);
+    // Teardown, as with destroy_instance(), requires callers to have stopped
+    // using this environment. A recycled slot must never destroy another env.
+    auto* context = g_instances[id.get()].load(std::memory_order_acquire);
+    if (!context || &MetalEnvAccessor(*context->env_).impl() != &env) return;
+    const auto state = context->worker_stream_state_client_state_.load(std::memory_order_acquire);
+    if (client ? (!state || state->client.lock() != client) : bool(state)) return;
+    WorkerStreamStateAccess access(client);
+    destroy_instance(false, id);
 }
 
 void MetalContext::destroy_instance(bool check_device_count, ContextId context_id) {

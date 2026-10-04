@@ -26,6 +26,8 @@
 #include "distributed/sd_mesh_command_queue.hpp"
 #include "../api/metal2_host_api/test_helpers.hpp"
 #include "impl/context/worker_stream_state_client.hpp"
+#include "impl/context/metal_env_accessor.hpp"
+#include "impl/context/metal_env_impl.hpp"
 
 namespace {
 std::binary_semaphore worker_client_publication_release{0};
@@ -73,6 +75,191 @@ protected:
     }
     std::shared_ptr<const WorkerStreamStateClient> client;
 };
+MetalEnvDescriptor explicit_mock_env() {
+    MetalEnvDescriptor descriptor(experimental::get_mock_cluster_desc().value());
+    descriptor.set_device_profiler_mode(DeviceProfilerMode::Disabled);
+    return descriptor;
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentOwnsNondefaultExclusiveContextAndTeardown) {
+    std::optional<ContextId> id;
+    {
+        MetalEnv env(explicit_mock_env());
+        auto token = env.acquire_worker_stream_state_client();
+        id = ContextId{MetalEnvAccessor(env).impl().ensure_context_registered(env)};
+        EXPECT_NE(*id, DEFAULT_CONTEXT_ID);
+        EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+        auto& context = MetalContext::instance(*id);
+        EXPECT_NO_THROW(context.validate_worker_stream_state_client(token));
+        EXPECT_THROW(context.validate_worker_stream_state_access(), std::runtime_error);
+        EXPECT_THROW(env.acquire_worker_stream_state_client(), std::runtime_error);
+        token.reset();
+        EXPECT_THROW(env.acquire_worker_stream_state_client(), std::runtime_error);
+    }
+    ASSERT_TRUE(id.has_value());
+    EXPECT_FALSE(MetalContext::instance_exists(*id));
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentClientsCannotCrossEnvironmentsOrDefault) {
+    client = MetalContext::acquire_worker_stream_state_client(DeviceProfilerMode::Disabled);
+    MetalEnv first(explicit_mock_env()), second(explicit_mock_env());
+    auto a = first.acquire_worker_stream_state_client();
+    auto b = second.acquire_worker_stream_state_client();
+    const auto a_id = ContextId{MetalEnvAccessor(first).impl().ensure_context_registered(first)};
+    const auto b_id = ContextId{MetalEnvAccessor(second).impl().ensure_context_registered(second)};
+    auto& a_context = MetalContext::instance(a_id);
+    auto& b_context = MetalContext::instance(b_id);
+    EXPECT_NE(a_id, b_id);
+    EXPECT_THROW(a_context.validate_worker_stream_state_client(b), std::runtime_error);
+    EXPECT_THROW(a_context.validate_worker_stream_state_client(client), std::runtime_error);
+    EXPECT_THROW(b_context.validate_worker_stream_state_client(a), std::runtime_error);
+    EXPECT_THROW(MetalContext::instance(DEFAULT_CONTEXT_ID).validate_worker_stream_state_client(a), std::runtime_error);
+    { WorkerStreamStateAccess access(a);
+      EXPECT_NO_THROW(a_context.validate_worker_stream_state_access());
+      EXPECT_THROW(b_context.validate_worker_stream_state_access(), std::runtime_error); }
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentRejectsOrdinaryContextWithoutMutation) {
+    MetalEnv env(explicit_mock_env());
+    auto& impl = MetalEnvAccessor(env).impl();
+    const auto id = ContextId{impl.ensure_context_registered(env)};
+    EXPECT_THROW(env.acquire_worker_stream_state_client(), std::runtime_error);
+    EXPECT_EQ(impl.ensure_context_registered(env), id.get());
+    EXPECT_NO_THROW(MetalContext::instance(id).validate_worker_stream_state_client({}));
+    EXPECT_NO_THROW(MetalContext::instance(id).validate_worker_stream_state_access());
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentRejectsUnregisteredOrdinaryContextWithoutMutation) {
+    MetalEnv env(explicit_mock_env());
+    const auto id = MetalContext::create_instance(env);
+    EXPECT_THROW(env.acquire_worker_stream_state_client(), std::runtime_error);
+    EXPECT_FALSE(MetalEnvAccessor(env).impl().has_registered_context());
+    EXPECT_NO_THROW(MetalContext::instance(id).validate_worker_stream_state_client({}));
+    MetalContext::destroy_instance(false, id);
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentRequiresSelectedProfileBeforeRegistration) {
+    MetalEnv env(MetalEnvDescriptor{experimental::get_mock_cluster_desc().value()});
+    auto& impl = MetalEnvAccessor(env).impl();
+    EXPECT_THROW(env.acquire_worker_stream_state_client(), std::runtime_error);
+    EXPECT_FALSE(impl.has_registered_context());
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentRejectsProfileConflictBeforeRegistration) {
+    auto descriptor = explicit_mock_env();
+    descriptor.set_device_profiler_mode(DeviceProfilerMode::Program);
+    MetalEnv env(std::move(descriptor));
+    auto& impl = MetalEnvAccessor(env).impl();
+    impl.get_rtoptions().set_watcher_enabled(true);
+    expectWorkerClientRejection([&] { env.acquire_worker_stream_state_client(); }, "conflicts with DPRINT or Watcher");
+    EXPECT_FALSE(impl.has_registered_context());
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+    impl.get_rtoptions().set_watcher_enabled(false);
+    EXPECT_NO_THROW(env.acquire_worker_stream_state_client());
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentMeshRetainsExactContextAndClient) {
+    MetalEnv env(explicit_mock_env());
+    auto token = env.acquire_worker_stream_state_client();
+    const auto id = ContextId{MetalEnvAccessor(env).impl().ensure_context_registered(env)};
+    std::shared_ptr<distributed::MeshDevice> mesh;
+    {
+        WorkerStreamStateAccess access(token);
+        mesh = env.create_unit_mesh_device(0);
+    }
+    EXPECT_EQ(mesh->impl().get_context_id(), id);
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+    token.reset();
+    EXPECT_THROW(env.acquire_worker_stream_state_client(), std::runtime_error);
+    EXPECT_NO_THROW(mesh.reset());
+    EXPECT_TRUE(MetalContext::instance_exists(id));
+    EXPECT_TRUE(MetalContext::instance(id).device_manager()->get_all_active_devices().empty());
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentRejectsSecondOrdinaryFactory) {
+    MetalEnv env(explicit_mock_env());
+    auto token = env.acquire_worker_stream_state_client();
+    const auto id = ContextId{MetalEnvAccessor(env).impl().ensure_context_registered(env)};
+    EXPECT_THROW(MetalContext::create_instance(env), std::runtime_error);
+    EXPECT_NO_THROW(MetalContext::instance(id).validate_worker_stream_state_client(token));
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentDoesNotDestroyRecycledForeignSlot) {
+    MetalEnv foreign(explicit_mock_env());
+    std::optional<ContextId> id;
+    {
+        MetalEnv env(explicit_mock_env());
+        auto token = env.acquire_worker_stream_state_client();
+        id = ContextId{MetalEnvAccessor(env).impl().ensure_context_registered(env)};
+        { WorkerStreamStateAccess access(token); MetalContext::destroy_instance(false, *id); }
+        EXPECT_THROW(MetalEnvAccessor(env).impl().ensure_context_registered(env), std::runtime_error);
+        const auto foreign_id = MetalContext::create_instance(foreign);
+        ASSERT_EQ(*id, foreign_id);
+        EXPECT_THROW(MetalEnvAccessor(env).impl().ensure_context_registered(env), std::runtime_error);
+    }
+    ASSERT_TRUE(MetalContext::instance_exists(*id));
+    EXPECT_EQ(&MetalContext::instance(*id).get_env(), &foreign);
+    MetalContext::destroy_instance(false, *id);
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentDoesNotDestroyRecycledOrdinaryGeneration) {
+    MetalEnv env(explicit_mock_env());
+    auto& impl = MetalEnvAccessor(env).impl();
+    auto token = env.acquire_worker_stream_state_client();
+    const auto id = ContextId{impl.ensure_context_registered(env)};
+    { WorkerStreamStateAccess access(token); MetalContext::destroy_instance(false, id); }
+    const auto replacement = MetalContext::create_instance(env);
+    ASSERT_EQ(id, replacement);
+    EXPECT_THROW(impl.ensure_context_registered(env), std::runtime_error);
+    EXPECT_NO_THROW(impl.teardown_registered_context());
+    EXPECT_TRUE(MetalContext::instance_exists(replacement));
+    EXPECT_NO_THROW(MetalContext::instance(replacement).validate_worker_stream_state_client({}));
+    MetalContext::destroy_instance(false, replacement);
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentConcurrentAcquisitionHasOneOwner) {
+    MetalEnv env(explicit_mock_env());
+    std::atomic<int> accepted{0}, rejected{0};
+    std::counting_semaphore<2> start{0};
+    auto acquire = [&] {
+        start.acquire();
+        try { (void)env.acquire_worker_stream_state_client(); ++accepted; }
+        catch (const std::runtime_error&) { ++rejected; }
+    };
+    std::thread first(acquire), second(acquire);
+    start.release();
+    start.release();
+    first.join(); second.join();
+    EXPECT_EQ(accepted, 1);
+    EXPECT_EQ(rejected, 1);
+    EXPECT_TRUE(MetalEnvAccessor(env).impl().has_registered_context());
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentConcurrentRegistrationNeverConvertsOrdinaryContext) {
+    MetalEnv env(explicit_mock_env());
+    auto& impl = MetalEnvAccessor(env).impl();
+    std::counting_semaphore<2> start{0};
+    std::shared_ptr<const WorkerStreamStateClient> token;
+    int registered = -1;
+    std::thread ordinary([&] { start.acquire(); registered = impl.ensure_context_registered(env); });
+    std::thread exclusive([&] {
+        start.acquire();
+        try { token = env.acquire_worker_stream_state_client(); }
+        catch (const std::runtime_error&) {}
+    });
+    start.release(); start.release();
+    ordinary.join(); exclusive.join();
+    EXPECT_EQ(registered, impl.ensure_context_registered(env));
+    auto& context = MetalContext::instance(ContextId{registered});
+    EXPECT_NO_THROW(context.validate_worker_stream_state_client(token));
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+}
+TEST_F(WorkerClientTest, ExplicitEnvironmentAndLightMetalCaptureExcludeEachOther) {
+#if defined(TT_ENABLE_LIGHT_METAL_TRACE) && (TT_ENABLE_LIGHT_METAL_TRACE == 1)
+    MetalEnv env(explicit_mock_env());
+    experimental::lightmetal::LightMetalBeginCapture();
+    EXPECT_THROW(env.acquire_worker_stream_state_client(), std::runtime_error);
+    EXPECT_FALSE(MetalEnvAccessor(env).impl().has_registered_context());
+    (void)experimental::lightmetal::LightMetalEndCapture();
+    auto token = env.acquire_worker_stream_state_client();
+    EXPECT_THROW(experimental::lightmetal::LightMetalBeginCapture(), std::runtime_error);
+    EXPECT_FALSE(LightMetalCaptureContext::get().is_tracing());
+    EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+#else
+    GTEST_SKIP() << "LightMetal capture is not built";
+#endif
+}
 TEST_F(WorkerClientTest, ExistingForeignContextIsRejectedWithoutMutation) {
     auto& context = MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Disabled);
     EXPECT_THROW(MetalContext::acquire_worker_stream_state_client(DeviceProfilerMode::Disabled), std::runtime_error);

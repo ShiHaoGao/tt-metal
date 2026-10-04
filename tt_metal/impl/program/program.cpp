@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "impl/experimental/native_kernel/native_kernel.hpp"
+
 #include <allocator.hpp>
 #include "impl/buffers/buffer_impl.hpp"
 #include <circular_buffer.hpp>
@@ -354,7 +356,6 @@ std::atomic<uint64_t> detail::ProgramImpl::program_counter = 0;
 
 detail::ProgramImpl::ProgramImpl(ContextId context_id) :
 
-    cached_device_hash_(std::nullopt),
     context_id_(context_id),
     programmable_core_count_(MetalContext::instance(context_id).hal().get_programmable_core_type_count()),
     max_cbs_(MetalContext::instance(context_id).hal().get_arch_num_circular_buffers()),
@@ -528,7 +529,7 @@ std::bitset<MAX_PROCESSOR_TYPES_COUNT> get_kernel_processor_set(const Kernel& ke
 
 KernelHandle detail::ProgramImpl::add_kernel(
     const std::shared_ptr<Kernel>& kernel, const HalProgrammableCoreType& programmable_core_type) {
-    TT_FATAL(this->compiled_.empty(), "Cannot add kernel to an already compiled program {}", this->id);
+    TT_FATAL(!prepared_, "Cannot add kernel to an already compiled program {}", this->id);
 
     // Metal 2.0 kernels (with named bindings, e.g. dfb::/tensor::/args::) are only legal on Metal 2.0 Programs
     if (kernel->is_metal2_kernel()) {
@@ -888,7 +889,8 @@ KernelGroup::KernelGroup(
             std::visit(
                 [&](auto&& arg) {
                     using T = std::decay_t<decltype(arg)>;
-                    if constexpr (std::is_same_v<T, DataMovementConfig> || std::is_same_v<T, EthernetConfig>) {
+                    if constexpr (std::is_same_v<T, DataMovementConfig> || std::is_same_v<T, EthernetConfig> ||
+                                  std::is_same_v<T, experimental::NativeDataMovementConfig>) {
                         // The code below sets the brisc_noc_id for use by the device firmware
                         // Use 0 if neither brisc nor ncrisc specify a noc
                         if (kernel->get_kernel_processor_type(0) ==
@@ -1116,7 +1118,7 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
                                         if (!kernels_str.empty()) {
                                             kernels_str += ", ";
                                         }
-                                        kernels_str += kernel->kernel_source().name();
+                                        kernels_str += kernel->name();
                                     }
 
                                     static std::mutex m;
@@ -1317,7 +1319,7 @@ CBHandle detail::ProgramImpl::add_circular_buffer_(const std::shared_ptr<Circula
 
 CBHandle detail::ProgramImpl::add_circular_buffer(
     const CoreRangeSet& core_range_set, const CircularBufferConfig& config) {
-    TT_FATAL(this->compiled_.empty(), "Cannot add circular buffer to an already compiled program {}", this->id);
+    TT_FATAL(!prepared_, "Cannot add circular buffer to an already compiled program {}", this->id);
     TT_FATAL(
         this->dataflow_buffers_.empty(), "Cannot add circular buffer to a program that already has dataflow buffers");
     // Merge ranges to reduce the number of multicasts needed to initialize CBs.
@@ -1330,7 +1332,7 @@ CBHandle detail::ProgramImpl::add_circular_buffer(
     const CoreRangeSet& core_range_set,
     const CircularBufferConfig& config,
     const experimental::GlobalCircularBuffer& global_circular_buffer) {
-    TT_FATAL(this->compiled_.empty(), "Cannot add circular buffer to an already compiled program {}", this->id);
+    TT_FATAL(!prepared_, "Cannot add circular buffer to an already compiled program {}", this->id);
     TT_FATAL(
         this->dataflow_buffers_.empty(), "Cannot add circular buffer to a program that already has dataflow buffers");
     TT_FATAL(
@@ -1350,7 +1352,7 @@ CBHandle detail::ProgramImpl::add_circular_buffer(
 uint8_t detail::ProgramImpl::add_cross_node_dfb(experimental::CrossNodeDFB gdfb) {
     TT_FATAL(worker_stream_state_owner_ == tt::worker_stream_state::Owner::SdkCircularBuffers,
              "Program-owned worker stream state cannot contain SDK CrossNodeDFBs");
-    TT_FATAL(this->compiled_.empty(), "Cannot add CrossNodeDFB to an already compiled program {}", this->id);
+    TT_FATAL(!prepared_, "Cannot add CrossNodeDFB to an already compiled program {}", this->id);
     // Check mutual exclusion: GlobalCircularBuffer and CrossNodeDFB cannot coexist in the same program.
     for (const auto& [core, remote_bits] : per_core_remote_cb_indices_) {
         TT_FATAL(
@@ -1404,7 +1406,7 @@ uint8_t detail::ProgramImpl::reserve_prefetcher_pipe_slot(
     uint32_t num_credit_lanes) {
     TT_FATAL(worker_stream_state_owner_ == tt::worker_stream_state::Owner::SdkCircularBuffers,
              "Program-owned worker stream state cannot contain SDK PrefetcherPipes");
-    TT_FATAL(this->compiled_.empty(), "Cannot add a PrefetcherPipe slot to an already compiled program {}", this->id);
+    TT_FATAL(!prepared_, "Cannot add a PrefetcherPipe slot to an already compiled program {}", this->id);
 
     for (const auto& [core, remote_bits] : per_core_remote_cb_indices_) {
         TT_FATAL(
@@ -1712,7 +1714,7 @@ std::optional<uint8_t> detail::ProgramImpl::get_prefetcher_pipe_id_for_relay(uin
 
 void detail::ProgramImpl::register_prefetcher_pipe_relay_dfb(uint8_t prefetcher_pipe_id, uint32_t relay_dfb_host_id) {
     TT_FATAL(
-        this->compiled_.empty(), "Cannot register a PrefetcherPipe relay on an already compiled program {}", this->id);
+        !prepared_, "Cannot register a PrefetcherPipe relay on an already compiled program {}", this->id);
     TT_FATAL(
         prefetcher_pipe_id < prefetcher_pipe_slots_.size(),
         "PrefetcherPipe slot {} does not exist",
@@ -1938,7 +1940,7 @@ experimental::CrossNodeDFB& detail::ProgramImpl::get_cross_node_dfb(uint8_t remo
 void detail::ProgramImpl::register_cross_node_relay_dfb(
     const CoreRangeSet& receiver_cores, uint8_t remote_dfb_id, uint32_t relay_dfb_host_id) {
     TT_FATAL(
-        this->compiled_.empty(), "Cannot register a CrossNodeDFB relay on an already compiled program {}", this->id);
+        !prepared_, "Cannot register a CrossNodeDFB relay on an already compiled program {}", this->id);
 
     const experimental::CrossNodeDFB& gdfb = get_cross_node_dfb(remote_dfb_id);
 
@@ -2596,7 +2598,7 @@ void detail::ProgramImpl::init_semaphores(
             device.id(),
             device.virtual_core_from_logical_core(logical_core, core_type),
             std::vector{semaphore.get().initial_value()},
-            addr + semaphore.get().offset());
+            addr + semaphore.get().offset(hal.get_alignment(HalMemType::L1)));
     }
 }
 
@@ -2623,7 +2625,7 @@ void detail::ProgramImpl::validate_semaphore_id(
 
 void detail::ProgramImpl::add_semaphore(
     const CoreRangeSet& crs, uint32_t semaphore_id, uint32_t init_value, CoreType core_type) {
-    TT_FATAL(this->compiled_.empty(), "Cannot add semaphore to an already compiled program {}", this->id);
+    TT_FATAL(!prepared_, "Cannot add semaphore to an already compiled program {}", this->id);
     validate_semaphore_id(crs, semaphore_id, core_type);
     semaphores_.emplace_back(Semaphore(crs, semaphore_id, init_value, core_type));
 }
@@ -2789,9 +2791,7 @@ void detail::ProgramImpl::populate_dispatch_data(IDevice* device) {
     // This is generic for workers and eth cores
     for (const auto& kernels : this->kernels_) {
         for (const auto& [kernel_id, kernel] : kernels) {
-            const auto& binaries = kernel->binaries(BuildEnvManager::get_instance(extract_context_id(device))
-                                                        .get_device_build_env(device->build_id())
-                                                        .build_key());
+            const auto& binaries = kernel->binaries(*device);
             std::vector<uint32_t> dst_base_addrs;
             std::vector<uint32_t> page_offsets;
             std::vector<uint32_t> lengths;
@@ -2952,7 +2952,7 @@ const std::vector<SubDeviceId>& detail::ProgramImpl::determine_sub_device_ids(co
     auto sub_device_manager_id = device->get_active_sub_device_manager_id();
     auto& sub_device_ids_map = this->sub_device_ids_[device->id()];
     auto sub_device_ids = sub_device_ids_map.find(sub_device_manager_id);
-    if (this->compiled_.empty() || sub_device_ids == sub_device_ids_map.end()) {
+    if (!prepared_ || sub_device_ids == sub_device_ids_map.end()) {
         if (!metal_ctx.rtoptions().get_fast_dispatch() ||
             sub_device_manager_id == device->get_default_sub_device_manager_id()) {
             // No sub device manager, nothing to validate
@@ -3012,24 +3012,43 @@ void detail::ProgramImpl::allocate_kernel_bin_buf_on_device(IDevice* device) {
     }
 }
 
+void ProgramImpl::validate_dispatch_device(IDevice& device) {
+    const auto context_id = extract_context_id(&device);
+    auto& context = MetalContext::instance(context_id);
+    DispatchDeviceIdentity identity{context_id, std::nullopt, std::nullopt, {}};
+    bool has_source = false;
+    for (const auto& kernels : kernels_) {
+        for (const auto& [id, kernel] : kernels) {
+            if (kernel->is_external_binary()) {
+                auto firmware = static_cast<ExternalBinaryKernel&>(*kernel).validate_deployments(
+                    device, get_worker_stream_state_owner());
+                TT_FATAL(identity.firmware.empty() || identity.firmware == firmware,
+                         "Program native kernels require the same firmware boot generation");
+                identity.firmware = std::move(firmware);
+            } else {
+                has_source = true;
+            }
+        }
+    }
+    if (has_source)
+        identity.source_build_key = BuildEnvManager::get_instance(context_id)
+                                        .get_device_build_env(device.build_id()).build_key();
+    if (!identity.firmware.empty() || !context.hal().is_coordinate_virtualization_enabled())
+        identity.device = device.id();
+    if (cached_device_identity_) {
+        for (const auto& [chip, firmware] : cached_device_identity_->firmware)
+            TT_FATAL(firmware->live(), "Program dispatch firmware was withdrawn on device {}", chip);
+        TT_FATAL(*cached_device_identity_ == identity,
+                 "Program dispatch device, context, source build or native firmware generation changed");
+    } else {
+        cached_device_identity_ = std::move(identity);
+    }
+}
+
 void ProgramImpl::generate_dispatch_commands(distributed::MeshDevice* mesh_device, bool use_prefetcher_cache) {
     uint64_t command_hash = *mesh_device->get_active_sub_device_manager_id();
     MetalContext& metal_ctx = MetalContext::instance(extract_context_id(mesh_device));
-
-    uint64_t device_hash = BuildEnvManager::get_instance(extract_context_id(mesh_device))
-                               .get_device_build_env(mesh_device->build_id())
-                               .build_key();
-    if (not metal_ctx.hal().is_coordinate_virtualization_enabled()) {
-        ttsl::hash::hash_combine(device_hash, mesh_device->id());
-    }
-    if (!is_cached()) {
-        set_cached(device_hash);
-    } else {
-        TT_FATAL(
-            *get_cached() == device_hash,
-            "Enqueueing a Program across devices with different cores harvested is not supported, unless coordinate "
-            "virtualization is enabled (only enabled on Wormhole and above).");
-    }
+    validate_dispatch_device(*mesh_device);
     auto& cached_program_command_sequences = this->get_cached_program_command_sequences();
     if (!cached_program_command_sequences.contains(command_hash)) {
         // Programs currently only support spanning a single sub-device
@@ -3057,20 +3076,7 @@ void ProgramImpl::generate_trace_dispatch_commands(distributed::MeshDevice* mesh
     uint64_t command_hash = *mesh_device->get_active_sub_device_manager_id();
     MetalContext& metal_ctx = MetalContext::instance(extract_context_id(mesh_device));
 
-    uint64_t device_hash = BuildEnvManager::get_instance(extract_context_id(mesh_device))
-                               .get_device_build_env(mesh_device->build_id())
-                               .build_key();
-    if (not metal_ctx.hal().is_coordinate_virtualization_enabled()) {
-        device_hash = (device_hash << 32) | (mesh_device->id());
-    }
-    if (!is_cached()) {
-        set_cached(device_hash);
-    } else {
-        TT_FATAL(
-            *get_cached() == device_hash,
-            "Enqueueing a Program across devices with different cores harvested is not supported, unless coordinate "
-            "virtualization is enabled (only enabled on Wormhole and above).");
-    }
+    validate_dispatch_device(*mesh_device);
     auto& trace_cached_program_command_sequences = get_trace_cached_program_command_sequences();
     if (!trace_cached_program_command_sequences.contains(command_hash)) {
         // Programs currently only support spanning a single sub-device
@@ -3108,7 +3114,7 @@ void detail::ProgramImpl::bind_internal_worker_stream_state_client(
     auto client = context.retain_worker_stream_state_client();
     if (!client)
         return;
-    TT_FATAL(!worker_stream_state_client_ && !worker_stream_state_internal_owner_ && compiled_.empty(),
+    TT_FATAL(!worker_stream_state_client_ && !worker_stream_state_internal_owner_ && !prepared_,
              "Internal SDK client must be bound once before compilation");
     TT_FATAL(get_worker_stream_state_owner() == tt::worker_stream_state::Owner::SdkCircularBuffers,
              "Internal SDK program must retain SDK worker ownership");
@@ -3146,6 +3152,13 @@ void detail::ProgramImpl::bind_realtime_profiler_client(MetalContext& context, C
 
 void detail::ProgramImpl::validate_worker_stream_state_client(
     const MetalContext& context, std::optional<ChipId> device_id) const {
+    for (const auto& kernels : kernels_) {
+        for (const auto& [id, kernel] : kernels) {
+            if (kernel->is_published_dispatch())
+                TT_FATAL(worker_stream_state_internal_owner_ == InternalWorkerStreamStateOwner::Dispatch,
+                         "Published dispatch kernels require internal SDK Dispatch ownership");
+        }
+    }
     if (worker_stream_state_internal_owner_) {
         auto client = worker_stream_state_internal_client_.lock();
         TT_FATAL(client, "Internal SDK program outlived its exclusive client");
@@ -3190,16 +3203,65 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
 
     const auto& cluster = MetalContext::instance(device_context_id).get_cluster();
 
-    const auto& build_env = BuildEnvManager::get_instance(device_context_id).get_device_build_env(device->build_id());
-
-    if (compiled_.contains(build_env.build_key())) {
-        Inspector::program_compile_already_exists(this, device, build_env.build_key());
-        return;
+    bool has_source_kernels = false;
+    FirmwareDeployments loaded_firmware;
+    for (const auto& kernels : kernels_) {
+        for (const auto& [id, kernel] : kernels) {
+            if (kernel->is_external_binary()) {
+                auto firmware = static_cast<ExternalBinaryKernel&>(*kernel).validate_deployments(
+                    *device, get_worker_stream_state_owner());
+                TT_FATAL(loaded_firmware.empty() || loaded_firmware == firmware,
+                         "Program external kernels require the same physical firmware boots");
+                loaded_firmware = std::move(firmware);
+                for (const auto& [chip, firmware] : loaded_firmware)
+                    validate_kernel_placement(force_slow_dispatch, kernel, chip);
+            } else {
+                has_source_kernels = true;
+            }
+        }
     }
+
     // Clear the determined sub_device_ids when we compile the program for the first time
     // This way, determine_sub_device_ids is forced to recalculate with the finalized information on the used cores
-    if (compiled_.empty()) {
+    if (!prepared_) {
         this->sub_device_ids_[device->id()].erase(device->get_active_sub_device_manager_id());
+    }
+
+    auto prepare_external = [&] {
+        if (loaded_firmware.empty()) return;
+        const auto previous = external_prepared_.find(device->id());
+        if (previous != external_prepared_.end()) {
+            TT_FATAL(previous->second == loaded_firmware, "Native Program firmware generation changed");
+            for (const auto& [chip, firmware] : previous->second)
+                TT_FATAL(firmware->live(), "Native Program firmware withdrawn on device {}", chip);
+            return;
+        }
+        for (const auto& kernels : kernels_) {
+            for (const auto& [id, kernel] : kernels) {
+                if (!kernel->is_external_binary()) continue;
+                static_cast<ExternalBinaryKernel&>(*kernel).prepare_deployments(*device, get_worker_stream_state_owner());
+                if (kernel->is_native()) Inspector::program_kernel_native_prepared(this, kernel);
+            }
+        }
+        for (const auto& [chip, firmware] : loaded_firmware)
+            TT_FATAL(firmware->live(), "Native Program firmware withdrawn during preparation on device {}", chip);
+        external_prepared_.insert_or_assign(device->id(), loaded_firmware);
+    };
+
+    if (!has_source_kernels) {
+        TT_FATAL(device->is_initialized(), "Native Program preparation requires an initialized device");
+        prepare_external();
+        if (detail::MemoryReporter::enabled())
+            detail::MemoryReporter::inst().flush_program_memory_usage(get_id(), device);
+        prepared_ = true;
+        return;
+    }
+
+    const auto& build_env = BuildEnvManager::get_instance(device_context_id).get_device_build_env(device->build_id());
+    if (compiled_.contains(build_env.build_key())) {
+        prepare_external();
+        Inspector::program_compile_already_exists(this, device, build_env.build_key());
+        return;
     }
 
     Inspector::program_compile_started(this, device, build_env.build_key());
@@ -3207,6 +3269,7 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
     // Currently JIT compile on Quasar mock devices is non functional
     if (cluster.get_target_device_type() == tt::TargetDevice::Mock && device->arch() == tt::ARCH::QUASAR) {
         compiled_.insert(build_env.build_key());
+        prepared_ = true;
         Inspector::program_compile_finished(this, device, build_env.build_key());
         return;
     }
@@ -3216,6 +3279,7 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
     // (MakeProgramFromSpec/MakeMeshWorkloadFromSpecs) reach compile() directly, so skip here too.
     if (cluster.get_target_device_type() == tt::TargetDevice::Emule) {
         compiled_.insert(build_env.build_key());
+        prepared_ = true;
         Inspector::program_compile_finished(this, device, build_env.build_key());
         return;
     }
@@ -3226,13 +3290,13 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
         "dependent on information that is set during device initialization.",
         this->get_id());
 
-    bool remote_enabled = jit_server::JitCompileRpcClient::enabled();
+    bool remote_enabled = has_source_kernels && jit_server::JitCompileRpcClient::enabled();
     std::vector<std::shared_future<void>> events;
 
     auto prep_kernel = [&](const std::shared_ptr<Kernel>& kernel) {
         JitBuildOptions build_options(build_env.build_env);
         kernel->set_build_options(build_options);
-        if (this->compiled_.empty()) {
+        if (!prepared_) {
             this->set_remote_circular_buffer_init(kernel);
         }
         this->set_cb_data_fmt_and_tile(kernel->logical_coreranges(), build_options);
@@ -3295,6 +3359,7 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
 
         for (auto& kernels : kernels_) {
             for (auto& [id, kernel] : kernels) {
+                if (kernel->is_external_binary()) continue;
                 validate_kernel_placement(force_slow_dispatch, kernel, device->build_id());
                 auto [build_options, kernel_hash] = prep_kernel(kernel);
                 // Skip the remote round-trip when the ELF is already validly cached locally.
@@ -3331,6 +3396,7 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
         // Local path: parallel build via thread pool.
         for (auto& kernels : kernels_) {
             for (auto& [id, kernel] : kernels) {
+                if (kernel->is_external_binary()) continue;
                 validate_kernel_placement(force_slow_dispatch, kernel, device->build_id());
                 launch_build_step(
                     [&, kernel] {
@@ -3346,11 +3412,13 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
         }
         sync_build_steps(events);
     }
+    prepare_external();
     if (detail::MemoryReporter::enabled()) {
         detail::MemoryReporter::inst().flush_program_memory_usage(get_id(), device);
     }
 
     compiled_.insert(build_env.build_key());
+    prepared_ = true;
 
     Inspector::program_compile_finished(this, device, build_env.build_key());
 }
@@ -3364,6 +3432,10 @@ void detail::ProgramImpl::compile_and_allocate(IDevice* device, bool force_slow_
     // program. The validation steps still have to run: they read live device state - L1 allocations
     // made since the last enqueue, and service-core claims - so a buffer that has come to overlap
     // this program's regions is only caught by re-checking them here.
+    for (const auto& kernels : kernels_)
+        for (const auto& [id, kernel] : kernels)
+            if (kernel->is_external_binary())
+                static_cast<ExternalBinaryKernel&>(*kernel).validate_deployments(*device, get_worker_stream_state_owner());
     if (not this->compile_and_allocate_needed_ and this->compile_and_allocate_device_ == device) {
         this->validate_circular_buffer_core_ranges(device);
         this->validate_circular_buffer_region(device);
@@ -3418,7 +3490,7 @@ void detail::ProgramImpl::set_worker_stream_state_owner(tt::worker_stream_state:
     using Owner = tt::worker_stream_state::Owner;
     TT_FATAL(!worker_stream_state_internal_owner_, "Internal SDK worker owner is frozen by its actual producer");
     TT_FATAL(owner == Owner::SdkCircularBuffers || owner == Owner::Program, "Unknown worker stream state owner");
-    TT_FATAL(!worker_stream_state_owner_frozen_ && compiled_.empty() && !finalized_,
+    TT_FATAL(!worker_stream_state_owner_frozen_ && !prepared_ && !finalized_,
              "Cannot change worker stream state owner after program projection or compilation");
     // Validate before committing the new fact. Failure preserves the old owner.
     if (owner == Owner::Program) {

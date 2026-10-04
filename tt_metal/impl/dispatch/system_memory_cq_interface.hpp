@@ -8,6 +8,16 @@
 
 namespace tt::tt_metal {
 
+struct SystemMemoryCQLayout {
+    uint8_t id;
+    uint32_t cq_start;
+    uint32_t command_issue_region_size;
+    uint32_t command_completion_region_size;
+    uint32_t device_offset;
+};
+SystemMemoryCQLayout plan_system_memory_cq(
+    uint16_t channel, uint8_t cq_id, uint32_t cq_size, uint32_t cq_start, uint32_t alignment, uint32_t base = 0);
+
 struct SystemMemoryCQInterface {
     // CQ is split into issue and completion regions
     // Host writes commands and data for H2D transfers in the issue region, device reads from the issue region
@@ -16,6 +26,7 @@ struct SystemMemoryCQInterface {
     // Space available would just be issue_fifo_limit - issue_fifo_size
     SystemMemoryCQInterface(
         uint16_t channel, uint8_t cq_id, uint32_t cq_size, uint32_t cq_start, uint32_t alignment, uint32_t base = 0);
+    explicit SystemMemoryCQInterface(const SystemMemoryCQLayout&);
 
     // Percentage of the command queue that is dedicated for issuing commands. Issue queue size is rounded to be 32B
     // aligned and remaining space is dedicated for completion queue Smaller issue queues can lead to more stalls for

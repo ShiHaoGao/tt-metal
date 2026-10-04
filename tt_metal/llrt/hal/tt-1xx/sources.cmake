@@ -6,6 +6,7 @@ set(WH_HAL_SOURCES
 )
 
 set(BH_HAL_SOURCES
+    blackhole/bh_image_regions.cpp
     blackhole/bh_hal.cpp
     blackhole/bh_hal_tensix.cpp
     blackhole/bh_hal_active_eth.cpp

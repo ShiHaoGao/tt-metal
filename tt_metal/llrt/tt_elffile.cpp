@@ -95,6 +95,7 @@ public:
     virtual void XIPify() = 0;
 
     virtual std::span<std::byte> GetSectionContents(std::string_view name, uint64_t& virtual_address) const = 0;
+    virtual std::span<const std::byte> GetMetadataSection(std::string_view name) const = 0;
 
 private:
     [[nodiscard]] auto GetSegments() const -> std::vector<Segment>& { return owner_->segments_; }
@@ -140,6 +141,25 @@ public:
             }
         }
         return {};
+    }
+
+    std::span<const std::byte> GetMetadataSection(std::string_view name) const override {
+        std::span<const std::byte> result;
+        bool found = false;
+        for (const auto& shdr : GetShdrs()) {
+            if (name != GetName(shdr)) continue;
+            if (found || (shdr.sh_flags & SHF_ALLOC) || shdr.sh_type != SHT_PROGBITS)
+                TT_THROW("{}: metadata section must be unique, non-ALLOC PROGBITS", path_);
+            found = true;
+            result = GetContents(shdr);
+            for (const auto& phdr : GetPhdrs()) {
+                if (phdr.p_type != PT_LOAD) continue;
+                if (shdr.sh_offset < uint64_t(phdr.p_offset) + phdr.p_filesz &&
+                    phdr.p_offset < uint64_t(shdr.sh_offset) + shdr.sh_size)
+                    TT_THROW("{}: metadata section overlaps a loaded payload", path_);
+            }
+        }
+        return result;
     }
 
 private:
@@ -310,6 +330,10 @@ std::span<std::byte> ElfFile::GetSectionContents(std::string_view section_name, 
         return {};
     }
     return pimpl_->GetSectionContents(section_name, virtual_address);
+}
+
+std::span<const std::byte> ElfFile::GetMetadataSection(std::string_view name) const {
+    return pimpl_ ? pimpl_->GetMetadataSection(name) : std::span<const std::byte>{};
 }
 
 void ElfFile::ReleaseImpl() {
@@ -633,8 +657,10 @@ void ElfFile::Impl::Elf<Is64>::LoadImage() {
                 section.sh_size,
                 section.sh_offset);
         }
-        // If it's allocatable, make sure it's in a segment.
-        if (section.sh_flags & SHF_ALLOC && !FindSegment(section)) {
+        // Empty linker-created allocation sections do not require a load
+        // payload (the linker can omit their zero-sized PT_LOAD entirely).
+        // Every nonempty allocation still has to belong to a real segment.
+        if (section.sh_flags & SHF_ALLOC && section.sh_size != 0 && !FindSegment(section)) {
             std::string_view sec_name = GetName(section);
             if (sec_name.starts_with(".device_print")) {
                 // Special case: .device_print sections are used for
@@ -670,7 +696,26 @@ void ElfFile::Impl::Elf<Is64>::LoadImage() {
             TT_THROW("{}: malformed segment metadata", path_);
         }
         std::span info{reinterpret_cast<const uint32_t*>(bytes.data()), bytes.size() / sizeof(uint32_t)};
-        TrimSegments(info);
+        // Linker scripts describe region capacity even when a zero-sized
+        // allocation produces no PT_LOAD. Admit only an actual empty ALLOC
+        // section with no requested trim; an unknown metadata address remains
+        // an error. Do not manufacture a segment or load any payload bytes.
+        std::vector<uint32_t> allocated_info;
+        for (size_t index = 0; index < info.size(); index += 3) {
+            const auto address = info[index];
+            const bool has_segment = std::any_of(
+                GetSegments().begin(), GetSegments().end(),
+                [&](const auto& segment) { return segment.address == address; });
+            const auto sections = GetShdrs();
+            const bool empty_allocation = !has_segment && info[index + 1] == address &&
+                std::any_of(sections.begin(), sections.end(), [&](const auto& section) {
+                    return (section.sh_flags & SHF_ALLOC) && section.sh_size == 0 && section.sh_addr == address;
+                });
+            if (!empty_allocation) {
+                allocated_info.insert(allocated_info.end(), info.begin() + index, info.begin() + index + 3);
+            }
+        }
+        TrimSegments(allocated_info);
     }
 }
 

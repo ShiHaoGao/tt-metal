@@ -23,6 +23,22 @@ constexpr static uint32_t DEFAULT_PROFILER_L1_PROGRAM_MIN_OPTIONAL_MARKER_COUNT 
 
 namespace {
 
+struct ProfilerBufferAllocation {
+    uint32_t program_support_count;
+    uint32_t bytes;
+};
+
+ProfilerBufferAllocation profiler_buffer_allocation(uint32_t program_support_count, bool sum) {
+    const uint32_t optional_markers = sum ? DEFAULT_PROFILER_L1_PROGRAM_MIN_OPTIONAL_MARKER_COUNT : 0;
+    const uint32_t program_bytes = kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE *
+        (kernel_profiler::PROFILER_L1_PROGRAM_ID_COUNT + kernel_profiler::PROFILER_L1_GUARANTEED_MARKER_COUNT +
+         optional_markers) * sizeof(uint32_t);
+    if (program_support_count <= kernel_profiler::PROFILER_L1_BUFFER_SIZE / program_bytes) {
+        program_support_count = div_up(kernel_profiler::PROFILER_L1_BUFFER_SIZE, program_bytes);
+    }
+    return {program_support_count, program_bytes * program_support_count};
+}
+
 // Convert a wall-time margin into device ticks for the NOC-debug watermark.
 uint64_t noc_debug_margin_to_ticks(const std::vector<IDevice*>& devices, std::chrono::milliseconds margin) {
     uint32_t aiclk_mhz = 0;
@@ -55,19 +71,10 @@ uint32_t get_profiler_dram_bank_size_per_risc_bytes(llrt::RunTimeOptions& rtopti
         }
     }
 
-    const uint32_t profiler_l1_program_min_optional_marker_count =
-        do_profiler_sum ? DEFAULT_PROFILER_L1_PROGRAM_MIN_OPTIONAL_MARKER_COUNT : 0;
-    uint32_t dram_bank_size_per_risc_bytes_single_program =
-        kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE *
-        (kernel_profiler::PROFILER_L1_PROGRAM_ID_COUNT + kernel_profiler::PROFILER_L1_GUARANTEED_MARKER_COUNT +
-         profiler_l1_program_min_optional_marker_count) *
-        sizeof(uint32_t);
-
-    if (profiler_program_support_count <=
-        ((kernel_profiler::PROFILER_L1_BUFFER_SIZE) / dram_bank_size_per_risc_bytes_single_program)) {
+    const auto allocation = profiler_buffer_allocation(profiler_program_support_count.value(), do_profiler_sum);
+    if (profiler_program_support_count.value() != allocation.program_support_count) {
         const uint32_t old_profiler_program_support_count = profiler_program_support_count.value();
-        profiler_program_support_count =
-            div_up(kernel_profiler::PROFILER_L1_BUFFER_SIZE, dram_bank_size_per_risc_bytes_single_program);
+        profiler_program_support_count = allocation.program_support_count;
         log_warning(
             tt::LogMetal,
             "Profiler program support count must be >= {}. Increasing program support count from {} to {}.",
@@ -76,8 +83,7 @@ uint32_t get_profiler_dram_bank_size_per_risc_bytes(llrt::RunTimeOptions& rtopti
             profiler_program_support_count.value());
     }
 
-    const uint32_t dram_bank_size_per_risc_bytes =
-        dram_bank_size_per_risc_bytes_single_program * profiler_program_support_count.value();
+    const uint32_t dram_bank_size_per_risc_bytes = allocation.bytes;
 
     rtoptions.set_profiler_program_support_count(profiler_program_support_count.value());
 
@@ -91,6 +97,9 @@ uint32_t get_profiler_dram_bank_size_per_risc_bytes() {
 }
 
 uint32_t get_profiler_dram_bank_size_for_hal_allocation(llrt::RunTimeOptions& rtoptions) {
+    if (!rtoptions.get_profiler_enabled() && !rtoptions.get_streaming_profiler_enabled()) {
+        return 0;
+    }
     const uint32_t per_buffer_size = get_profiler_dram_bank_size_per_risc_bytes(rtoptions);
     const bool debug_dump_enabled = rtoptions.get_experimental_noc_debug_dump_enabled();
 
@@ -106,6 +115,19 @@ uint32_t get_profiler_dram_bank_size_for_hal_allocation(llrt::RunTimeOptions& rt
     // so it is handed the spool's per-RISC share; reserve_spool() checks the resulting slot at boot.
     constexpr uint32_t kBlackholeRiscsPerDramChannel = 5 * 20;
     return div_up(rtoptions.get_streaming_profiler_spool_mb() << 20, kBlackholeRiscsPerDramChannel);
+}
+
+uint32_t get_profiler_dram_bank_size_for_hal_allocation(const DeviceProfilerMode& mode) {
+    switch (mode) {
+        case DeviceProfilerMode::Disabled: return 0;
+        case DeviceProfilerMode::Program:
+#if defined(TRACY_ENABLE)
+            return profiler_buffer_allocation(DEFAULT_PROFILER_PROGRAM_SUPPORT_COUNT, false).bytes;
+#else
+            TT_THROW("Program device profiler deployment requires a Tracy-enabled build of tt-metal.");
+#endif
+        default: TT_THROW("Invalid device profiler deployment mode.");
+    }
 }
 
 ProfilerStateManager::ProfilerStateManager(MetalEnvImpl& env) : env_(env), do_sync_on_close(true) {}

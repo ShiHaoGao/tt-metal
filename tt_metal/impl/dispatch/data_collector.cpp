@@ -146,7 +146,7 @@ void DataCollector::RecordProgramMetadata(ProgramImpl& program) {
             for (const auto& [handle, kernel] : program.get_kernels(i)) {
                 // insert(const string&) allocates only on a miss; on a hit it just returns the
                 // existing node, so this allocation is only done once per unique source.
-                const std::string& stored_path = *unique_kernel_sources_.insert(kernel->kernel_source().source_).first;
+                const std::string& stored_path = *unique_kernel_sources_.insert(kernel->is_external_binary() ? kernel->name() : kernel->kernel_source().source_).first;
                 kernel_sources.emplace_back(stored_path);
             }
         }

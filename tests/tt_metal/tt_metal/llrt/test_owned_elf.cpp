@@ -159,6 +159,76 @@ TEST(OwnedElf, DiscretePackingPreservesAddressOrderingAndCallerLifetime) {
     EXPECT_EQ(image.get_text_addr(), 0x2000u);
 }
 
+TEST(OwnedElf, AcceptsEmptyAllocatableSectionWithoutInventingLoadPayload) {
+    LinkedElf input;
+    auto header = input.get<Elf32_Ehdr>(0);
+    header.e_phnum = 1;
+    input.put(0, header);
+    auto data = input.section(2);
+    data.sh_size = 0;
+    input.section(2, data);
+    auto segments = input.section(7);
+    segments.sh_size = 12;
+    input.section(7, segments);
+
+    ElfFile elf;
+    ASSERT_NO_THROW(elf.ReadImage(input.bytes));
+    ASSERT_EQ(elf.GetSegments().size(), 1u);
+    EXPECT_EQ(elf.GetSegments().front().contents.size_bytes(), 12u);
+    const memory image(input.bytes, memory::Loading::CONTIGUOUS_XIP);
+    EXPECT_EQ(image.data(), (std::vector<uint32_t>{0x00000097u, 0x00808093u, 0x00008067u}));
+
+    // A nonempty section at the same unmapped address still requires storage.
+    data.sh_size = 4;
+    input.section(2, data);
+    EXPECT_THROW(elf.ReadImage(input.bytes), std::exception);
+}
+
+TEST(OwnedElf, AcceptsEmptyAllocationMetadataWithoutInventingLoadPayload) {
+    LinkedElf input;
+    auto header = input.get<Elf32_Ehdr>(0);
+    header.e_phnum = 1;
+    input.put(0, header);
+    auto data = input.section(2);
+    data.sh_size = 0;
+    input.section(2, data);
+    // The real SDK linker script retains its data-region metadata even when
+    // LLD omits the empty PT_LOAD. The limit is capacity, not payload size.
+    input.put(LinkedElf::segments_offset + 20, uint32_t{4096});
+    ElfFile elf;
+    ASSERT_NO_THROW(elf.ReadImage(input.bytes));
+    ASSERT_EQ(elf.GetSegments().size(), 1u);
+    EXPECT_EQ(elf.GetSegments().front().contents.size_bytes(), 12u);
+    const memory image(input.bytes, memory::Loading::CONTIGUOUS_XIP);
+    EXPECT_EQ(image.data(), (std::vector<uint32_t>{0x00000097u, 0x00808093u, 0x00008067u}));
+}
+
+TEST(OwnedElf, RejectsUnbackedMetadataWithoutAnEmptyAllocationSection) {
+    LinkedElf input;
+    auto header = input.get<Elf32_Ehdr>(0);
+    header.e_phnum = 1;
+    input.put(0, header);
+    auto data = input.section(2);
+    data.sh_size = 0;
+    data.sh_flags = 0;
+    input.section(2, data);
+    ElfFile elf;
+    EXPECT_ANY_THROW(elf.ReadImage(input.bytes));
+}
+
+TEST(OwnedElf, RejectsNonzeroTrimForAnEmptyAllocationSection) {
+    LinkedElf input;
+    auto header = input.get<Elf32_Ehdr>(0);
+    header.e_phnum = 1;
+    input.put(0, header);
+    auto data = input.section(2);
+    data.sh_size = 0;
+    input.section(2, data);
+    input.put(LinkedElf::segments_offset + 16, uint32_t{0x2004});
+    ElfFile elf;
+    EXPECT_ANY_THROW(elf.ReadImage(input.bytes));
+}
+
 TEST(OwnedElf, RejectedReplacementRetainsAcceptedImage) {
     LinkedElf input;
     ElfFile image;

@@ -400,16 +400,45 @@ bool MetalEnvImpl::consume_force_reinit() {
 // ─── Control plane ────────────────────────────────────────────────────────────
 
 int MetalEnvImpl::ensure_context_registered(MetalEnv& env) {
-    if (!registered_context_id_.has_value()) {
+    std::lock_guard lock(context_registration_mutex_);
+    if (!registered_context_id_) {
         registered_context_id_ = MetalContext::create_instance(env).get();
+    } else {
+        MetalContext::validate_registered_environment(ContextId{*registered_context_id_}, env, worker_stream_state_client_);
     }
     return *registered_context_id_;
 }
 
+bool MetalEnvImpl::has_registered_context() const {
+    std::lock_guard lock(context_registration_mutex_);
+    return registered_context_id_.has_value();
+}
+
+std::shared_ptr<const WorkerStreamStateClient> MetalEnvImpl::acquire_worker_stream_state_client(MetalEnv& env) {
+    std::lock_guard lock(context_registration_mutex_);
+    TT_FATAL(!registered_context_id_, "Worker stream-state environment already has a registered context");
+    auto created = MetalContext::create_worker_stream_state_context(env);
+    worker_stream_state_client_ = std::move(created.client);
+    registered_context_id_ = created.context_id.get();
+    return worker_stream_state_client_;
+}
+
+MetalEnvImpl::MeshContext MetalEnvImpl::acquire_mesh_context(MetalEnv& env) {
+    std::lock_guard lock(context_registration_mutex_);
+    if (registered_context_id_) {
+        MetalContext::validate_registered_environment(ContextId{*registered_context_id_}, env, worker_stream_state_client_);
+        return {*registered_context_id_, true};
+    }
+    return {MetalContext::create_instance(env).get(), false};
+}
+
 void MetalEnvImpl::teardown_registered_context() {
-    if (registered_context_id_.has_value()) {
-        MetalContext::destroy_instance(/*check_device_count=*/false, ContextId{*registered_context_id_});
+    std::lock_guard lock(context_registration_mutex_);
+    if (registered_context_id_) {
+        MetalContext::destroy_registered_environment(
+            ContextId{*registered_context_id_}, *this, worker_stream_state_client_);
         registered_context_id_.reset();
+        worker_stream_state_client_.reset();
     }
 }
 
@@ -627,6 +656,9 @@ void MetalEnvImpl::teardown_fabric_objects() {
 // ─── MetalEnv public forwarding ───────────────────────────────────────────────
 
 MetalEnv::MetalEnv(MetalEnvDescriptor descriptor) : impl_(std::make_unique<MetalEnvImpl>(std::move(descriptor))) {}
+std::shared_ptr<const WorkerStreamStateClient> MetalEnv::acquire_worker_stream_state_client() {
+    return impl_->acquire_worker_stream_state_client(*this);
+}
 
 MetalEnv::~MetalEnv() {
     // Destroy the env-owned MetalContext (if any) while impl_ is still valid: MetalContext::teardown()
@@ -674,9 +706,9 @@ std::shared_ptr<distributed::MeshDevice> MetalEnv::create_mesh_device(
     // If the control plane / system mesh was already accessed, the env owns a registered context; reuse it
     // (its lifetime is tied to the env). Otherwise create one here and let the mesh device tear it down on
     // close, preserving the legacy create_mesh_device-only behavior.
-    const bool env_owns_context = impl_->has_registered_context();
-    ContextId context_id =
-        env_owns_context ? ContextId{impl_->ensure_context_registered(*this)} : MetalContext::create_instance(*this);
+    const auto registration = impl_->acquire_mesh_context(*this);
+    const bool env_owns_context = registration.environment_owned;
+    const ContextId context_id{registration.context_id};
     auto mesh_device = distributed::MeshDeviceImpl::create(
         context_id,
         config,
@@ -700,9 +732,9 @@ std::shared_ptr<distributed::MeshDevice> MetalEnv::create_unit_mesh_device(
     const DispatchCoreConfig& dispatch_core_config,
     ttsl::Span<const std::uint32_t> l1_bank_remap,
     size_t worker_l1_size) {
-    const bool env_owns_context = impl_->has_registered_context();
-    ContextId context_id =
-        env_owns_context ? ContextId{impl_->ensure_context_registered(*this)} : MetalContext::create_instance(*this);
+    const auto registration = impl_->acquire_mesh_context(*this);
+    const bool env_owns_context = registration.environment_owned;
+    const ContextId context_id{registration.context_id};
     auto mesh_device = distributed::MeshDeviceImpl::create_unit_mesh(
         context_id,
         device_id,
@@ -726,9 +758,9 @@ std::map<int, std::shared_ptr<distributed::MeshDevice>> MetalEnv::create_unit_me
     const DispatchCoreConfig& dispatch_core_config,
     ttsl::Span<const std::uint32_t> l1_bank_remap,
     size_t worker_l1_size) {
-    const bool env_owns_context = impl_->has_registered_context();
-    ContextId context_id =
-        env_owns_context ? ContextId{impl_->ensure_context_registered(*this)} : MetalContext::create_instance(*this);
+    const auto registration = impl_->acquire_mesh_context(*this);
+    const bool env_owns_context = registration.environment_owned;
+    const ContextId context_id{registration.context_id};
     auto result = distributed::MeshDeviceImpl::create_unit_meshes(
         context_id,
         device_ids,

@@ -47,8 +47,7 @@ JitDeviceConfig create_jit_device_config(ChipId device_id, uint8_t num_hw_cqs, C
     auto pcie_cores = soc_d.get_cores(CoreType::PCIE, CoordSystem::TRANSLATED);
     CoreCoord pcie_core = pcie_cores.empty() ? soc_d.grid_size : pcie_cores[0];
 
-    return {
-        .hal = &hal,
+    return {DeviceConfiguration{
         .arch = cluster.arch(),
         .num_dram_banks = num_dram_banks,
         .num_l1_banks = num_l1_banks,
@@ -63,7 +62,8 @@ JitDeviceConfig create_jit_device_config(ChipId device_id, uint8_t num_hw_cqs, C
         .max_cbs = hal.get_arch_num_circular_buffers(),
         .num_hw_cqs = num_hw_cqs,
         .routing_fw_enabled = cluster.is_base_routing_fw_enabled(),
-        .profiler_dram_bank_size_per_risc_bytes = get_profiler_dram_bank_size_per_risc_bytes(ctx.rtoptions())};
+        .profiler_dram_bank_size_per_risc_bytes = ctx.rtoptions().get_profiler_enabled()
+            ? get_profiler_dram_bank_size_per_risc_bytes(ctx.rtoptions()) : 0}, &hal};
 }
 
 namespace {
@@ -200,8 +200,7 @@ void enumerate_jit_device_configs(
                             /*is_simulator=*/false,
                             /*enable_blackhole_dram_programmable_cores=*/true,
                             /*enable_aerisc_ptp_trace=*/true);
-                        JitDeviceConfig jit_device_config = {
-                            .hal = &hal,
+                        JitDeviceConfig jit_device_config = {DeviceConfiguration{
                             .arch = arch,
                             .num_dram_banks = num_dram_banks,
                             .num_l1_banks = num_l1_banks,
@@ -220,7 +219,7 @@ void enumerate_jit_device_configs(
                             // We only precompile with profiler disabled, so profiler_dram_bank_size_per_risc_bytes
                             // has no effect on compilation
                             .profiler_dram_bank_size_per_risc_bytes = profiler_dram_bank_size_per_risc_bytes,
-                        };
+                        }, &hal};
                         callback(jit_device_config);
                     }
                 }

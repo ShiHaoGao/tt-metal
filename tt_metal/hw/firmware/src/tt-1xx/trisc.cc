@@ -10,6 +10,7 @@
 #include "hostdev/dev_msgs.h"
 #include "hostdev/rta_constants.h"
 #include "hostdev/worker_stream_state_contract.h"
+#include "internal/native_firmware_contract.h"
 
 #include "tools/profiler/kernel_profiler.hpp"
 

@@ -223,6 +223,7 @@ set(HW_JIT_API_HEADERS
     inc/hostdev/debug_ring_buffer_common.h
     inc/hostdev/dev_msgs.h
     inc/hostdev/worker_stream_state_contract.h
+    inc/hostdev/blackhole_noc_counters.h
     inc/hostdev/device_print_common.h
     inc/hostdev/device_print_structures.h
     inc/hostdev/fabric_telemetry_msgs.h
@@ -251,6 +252,7 @@ set(HW_JIT_API_HEADERS
     inc/internal/template_string.h
     inc/internal/tensix_functions.h
     inc/internal/vptr_uint.h
+    inc/internal/native_firmware_contract.h
     inc/internal/dataflow/dataflow_api_addrgen.h
     inc/internal/dataflow/dataflow_api_common.h
     inc/internal/dataflow/dataflow_cmd_bufs.h

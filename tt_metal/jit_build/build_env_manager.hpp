@@ -6,11 +6,13 @@
 
 #include <stdint.h>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "build.hpp"
+#include "tt-metalium/experimental/native_kernel.hpp"
 #include "impl/context/context_types.hpp"
 #include <umd/device/types/cluster_descriptor_types.hpp>
 
@@ -28,6 +30,7 @@ struct DeviceBuildEnv {
     std::vector<JitBuildState> firmware_build_states;
     std::vector<JitBuildState> kernel_build_states;
     bool firmware_precompiled = false;
+    std::optional<experimental::FirmwareBundle> native_firmware;
 };
 
 // A struct to hold device-specific build environment info (lightweight version of DeviceBuildEnv)
@@ -118,6 +121,7 @@ public:
 private:
     void add_build_env_locked(
         ChipId device_id, const JitDeviceConfig& dev_config, const llrt::RunTimeOptions& rtoptions);
+    void retain_native_firmware(ChipId device_id);
 
     std::unordered_map<ChipId, DeviceBuildEnv> device_id_to_build_env_;
 

@@ -469,6 +469,7 @@ public:
     struct ExplicitBuildOptions {
         std::string root_dir;
         std::optional<std::string> cache_dir;
+        tt_metal::DeviceProfilerMode profiler_mode = tt_metal::DeviceProfilerMode::Disabled;
     };
 
     RunTimeOptions();
@@ -1041,6 +1042,7 @@ public:
     void resolve_mesh_coords_to_chip_ids(const tt::tt_metal::distributed::SystemMesh& system_mesh);
 
 private:
+    void apply_device_profiler_mode(tt_metal::DeviceProfilerMode mode);
     // Helper functions to parse feature-specific environment variables.
     void ParseFeatureEnv(RunTimeDebugFeatures feature, const tt_metal::Hal& hal);
     void ParseFeatureCoreRange(RunTimeDebugFeatures feature, const std::string& env_var, CoreType core_type);

@@ -20,6 +20,7 @@
 #include "hostdev/worker_stream_state_contract.h"
 #include "program_device_map.hpp"          // ProgramTransferInfo
 #include "impl/buffers/semaphore.hpp"
+#include "impl/experimental/native_kernel/native_image.hpp"
 #include "impl/allocator/persistent_l1_arena.hpp"
 #include "tt-metalium/sub_device_types.hpp"
 #include "tt-metalium/tensor/spec/tensor_spec.hpp"                               // Metal 2.0 TensorParameter registry
@@ -75,6 +76,7 @@ namespace experimental {
 class GlobalCircularBuffer;
 class CrossNodeDFB;
 class PrefetcherPipeImpl;
+namespace native_detail { class LoadedFirmware; }
 }  // namespace experimental
 
 namespace program_dispatch {
@@ -277,17 +279,15 @@ public:
     void allocate_scratchpads(const IDevice* device);
     DeviceAddr reserve_program_local_l1(const IDevice* device, const CoreRangeSet& cores);
     bool is_finalized() const;
-    bool is_compiled() const { return !compiled_.empty(); }
+    bool is_compiled() const { return prepared_; }
     void set_finalized();
     void allocate_kernel_bin_buf_on_device(IDevice* device);
-    bool is_cached() const { return this->cached_device_hash_.has_value(); }
     ProgramBinaryStatus get_program_binary_status(ChipId device_id) const {
         if (auto it = this->binaries_on_device_.find(device_id); it != this->binaries_on_device_.end()) {
             return it->second;
         }
         return ProgramBinaryStatus::NotSent;
     }
-    void set_cached(uint64_t device_hash) { this->cached_device_hash_ = device_hash; }
     void set_reload_table(uint32_t addr, const CoreRangeSet& cores) {
         this->reload_table_addr_ = addr;
         this->reload_core_ranges_ = cores;
@@ -308,7 +308,6 @@ public:
             group_cores);
         return *this->reload_table_addr_;
     }
-    const std::optional<uint64_t>& get_cached() const { return this->cached_device_hash_; }
     void set_program_binary_status(ChipId device_id, ProgramBinaryStatus status);
     std::shared_ptr<Kernel> get_kernel(KernelHandle kernel_id) const;
     ProgramConfig& get_program_config(uint32_t programmable_core_type_index);
@@ -689,9 +688,15 @@ private:
     std::vector<std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>> worker_stream_state_internal_kernels_;
     bool finalized_{false};
     bool program_run_args_initialized_{false};
-    // Used only when devices do not have virtualization enabled and used to check that programs are only rerun on
-    // the same device
-    std::optional<uint64_t> cached_device_hash_;
+    struct DispatchDeviceIdentity {
+        ContextId context;
+        std::optional<ChipId> device;
+        std::optional<uint64_t> source_build_key;
+        FirmwareDeployments firmware;
+        bool operator==(const DispatchDeviceIdentity&) const = default;
+    };
+    std::optional<DispatchDeviceIdentity> cached_device_identity_;
+    void validate_dispatch_device(IDevice& device);
 
     // TODO: Should map based on the hash of the configured sub-devices
     // This way we can cache it agnostic of the device
@@ -800,6 +805,8 @@ private:
     std::vector<Semaphore> semaphores_;
 
     std::unordered_set<uint64_t> compiled_;
+    bool prepared_ = false;
+    std::unordered_map<ChipId, FirmwareDeployments> external_prepared_;
     bool local_circular_buffer_allocation_needed_{false};
     bool local_dataflow_buffer_allocation_needed_{false};
 

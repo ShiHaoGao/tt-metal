@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <tt-metalium/experimental/offline_kernel_compile.hpp>
+#include "kernel_compiler.hpp"
 
 #include <tt-metalium/circular_buffer_constants.h>
 #include <tt-metalium/program.hpp>
@@ -134,7 +135,8 @@ void validate_offline_firmware(const JitBuildState& build) {
 //
 // TODO: the kernel-type if/else below does not extend to other Kernel subclasses
 // (Ethernet, DRAM, Quasar variants); this dispatch should live on Kernel itself.
-void generate_kernel_binaries_offline(
+} // namespace
+void offline_detail::generate_kernel_binaries(
     const std::shared_ptr<Kernel>& kernel,
     BuildEnvManager& build_env_manager,
     const DeviceBuildEnv& device_build_env,
@@ -161,6 +163,7 @@ void generate_kernel_binaries_offline(
     }
 }
 
+namespace {
 // Copy each generated ELF for `kernel` from the local build env's kernel root into
 // <output_dir>/<kernel_name>/<compile_hash>/<target_full_path>. Both source and destination
 // paths are computed by BuildEnvManager::get_kernel_binary_path so the layout matches what
@@ -299,7 +302,7 @@ void CompileKernelOffline(
                 kernel->set_full_name(kernel_path_suffix);
                 build_options.set_name(kernel_path_suffix);
 
-                generate_kernel_binaries_offline(
+                offline_detail::generate_kernel_binaries(
                     kernel, build_env_manager, device_build_env, build_options, *jit_device_config.hal);
 
                 copy_generated_elfs_to_output_dir(

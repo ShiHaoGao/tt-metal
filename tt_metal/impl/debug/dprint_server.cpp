@@ -36,6 +36,7 @@
 #include "core_coord.hpp"
 #include "debug_helpers.hpp"
 #include "dprint_server.hpp"
+#include "impl/experimental/native_kernel/native_image.hpp"
 #include "dprint_parser.hpp"
 #include "fmt/base.h"
 #include "hal_types.hpp"
@@ -400,6 +401,12 @@ void DPrintServer::Impl::print_buffer_data(
             auto kernel_id = static_cast<int>(header->info_id);
             risc_data.last_loaded_kernel_id = kernel_id;
 
+            if (auto image = Inspector::get_kernel_elf_image(header->info_id, header->risc_id)) {
+                risc_data.kernel_elf_path.clear();
+                risc_data.kernel_elf_parser = DevicePrintParser::from_elf_bytes(image->image_bytes());
+                continue;
+            }
+
             // Find the elf path for this risc from the inspector.
             auto elf_path = Inspector::get_kernel_elf_path(header->info_id, header->risc_id);
 
@@ -458,7 +465,12 @@ void DPrintServer::Impl::print_buffer_data(
                                                      processor_type_idx);
 
                     risc_data.firmware_elf_path = firmware_elf_path;
-                    risc_data.firmware_elf_parser = DevicePrintParser::get_parser_for_elf(firmware_elf_path);
+                    auto loaded = context_->native_firmware(device_id);
+                    if (loaded && programmable_core_type == HalProgrammableCoreType::TENSIX &&
+                        header->risc_id < TT_NATIVE_ROLE_COUNT)
+                        risc_data.firmware_elf_parser = DevicePrintParser::from_elf_bytes(loaded->bundle().image_bytes(
+                            static_cast<experimental::TensixKernelRole>(header->risc_id)));
+                    else risc_data.firmware_elf_parser = DevicePrintParser::get_parser_for_elf(firmware_elf_path);
                 }
                 elf_parser = risc_data.firmware_elf_parser;
             }

@@ -28,6 +28,8 @@ public:
 
     // Idempotent per path. Never throws: failing to name a zone must not fail a run.
     void ingest_elf(const std::string& elf_path);
+    // Immutable bytes are parsed directly; no path-based deduplication.
+    void ingest_elf(std::span<const std::byte> image);
 
     // One listener, called under the registry's lock with each ELF's new entries as they register, after a replay of
     // every entry already registered. Entries never move or die.

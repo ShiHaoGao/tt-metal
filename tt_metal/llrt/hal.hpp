@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <ostream>
+#include <optional>
 #include <string_view>
 #include <umd/device/types/xy_pair.hpp>
 #include <umd/device/types/cluster_types.hpp>
@@ -47,16 +48,6 @@ class RunTimeOptions;
 
 namespace tt::tt_metal {
 
-// Struct of core type, processor class, and processor type to uniquely identify any processor.
-struct HalProcessorIdentifier {
-    HalProgrammableCoreType core_type = HalProgrammableCoreType::TENSIX;
-    HalProcessorClassType processor_class = HalProcessorClassType::DM;
-    int processor_type = 0;
-};
-
-std::ostream& operator<<(std::ostream&, const HalProcessorIdentifier&);
-bool operator<(const HalProcessorIdentifier&, const HalProcessorIdentifier&);
-bool operator==(const HalProcessorIdentifier&, const HalProcessorIdentifier&);
 
 enum class HalDramMemAddrType : uint8_t {
     BARRIER = 0,
@@ -73,6 +64,18 @@ enum class NoCTopologyType : uint8_t { MESH = 0, TORUS = 1 };
 
 // Compile-time maximum for processor types count for any arch.  Useful for creating bitsets.
 static constexpr int MAX_PROCESSOR_TYPES_COUNT = 24;
+
+// Exact processor image limits from the architecture's linker/memory-map ABI.
+struct HalImageRegion { DeviceAddr base; uint32_t size; };
+enum class HalKernelTextLimit : uint8_t { FromFirmwareBase, AfterFirmware };
+struct HalProcessorImageRegions {
+    HalImageRegion firmware_text;
+    HalImageRegion local_data; // Static data/BSS capacity, excludes reserved stack.
+    HalImageRegion local_initialization; // Host staging of initialized firmware data only.
+    uint32_t kernel_text_size;
+    HalKernelTextLimit kernel_text_limit;
+    uint32_t firmware_kernel_pad;
+};
 
 // Note: nsidwell will be removing need for fw_base_addr and local_init_addr
 // fw_launch_addr is programmed with fw_launch_addr_value on the master risc
@@ -640,6 +643,8 @@ public:
 
     uint32_t get_processor_class_num_fw_binaries(
         uint32_t programmable_core_type_index, uint32_t processor_class_idx) const;
+
+    std::optional<HalProcessorImageRegions> get_processor_image_regions(HalProcessorIdentifier) const;
 
     uint64_t relocate_dev_addr(uint64_t addr, uint64_t local_init_addr = 0, bool has_shared_local_mem = false) const {
         return relocate_func_(addr, local_init_addr, has_shared_local_mem);

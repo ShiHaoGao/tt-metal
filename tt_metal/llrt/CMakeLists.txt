@@ -28,6 +28,7 @@ target_link_libraries(
         TT::Metalium::Common
         tt-logger::tt-logger
         Metalium::Metal::Hardware
+        ${CMAKE_DL_LIBS}
 )
 target_include_directories(llrt PUBLIC .)
 target_compile_options(llrt PRIVATE -Wno-int-to-pointer-cast)
@@ -35,7 +36,11 @@ target_compile_options(llrt PRIVATE -Wno-int-to-pointer-cast)
 include(GNUInstallDirs)
 
 set(TT_METAL_DEFAULT_INSTALL_ROOT "/usr/${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium")
-target_compile_definitions(llrt PRIVATE TT_METAL_INSTALL_ROOT="${TT_METAL_DEFAULT_INSTALL_ROOT}")
+file(RELATIVE_PATH TT_METAL_RUNTIME_ROOT_FROM_LIBDIR
+    "${CMAKE_INSTALL_FULL_LIBDIR}" "${CMAKE_INSTALL_FULL_LIBEXECDIR}/tt-metalium")
+target_compile_definitions(llrt PRIVATE
+    TT_METAL_INSTALL_ROOT="${TT_METAL_DEFAULT_INSTALL_ROOT}"
+    TT_METAL_RUNTIME_ROOT_FROM_LIBDIR="${TT_METAL_RUNTIME_ROOT_FROM_LIBDIR}")
 
 if(TT_METAL_USE_EMULE)
     target_compile_definitions(llrt PRIVATE TT_METAL_USE_EMULE=1)

@@ -15,6 +15,7 @@
 #include <umd/device/types/cluster_descriptor_types.hpp>
 
 #include "impl/context/context_types.hpp"
+#include <tt-metalium/experimental/published_deployment.hpp>
 
 namespace tt::llrt {
 class RunTimeOptions;
@@ -31,33 +32,8 @@ class Hal;
 // device via `create_jit_device_config` and then treated as read-only; the
 // build pipeline uses these values to produce compiler defines and to compute
 // a cache key that uniquely identifies a build configuration.
-struct JitDeviceConfig {
+struct JitDeviceConfig : DeviceConfiguration {
     const Hal* hal = nullptr;
-    tt::ARCH arch = tt::ARCH::Invalid;
-
-    size_t num_dram_banks = 0;
-    size_t num_l1_banks = 0;
-    CoreCoord pcie_core{0, 0};
-
-    uint32_t harvesting_mask = 0;
-    DispatchCoreType dispatch_core_type = DispatchCoreType::WORKER;
-    // Effective dispatch placement (Quasar: DISPATCH vs WORKER from soc/env, not DispatchCoreConfig alone).
-    tt::CoreType resolved_dispatch_core_type = tt::CoreType::WORKER;
-    DispatchCoreAxis dispatch_core_axis = DispatchCoreAxis::ROW;
-    bool coordinate_virtualization_enabled = false;
-
-    uint32_t dispatch_message_addr = 0;
-    uint32_t max_cbs = 0;
-    uint8_t num_hw_cqs = 0;
-
-    bool routing_fw_enabled = false;
-
-    // Pre-computed in the factory so that JitBuildEnv::init can consume it without
-    // calling get_profiler_dram_bank_size_per_risc_bytes(), which has a side-effect
-    // of mutating rtoptions (set_profiler_program_support_count). The build module
-    // must only observe const RunTimeOptions; any mutation belongs in the factory or
-    // in the profiler subsystem itself.
-    uint32_t profiler_dram_bank_size_per_risc_bytes = 0;
 };
 
 // Construct a JitDeviceConfig by querying a live device through MetalContext.

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "impl/experimental/published_deployment/configuration.hpp"
 
 #include <stdint.h>
 #include <optional>
@@ -15,20 +16,7 @@
 
 namespace tt::tt_metal {
 
-struct relay_mux_client_config {
-    std::optional<uint32_t> virtual_x;
-    std::optional<uint32_t> virtual_y;
-    std::optional<uint32_t> num_buffers_per_channel;
-    std::optional<uint32_t> channel_buffer_size_bytes;
-    std::optional<uint32_t> channel_base_address;
-    std::optional<uint32_t> connection_info_address;
-    std::optional<uint32_t> connection_handshake_address;
-    std::optional<uint32_t> flow_control_address;
-    std::optional<uint32_t> buffer_index_address;
-    std::optional<uint32_t> status_address;
-    std::optional<uint32_t> termination_signal_address;
-    std::optional<uint32_t> worker_credits_stream_id;
-};
+
 
 struct relay_mux_static_config {
     // Base address for each buffer
