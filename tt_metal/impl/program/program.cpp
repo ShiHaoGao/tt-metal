@@ -3179,6 +3179,68 @@ void detail::ProgramImpl::validate_worker_stream_state_client(
                  "Bound worker stream-state client requires Program ownership");
 }
 
+void detail::ProgramImpl::prepare_native(IDevice* device) {
+    TT_FATAL(device, "Native Program preparation requires a device");
+    validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    validate_worker_stream_state();
+    worker_stream_state_owner_frozen_ = true;
+    TTZoneScopedD(PROGRAM);
+
+    const ContextId device_context_id = extract_context_id(device);
+    TT_FATAL(
+        context_id_ == DEFAULT_CONTEXT_ID || context_id_ == device_context_id,
+        "Native Program {} was created for context_id {} but is being prepared on a device from context_id {}.",
+        this->id,
+        context_id_.get(),
+        device_context_id.get());
+    TT_FATAL(device->is_initialized(), "Native Program preparation requires an initialized device");
+
+    FirmwareDeployments loaded_firmware;
+    bool has_external_kernels = false;
+    for (const auto& kernels : kernels_) {
+        for (const auto& [id, kernel] : kernels) {
+            TT_FATAL(kernel->is_external_binary(),
+                     "Native Program preparation rejects source kernel {}", id);
+            TT_FATAL(kernel->is_native(),
+                     "Native Program preparation requires compiler-published ELF images");
+            auto firmware = static_cast<ExternalBinaryKernel&>(*kernel).validate_deployments(
+                *device, get_worker_stream_state_owner());
+            TT_FATAL(loaded_firmware.empty() || loaded_firmware == firmware,
+                     "Native Program kernels require the same physical firmware boots");
+            loaded_firmware = std::move(firmware);
+            has_external_kernels = true;
+            for (const auto& [chip, boot] : loaded_firmware)
+                validate_kernel_placement(false, kernel, chip);
+        }
+    }
+    TT_FATAL(has_external_kernels,
+             "Native Program preparation requires at least one external ELF kernel");
+
+    if (!prepared_)
+        this->sub_device_ids_[device->id()].erase(device->get_active_sub_device_manager_id());
+
+    const auto previous = external_prepared_.find(device->id());
+    if (previous != external_prepared_.end()) {
+        TT_FATAL(previous->second == loaded_firmware, "Native Program firmware generation changed");
+        for (const auto& [chip, firmware] : previous->second)
+            TT_FATAL(firmware->live(), "Native Program firmware withdrawn on device {}", chip);
+    } else {
+        for (const auto& kernels : kernels_) {
+            for (const auto& [id, kernel] : kernels) {
+                auto& external = static_cast<ExternalBinaryKernel&>(*kernel);
+                external.prepare_deployments(*device, get_worker_stream_state_owner());
+                Inspector::program_kernel_native_prepared(this, kernel);
+            }
+        }
+        for (const auto& [chip, firmware] : loaded_firmware)
+            TT_FATAL(firmware->live(), "Native Program firmware withdrawn during preparation on device {}", chip);
+        external_prepared_.insert_or_assign(device->id(), loaded_firmware);
+    }
+    if (detail::MemoryReporter::enabled())
+        detail::MemoryReporter::inst().flush_program_memory_usage(get_id(), device);
+    prepared_ = true;
+}
+
 void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
     validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
     validate_worker_stream_state();

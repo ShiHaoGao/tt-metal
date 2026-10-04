@@ -267,6 +267,9 @@ public:
     void init_semaphores(
         const IDevice& device, const CoreCoord& logical_core, uint32_t programmable_core_type_index) const;
     std::vector<std::vector<CoreCoord>> logical_cores() const;
+    // Prepare a source-free program whose kernels are all compiler-published
+    // external ELF images. This API never consults the source/JIT build path.
+    void prepare_native(IDevice* device);
     void compile(IDevice* device, bool force_slow_dispatch = false);
     void compile_and_allocate(IDevice* device, bool force_slow_dispatch);
     void invalidate_circular_buffer_allocation();
