@@ -80,6 +80,13 @@ struct NativeComputeConfig {
 KernelHandle CreateKernelFromElf(Program&, const CoreRangeSet&, const NativeDataMovementConfig&);
 KernelHandle CreateKernelFromElf(Program&, const CoreRangeSet&, const NativeComputeConfig&);
 
+// Validate and prepare a program composed exclusively of compiler-published
+// native ELF kernels for the supplied live device.  The implementation keeps
+// the SDK-owned worker-stream, firmware-generation, placement and native-image
+// checks in ProgramImpl; this public entry point avoids exposing that private
+// implementation header to installed consumers.
+void PrepareNativeProgram(Program&, IDevice&);
+
 // Returns only the bundle actually used by successful firmware boot. This
 // does not create a context, build firmware, reopen files, or mint boot state.
 FirmwareBundle GetLoadedFirmwareBundle(IDevice& device);

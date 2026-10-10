@@ -36,6 +36,8 @@ void copy_per_core_addresses(Buffer& dst, const Buffer& src) {
     TT_FATAL(
         dst.impl().per_core_allocation_ && src.impl().per_core_allocation_,
         "copy_per_core_addresses requires both buffers to use per-core allocation");
+    TT_FATAL(dst.impl().per_core_address_mode_ == src.impl().per_core_address_mode_,
+             "copy_per_core_addresses requires the same per-core address policy");
     dst.impl().per_core_addresses_ = src.impl().per_core_addresses_;
 }
 
@@ -46,13 +48,29 @@ BufferShardingArgs& set_per_core_allocation(BufferShardingArgs& args, bool enabl
         // per-core branch first, so range lockstep is silently ignored rather than reported.
         TT_FATAL(
             !range_lockstep_allocation::is_range_lockstep_allocation(args),
-            "per_core_allocation and range_lockstep_allocation are mutually exclusive: a buffer either takes an "
-            "independent address on each core or one address across them");
+            "per_core_allocation and range_lockstep_allocation are mutually exclusive ownership policies");
     }
     args.impl().per_core_allocation_ = enable;
+    args.impl().per_core_address_mode_ = AddressMode::Independent;
     return args;
 }
 
 bool is_per_core_allocation(const BufferShardingArgs& args) { return args.impl().per_core_allocation_; }
+
+AddressMode get_address_mode(const Buffer& buffer) { return buffer.impl().per_core_address_mode_; }
+
+AddressMode get_address_mode(const BufferShardingArgs& args) { return args.impl().per_core_address_mode_; }
+
+BufferShardingArgs& set_per_core_allocation(BufferShardingArgs& args, AddressMode mode) {
+    TT_FATAL(mode == AddressMode::Independent || mode == AddressMode::Common, "Unknown per-core address mode");
+    if (mode == AddressMode::Common) {
+        TT_FATAL(args.shard_spec().has_value(), "Common per-core allocation requires an explicit shard grid");
+        TT_FATAL(!args.buffer_distribution_spec().has_value(),
+                 "Common per-core allocation does not accept a second distribution scope");
+    }
+    set_per_core_allocation(args, true);
+    args.impl().per_core_address_mode_ = mode;
+    return args;
+}
 
 }  // namespace tt::tt_metal::experimental::per_core_allocation

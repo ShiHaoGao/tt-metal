@@ -3,6 +3,7 @@
 #include "native_kernel.hpp"
 #include "impl/context/metal_env_accessor.hpp"
 #include "impl/context/metal_env_impl.hpp"
+#include "impl/program/program_impl.hpp"
 #include "llrt/llrt.hpp"
 #include "llrt/zone_meta.hpp"
 #include <stdexcept>
@@ -99,6 +100,13 @@ void NativeElfKernel::prepare(IDevice* device, tt::worker_stream_state::Owner ow
     for (const auto& image : native_images().images) {
         if (image.contract().profile) tt::llrt::ZoneMetaRegistry::instance().ingest_elf(image.image_bytes());
     }
+}
+
+void experimental::PrepareNativeProgram(Program& program, IDevice& device) {
+    // Keep all native-only admission and preparation checks in the SDK's
+    // ProgramImpl owner.  This wrapper is the installed typed boundary; it
+    // intentionally does not reproduce or weaken those checks here.
+    program.impl().prepare_native(&device);
 }
 
 bool NativeElfKernel::configure(IDevice* device, const CoreCoord& logical, uint32_t base, const uint32_t offsets[]) const {

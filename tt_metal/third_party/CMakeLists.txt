@@ -98,152 +98,154 @@ target_compile_options(TracyClient PRIVATE -Wno-deprecated-declarations)
 # Their executable exports symbols (-rdynamic) → Tracy can map addresses to names.
 target_link_options(TracyClient PUBLIC -rdynamic)
 
-set(NO_FILESELECTOR ON)
+if(TT_METAL_BUILD_PROFILER_TOOLS)
+    set(NO_FILESELECTOR ON)
 
-# Build Tracy CLI deps statically so the binaries run from packaged artifacts without build/_deps.
-set(BUILD_SHARED_LIBS OFF)
+    # Build Tracy CLI deps statically so the binaries run from packaged artifacts without build/_deps.
+    set(BUILD_SHARED_LIBS OFF)
 
-# Disable Tracy's -march=native for portable CLI binaries in CI.
-set(NO_ISA_EXTENSIONS ON)
+    # Disable Tracy's -march=native for portable CLI binaries in CI.
+    set(NO_ISA_EXTENSIONS ON)
 
-# Tracy's csvexport/capture each include cmake/config.cmake, which sets
-# RULE_LAUNCH_COMPILE ccache as a GLOBAL property.  tt-metal already wires
-# ccache via CMAKE_CXX_COMPILER_LAUNCHER (cmake/ccache.cmake), so having both
-# active causes double-wrapping: the outer ccache sees the entire
-# "cmake -E env ... ccache clang++ -c file.cpp" as its argument list and
-# rejects every tt_metal translation unit as "Multiple source files".
-# Suppress Tracy's own ccache logic; ours handles it correctly.
-set(NO_CCACHE ON)
-add_subdirectory(tracy/csvexport)
-add_subdirectory(tracy/capture)
+    # Tracy's csvexport/capture each include cmake/config.cmake, which sets
+    # RULE_LAUNCH_COMPILE ccache as a GLOBAL property.  tt-metal already wires
+    # ccache via CMAKE_CXX_COMPILER_LAUNCHER (cmake/ccache.cmake), so having both
+    # active causes double-wrapping: the outer ccache sees the entire
+    # "cmake -E env ... ccache clang++ -c file.cpp" as its argument list and
+    # rejects every tt_metal translation unit as "Multiple source files".
+    # Suppress Tracy's own ccache logic; ours handles it correctly.
+    set(NO_CCACHE ON)
+    add_subdirectory(tracy/csvexport)
+    add_subdirectory(tracy/capture)
 
-# Keep CLI output in the path used by Python tooling and CI packaging.
-set(TRACY_CLI_BIN_DIR "${CMAKE_BINARY_DIR}/tools/profiler/bin")
-set_target_properties(
-    tracy-csvexport
-    tracy-capture
-    tracy-capture-daemon
-    PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY
-            "${TRACY_CLI_BIN_DIR}"
-)
-
-# Same -Wno-deprecated-declarations suppression as TracyClient above, extended to the rest of
-# Tracy's own (non-vendored) targets -- their server code is what actually triggers the warning.
-foreach(
-    _tt_tracy_deprecated_target
-    IN
-    ITEMS
-        TracyServer
-        TracyGetOpt
+    # Keep CLI output in the path used by Python tooling and CI packaging.
+    set(TRACY_CLI_BIN_DIR "${CMAKE_BINARY_DIR}/tools/profiler/bin")
+    set_target_properties(
         tracy-csvexport
         tracy-capture
         tracy-capture-daemon
-)
-    if(NOT TARGET ${_tt_tracy_deprecated_target})
-        continue()
-    endif()
-    get_target_property(_tt_tracy_deprecated_target_type ${_tt_tracy_deprecated_target} TYPE)
-    if(_tt_tracy_deprecated_target_type STREQUAL "INTERFACE_LIBRARY")
-        continue()
-    endif()
-    target_compile_options(${_tt_tracy_deprecated_target} PRIVATE -Wno-deprecated-declarations)
-endforeach()
-unset(_tt_tracy_deprecated_target)
-unset(_tt_tracy_deprecated_target_type)
+        PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY
+                "${TRACY_CLI_BIN_DIR}"
+    )
 
-# Force a portable ISA baseline for Tracy server/CLI and key deps on x86_64.
-if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-    set(_tt_tracy_portable_march -march=x86-64-v2)
+    # Same -Wno-deprecated-declarations suppression as TracyClient above, extended to the rest of
+    # Tracy's own (non-vendored) targets -- their server code is what actually triggers the warning.
     foreach(
-        _tt_tracy_portable_target
+        _tt_tracy_deprecated_target
         IN
         ITEMS
             TracyServer
-            tracy-capture
-            tracy-csvexport
-            tracy-capture-daemon
-            capstone
-            libzstd
-            libzstd_static
-            PPQSort
             TracyGetOpt
+            tracy-csvexport
+            tracy-capture
+            tracy-capture-daemon
     )
-        if(NOT TARGET ${_tt_tracy_portable_target})
+        if(NOT TARGET ${_tt_tracy_deprecated_target})
             continue()
         endif()
-        get_target_property(_tt_tracy_portable_target_type ${_tt_tracy_portable_target} TYPE)
-        if(_tt_tracy_portable_target_type STREQUAL "INTERFACE_LIBRARY")
+        get_target_property(_tt_tracy_deprecated_target_type ${_tt_tracy_deprecated_target} TYPE)
+        if(_tt_tracy_deprecated_target_type STREQUAL "INTERFACE_LIBRARY")
             continue()
         endif()
-        target_compile_options(${_tt_tracy_portable_target} PRIVATE ${_tt_tracy_portable_march})
+        target_compile_options(${_tt_tracy_deprecated_target} PRIVATE -Wno-deprecated-declarations)
     endforeach()
-    unset(_tt_tracy_portable_march)
-    unset(_tt_tracy_portable_target)
-    unset(_tt_tracy_portable_target_type)
-endif()
+    unset(_tt_tracy_deprecated_target)
+    unset(_tt_tracy_deprecated_target_type)
 
-# Aggregate target used by CI/artifact workflows.
-add_custom_target(
-    tracy_profiler_cli_tools
-    DEPENDS
-        tracy-csvexport
-        tracy-capture
-)
-
-# Tracy profiler WASM viewer (Emscripten).
-CPMAddPackage(
-    NAME emsdk
-    GITHUB_REPOSITORY emscripten-core/emsdk
-    GIT_TAG
-        0dfff153dc3c596948ac088b8853006c570f2609 # 5.0.7-4-g0dfff15
-    DOWNLOAD_ONLY YES
-)
-
-set(EMSDK_DIR "${emsdk_SOURCE_DIR}")
-set(EMSCRIPTEN_TOOLCHAIN_FILE "${EMSDK_DIR}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake")
-
-if(NOT EXISTS "${EMSCRIPTEN_TOOLCHAIN_FILE}")
-    message(
-        STATUS
-        "Installing Emscripten via emsdk into ${EMSDK_DIR} (first configure only; downloads ~hundreds of MB)..."
-    )
-    execute_process(
-        COMMAND
-            ./emsdk install latest
-        WORKING_DIRECTORY "${EMSDK_DIR}"
-        RESULT_VARIABLE _emsdk_install_rc
-    )
-    if(NOT _emsdk_install_rc EQUAL 0)
-        message(FATAL_ERROR "emsdk install failed (exit ${_emsdk_install_rc})")
+    # Force a portable ISA baseline for Tracy server/CLI and key deps on x86_64.
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set(_tt_tracy_portable_march -march=x86-64-v2)
+        foreach(
+            _tt_tracy_portable_target
+            IN
+            ITEMS
+                TracyServer
+                tracy-capture
+                tracy-csvexport
+                tracy-capture-daemon
+                capstone
+                libzstd
+                libzstd_static
+                PPQSort
+                TracyGetOpt
+        )
+            if(NOT TARGET ${_tt_tracy_portable_target})
+                continue()
+            endif()
+            get_target_property(_tt_tracy_portable_target_type ${_tt_tracy_portable_target} TYPE)
+            if(_tt_tracy_portable_target_type STREQUAL "INTERFACE_LIBRARY")
+                continue()
+            endif()
+            target_compile_options(${_tt_tracy_portable_target} PRIVATE ${_tt_tracy_portable_march})
+        endforeach()
+        unset(_tt_tracy_portable_march)
+        unset(_tt_tracy_portable_target)
+        unset(_tt_tracy_portable_target_type)
     endif()
-    execute_process(
-        COMMAND
-            ./emsdk activate latest
-        WORKING_DIRECTORY "${EMSDK_DIR}"
-        RESULT_VARIABLE _emsdk_activate_rc
+
+    # Aggregate target used by CI/artifact workflows.
+    add_custom_target(
+        tracy_profiler_cli_tools
+        DEPENDS
+            tracy-csvexport
+            tracy-capture
     )
-    if(NOT _emsdk_activate_rc EQUAL 0)
-        message(FATAL_ERROR "emsdk activate failed (exit ${_emsdk_activate_rc})")
+
+    # Tracy profiler WASM viewer (Emscripten).
+    CPMAddPackage(
+        NAME emsdk
+        GITHUB_REPOSITORY emscripten-core/emsdk
+        GIT_TAG
+            0dfff153dc3c596948ac088b8853006c570f2609 # 5.0.7-4-g0dfff15
+        DOWNLOAD_ONLY YES
+    )
+
+    set(EMSDK_DIR "${emsdk_SOURCE_DIR}")
+    set(EMSCRIPTEN_TOOLCHAIN_FILE "${EMSDK_DIR}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake")
+
+    if(NOT EXISTS "${EMSCRIPTEN_TOOLCHAIN_FILE}")
+        message(
+            STATUS
+            "Installing Emscripten via emsdk into ${EMSDK_DIR} (first configure only; downloads ~hundreds of MB)..."
+        )
+        execute_process(
+            COMMAND
+                ./emsdk install latest
+            WORKING_DIRECTORY "${EMSDK_DIR}"
+            RESULT_VARIABLE _emsdk_install_rc
+        )
+        if(NOT _emsdk_install_rc EQUAL 0)
+            message(FATAL_ERROR "emsdk install failed (exit ${_emsdk_install_rc})")
+        endif()
+        execute_process(
+            COMMAND
+                ./emsdk activate latest
+            WORKING_DIRECTORY "${EMSDK_DIR}"
+            RESULT_VARIABLE _emsdk_activate_rc
+        )
+        if(NOT _emsdk_activate_rc EQUAL 0)
+            message(FATAL_ERROR "emsdk activate failed (exit ${_emsdk_activate_rc})")
+        endif()
     endif()
-endif()
 
-if(NOT EXISTS "${EMSCRIPTEN_TOOLCHAIN_FILE}")
-    message(FATAL_ERROR "Emscripten toolchain file not found at ${EMSCRIPTEN_TOOLCHAIN_FILE} after install/activate.")
-endif()
+    if(NOT EXISTS "${EMSCRIPTEN_TOOLCHAIN_FILE}")
+        message(FATAL_ERROR "Emscripten toolchain file not found at ${EMSCRIPTEN_TOOLCHAIN_FILE} after install/activate.")
+    endif()
 
-# Keep output path aligned with Python tooling and CI packaging/tests.
-# No EXCLUDE_FROM_ALL: Ninja's install target depends on all, so cmake --build --target install
-# builds this automatically when Tracy is enabled.
-ExternalProject_Add(
-    tracy_profiler_wasm
-    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tracy/profiler
-    BINARY_DIR ${CMAKE_BINARY_DIR}/profiler/build_wasm
-    CMAKE_ARGS
-        -DCMAKE_TOOLCHAIN_FILE=${EMSCRIPTEN_TOOLCHAIN_FILE} -DCMAKE_BUILD_TYPE=MinSizeRel
-    INSTALL_COMMAND
-        "" # Suppress default cmake --install: artifacts stay in BINARY_DIR for CI packaging to pick up.
-)
+    # Keep output path aligned with Python tooling and CI packaging/tests.
+    # No EXCLUDE_FROM_ALL: Ninja's install target depends on all, so cmake --build --target install
+    # builds this automatically when Tracy is enabled.
+    ExternalProject_Add(
+        tracy_profiler_wasm
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tracy/profiler
+        BINARY_DIR ${CMAKE_BINARY_DIR}/profiler/build_wasm
+        CMAKE_ARGS
+            -DCMAKE_TOOLCHAIN_FILE=${EMSCRIPTEN_TOOLCHAIN_FILE} -DCMAKE_BUILD_TYPE=MinSizeRel
+        INSTALL_COMMAND
+            "" # Suppress default cmake --install: artifacts stay in BINARY_DIR for CI packaging to pick up.
+    )
+endif()
 
 set(_tt_tracy_categories_file "${CMAKE_CURRENT_SOURCE_DIR}/../tools/profiler/tracy_debug_categories.txt")
 set_property(

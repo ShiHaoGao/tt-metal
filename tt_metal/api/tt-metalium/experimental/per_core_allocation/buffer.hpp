@@ -4,12 +4,22 @@
 
 #pragma once
 
+#include <cstdint>
 #include <unordered_map>
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/hal_types.hpp>
 
 namespace tt::tt_metal::experimental::per_core_allocation {
+
+// Both policies retain per-device/per-core allocation ownership. Common
+// reserves one address only on the exact selected cores; it never consumes the
+// device-wide lockstep allocator. It does not promise one address across devices.
+enum class AddressMode : uint8_t { Independent = 0, Common = 1 };
+
+AddressMode get_address_mode(const Buffer& buffer);
+AddressMode get_address_mode(const BufferShardingArgs& args);
+BufferShardingArgs& set_per_core_allocation(BufferShardingArgs& args, AddressMode mode);
 
 // Buffer free functions — friended by Buffer to access private per-core state.
 
@@ -20,8 +30,9 @@ void copy_per_core_addresses(Buffer& dst, const Buffer& src);
 
 // Base address of ``buffer``'s shard on ``core``, for either allocation mode.
 //
-// Per-core-allocated buffers give each core an INDEPENDENT shard address, while
-// Buffer::address() returns only cores[0]'s. Host data movement must target the same address
+// The Independent policy may give each core a different shard address; Common
+// reserves the same address on every selected core. Buffer::address() reports
+// only cores[0]'s. Host data movement must target the same address
 // the kernel reads, otherwise a relocated core reads/writes at the wrong offset. Falls back to
 // Buffer::address() for ordinary lockstep buffers, so callers need no mode check.
 DeviceAddr get_shard_base_address(const Buffer& buffer, CoreCoord core);

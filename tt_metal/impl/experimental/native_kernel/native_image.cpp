@@ -53,12 +53,12 @@ void validate_executable(std::span<const std::byte> bytes, const ll_api::ElfFile
         throw std::invalid_argument("native entry must start the executable text segment");
 }
 
-using Symbols = std::unordered_map<std::string, Elf32_Sym>;
-Symbols symbols(const ll_api::ElfFile& elf) {
+using NativeImageSymbols = std::unordered_map<std::string, Elf32_Sym>;
+NativeImageSymbols symbols(const ll_api::ElfFile& elf) {
     uint64_t address = 0;
     auto table = elf.GetSectionContents(".symtab", address);
     auto strings = elf.GetSectionContents(".strtab", address);
-    Symbols result;
+    NativeImageSymbols result;
     for (size_t offset = 0; offset + sizeof(Elf32_Sym) <= table.size(); offset += sizeof(Elf32_Sym)) {
         Elf32_Sym symbol{};
         std::memcpy(&symbol, table.data() + offset, sizeof(symbol));
@@ -76,7 +76,7 @@ struct Image {
     std::vector<std::byte> link_bytes;
     tt_native_image_record contract{};
     ll_api::memory memory;
-    Symbols exports;
+    NativeImageSymbols exports;
 };
 }  // namespace
 

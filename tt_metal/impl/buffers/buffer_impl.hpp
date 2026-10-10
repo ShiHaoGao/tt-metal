@@ -5,6 +5,7 @@
 #pragma once
 
 #include <tt-metalium/buffer.hpp>
+#include <tt-metalium/experimental/per_core_allocation/buffer.hpp>
 #include <tt-metalium/hal_types.hpp>
 #include <tt-metalium/sub_device_types.hpp>
 
@@ -98,6 +99,8 @@ public:
     std::optional<BufferDistributionSpec> buffer_distribution_spec_;
 
     bool per_core_allocation_ = false;
+    experimental::per_core_allocation::AddressMode per_core_address_mode_ =
+        experimental::per_core_allocation::AddressMode::Independent;
     std::unordered_map<CoreCoord, DeviceAddr> per_core_addresses_;
 
     // Lockstep only across the cores this buffer occupies, rather than every core on the device.

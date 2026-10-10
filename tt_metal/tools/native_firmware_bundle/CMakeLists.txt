@@ -31,6 +31,11 @@ target_link_libraries(native_firmware_bundle PRIVATE
 set_target_properties(native_firmware_bundle PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/tools)
 
+if(NOT TT_METAL_BUILD_TOOLS)
+    set_target_properties(native_deployment_publish native_firmware_bundle
+        PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
 if(TT_METAL_BUILD_TESTS)
     add_executable(unit_tests_native_deployment_publish
         NativeDeploymentPublishTest.cpp DeploymentInputsTest.cpp

@@ -107,6 +107,17 @@ public:
         // on the path that does not go through a mesh allocator.
         const std::optional<std::unordered_set<uint32_t>>& scoped_dependent_allocators = std::nullopt);
 
+    // Caller serializes the entire operation. Reserve one address in the exact
+    // non-lockstep bank allocators; failures roll back tracked reservations.
+    // Existing per-bank deallocation owns each member afterwards.
+    DeviceAddr allocate_buffer_on_banks(
+        DeviceAddr size_per_bank,
+        DeviceAddr page_size,
+        bool bottom_up,
+        const CoreRangeSet& compute_grid,
+        const std::vector<AllocatorDependencies::AllocatorID>& allocator_ids,
+        const std::vector<std::pair<DeviceAddr, DeviceAddr>>& additional_occupied_ranges = {});
+
     void deallocate_buffer(
         DeviceAddr address, AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0});
     void deallocate_all();

@@ -72,23 +72,25 @@ install(
     COMPONENT metalium-dev
 )
 
-write_basic_package_version_file(
-    ${PROJECT_BINARY_DIR}/tt-nn-config-version.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
-configure_package_config_file(
-    ${CMAKE_CURRENT_LIST_DIR}/packaging.d/tt-nn-config.cmake.in
-    ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
-)
-install(
-    FILES
-        ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
+if(TT_METAL_BUILD_TTNN)
+    write_basic_package_version_file(
         ${PROJECT_BINARY_DIR}/tt-nn-config-version.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
-    COMPONENT ttnn-dev
-)
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+    configure_package_config_file(
+        ${CMAKE_CURRENT_LIST_DIR}/packaging.d/tt-nn-config.cmake.in
+        ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
+    )
+    install(
+        FILES
+            ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
+            ${PROJECT_BINARY_DIR}/tt-nn-config-version.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
+        COMPONENT ttnn-dev
+    )
+endif()
 
 get_cmake_property(CPACK_COMPONENTS_ALL COMPONENTS)
 list(
@@ -140,46 +142,50 @@ cpack_add_component(
 )
 cpack_add_component(gtest GROUP metalium-validation)
 
-cpack_add_component_group(nn)
-cpack_add_component(nn DEPENDS metalium GROUP nn DESCRIPTION "TT-NN runtime library")
-cpack_add_component(ttnn-runtime GROUP nn)
+if(TT_METAL_BUILD_TTNN)
+    cpack_add_component_group(nn)
+    cpack_add_component(nn DEPENDS metalium GROUP nn DESCRIPTION "TT-NN runtime library")
+    cpack_add_component(ttnn-runtime GROUP nn)
 
-cpack_add_component_group(nn-dev)
-cpack_add_component(
-    nn-dev
-    DEPENDS
-        metalium-dev
-        nn
-    GROUP nn-dev
-    DESCRIPTION "TT-NN SDK"
-)
-cpack_add_component(ttnn-dev GROUP nn-dev)
+    cpack_add_component_group(nn-dev)
+    cpack_add_component(
+        nn-dev
+        DEPENDS
+            metalium-dev
+            nn
+        GROUP nn-dev
+        DESCRIPTION "TT-NN SDK"
+    )
+    cpack_add_component(ttnn-dev GROUP nn-dev)
 
-cpack_add_component_group(nn-examples)
-cpack_add_component(nn-examples DEPENDS nn-dev GROUP nn-examples DESCRIPTION "TT-NN examples")
-cpack_add_component(ttnn-examples GROUP nn-examples)
+    cpack_add_component_group(nn-examples)
+    cpack_add_component(nn-examples DEPENDS nn-dev GROUP nn-examples DESCRIPTION "TT-NN examples")
+    cpack_add_component(ttnn-examples GROUP nn-examples)
 
-cpack_add_component_group(nn-validation)
-cpack_add_component(
-    nn-validation
-    DEPENDS
-        nn
-        metalium
-        metalium-validation
-    GROUP nn-validation
-    DESCRIPTION "TT-NN validation tools"
-)
-cpack_add_component(ttnn-validation GROUP nn-validation)
+    cpack_add_component_group(nn-validation)
+    cpack_add_component(
+        nn-validation
+        DEPENDS
+            nn
+            metalium
+            metalium-validation
+        GROUP nn-validation
+        DESCRIPTION "TT-NN validation tools"
+    )
+    cpack_add_component(ttnn-validation GROUP nn-validation)
+endif()
 
-cpack_add_component_group(ml)
-cpack_add_component(
-    ml
-    DEPENDS
-        nn
-        metalium
-    GROUP ml
-    DESCRIPTION "TT-Train runtime library"
-)
-cpack_add_component(ttml GROUP ml)
+if(BUILD_TT_TRAIN)
+    cpack_add_component_group(ml)
+    cpack_add_component(
+        ml
+        DEPENDS
+            nn
+            metalium
+        GROUP ml
+        DESCRIPTION "TT-Train runtime library"
+    )
+    cpack_add_component(ttml GROUP ml)
+endif()
 
 include(CPack)

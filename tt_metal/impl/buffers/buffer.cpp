@@ -501,6 +501,7 @@ BufferImpl::BufferImpl(
     shard_spec_(sharding_args.shard_spec()),
     buffer_distribution_spec_(sharding_args.buffer_distribution_spec()),
     per_core_allocation_(experimental::per_core_allocation::is_per_core_allocation(sharding_args)),
+    per_core_address_mode_(experimental::per_core_allocation::get_address_mode(sharding_args)),
     range_lockstep_allocation_(experimental::range_lockstep_allocation::is_range_lockstep_allocation(sharding_args)) {
     TT_FATAL(this->device_ != nullptr, "Device needs to not be null.");
     // BufferShardingArgs does not know the buffer type; this is the first point where both are visible.

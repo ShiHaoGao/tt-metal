@@ -155,7 +155,7 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
         TT_FATAL(num_cores.has_value(), "Interleaved allocation is disabled, see validate_num_banks");
     }
 
-    // Per-core allocation path: each core gets an independent address
+    // Per-core ownership: independent addresses or one address on selected banks
     if (buffer->impl().per_core_allocation_) {
         TT_FATAL(
             config_->allocator_mode == AllocatorMode::HYBRID,
@@ -168,6 +168,56 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
         auto cores = corerange_to_cores(grid, std::nullopt, row_major);
         TT_FATAL(!cores.empty(), "per_core_allocation: shard grid resolved to zero cores");
         DeviceAddr alloc_size = buffer->aligned_size_per_bank();
+
+        if (buffer->impl().per_core_address_mode_ ==
+            experimental::per_core_allocation::AddressMode::Common) {
+            TT_FATAL(allocated_buffers_.count(buffer) == 0 && buffer->impl().per_core_addresses_.empty(),
+                     "Common-core buffer already owns an allocation");
+            // Resolve every core and prepare all host storage before touching
+            // any bank. A missing/service core or duplicate bank must fail
+            // before the first reservation, never be silently omitted.
+            std::vector<AllocatorID> banks;
+            banks.reserve(cores.size());
+            std::unordered_set<uint32_t> selected;
+            selected.reserve(cores.size());
+            std::unordered_map<CoreCoord, DeviceAddr> addrs;
+            addrs.reserve(cores.size());
+            std::vector<std::pair<DeviceAddr, DeviceAddr>> persistent_ranges;
+            for (const auto& core : cores) {
+                const auto& ids = logical_core_to_bank_ids_.at(BufferType::L1).at(core);
+                TT_FATAL(ids.size() == 1 && selected.insert(ids.front()).second,
+                         "Common-core allocation requires one distinct L1 bank per core");
+                banks.push_back(AllocatorID{ids.front() + 1});
+                TT_FATAL(addrs.emplace(core, 0).second, "Common-core allocation repeats a core");
+                const auto occupied = persistent_l1_.occupied_ranges(core);
+                persistent_ranges.insert(persistent_ranges.end(), occupied.begin(), occupied.end());
+            }
+            const DeviceAddr common = l1_manager_->allocate_buffer_on_banks(
+                alloc_size, page_size, bottom_up, config_->compute_grid, banks, persistent_ranges);
+            try {
+                for (auto& [core, addr] : addrs) {
+                    addr = common;
+                }
+                TT_FATAL(allocated_buffers_.insert(buffer).second,
+                         "Common-core buffer is already registered with this allocator");
+                if (tracking_enabled_ && !unsafe_tracked_ids_by_manager_and_trace_.empty()) [[unlikely]] {
+                    this->record_allocation_if_unsafe(buffer);
+                }
+                // Publish only after every bank and owner record succeeded.
+                buffer->impl().per_core_addresses_.swap(addrs);
+            } catch (...) {
+                for (const auto bank : banks) {
+                    l1_manager_->deallocate_buffer(common, bank);
+                }
+                allocated_buffers_.erase(buffer);
+                this->record_deallocation(buffer->unique_id());
+                throw;
+            }
+            return common;
+        }
+        TT_FATAL(buffer->impl().per_core_address_mode_ ==
+                     experimental::per_core_allocation::AddressMode::Independent,
+                 "Unknown per-core address mode");
 
         std::unordered_map<CoreCoord, DeviceAddr> addrs;
         for (const auto& core : cores) {

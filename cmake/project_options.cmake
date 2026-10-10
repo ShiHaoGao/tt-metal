@@ -14,6 +14,10 @@ option(ENABLE_LIBCXX "Enable using libc++" OFF)
 option(ENABLE_BUILD_TIME_TRACE "Enable build time trace (Clang only -ftime-trace)" OFF)
 option(BUILD_SHARED_LIBS "Create shared libraries" ON)
 option(BUILD_PROGRAMMING_EXAMPLES "Enables build of tt_metal programming examples" OFF)
+# Keep the general SDK build unchanged; embedding consumers can select Metalium only.
+option(TT_METAL_BUILD_TTNN "Build the TTNN library and its package exports" ON)
+option(TT_METAL_BUILD_TOOLS "Build standalone Metalium tools and precompiled firmware" ON)
+option(TT_METAL_BUILD_PROFILER_TOOLS "Build Tracy CLI and WASM tools independently of TracyClient" ON)
 option(TT_METAL_BUILD_TESTS "Enables build of tt_metal tests" OFF)
 option(TTNN_BUILD_TESTS "Enables build of ttnn tests" OFF)
 option(ENABLE_CCACHE "Build with compiler cache" FALSE)
@@ -37,6 +41,10 @@ if(TT_METAL_USE_EMULE)
 endif()
 
 ###########################################################################################
+
+if(NOT TT_METAL_BUILD_TTNN AND (TTNN_BUILD_TESTS OR BUILD_TT_TRAIN))
+    message(FATAL_ERROR "TTNN_BUILD_TESTS and BUILD_TT_TRAIN require TT_METAL_BUILD_TTNN=ON.")
+endif()
 
 if(WITH_PYTHON_BINDINGS)
     message(STATUS "Building with Python Bindings: nanobind")

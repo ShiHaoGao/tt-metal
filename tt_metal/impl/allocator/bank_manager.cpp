@@ -595,6 +595,143 @@ uint64_t BankManager::allocate_buffer(
     return address.value();
 }
 
+DeviceAddr BankManager::allocate_buffer_on_banks(
+    DeviceAddr size_per_bank,
+    DeviceAddr page_size,
+    bool bottom_up,
+    const CoreRangeSet& compute_grid,
+    const std::vector<AllocatorDependencies::AllocatorID>& allocator_ids,
+    const std::vector<std::pair<DeviceAddr, DeviceAddr>>& additional_occupied_ranges) {
+    TT_FATAL(buffer_type_ == BufferType::L1, "Common-core allocation requires L1 banks");
+    TT_FATAL(!allocator_ids.empty(), "Common-core allocation requires at least one bank");
+    TT_FATAL(allocator_ids.size() <= compute_grid.num_cores(), "Common-core bank count exceeds the compute grid");
+    TT_FATAL(size_per_bank > 0 && page_size > 0 && size_per_bank % page_size == 0,
+             "Common-core allocation requires positive page-multiple geometry");
+    TT_FATAL(alignment_bytes_ > 0 &&
+                 page_size <= std::numeric_limits<DeviceAddr>::max() - (alignment_bytes_ - 1),
+             "Common-core page geometry overflows alignment");
+    const DeviceAddr padded_page =
+        ((page_size + alignment_bytes_ - 1) / alignment_bytes_) * alignment_bytes_;
+    const DeviceAddr pages = size_per_bank / page_size;
+    TT_FATAL(pages <= std::numeric_limits<DeviceAddr>::max() / padded_page,
+             "Common-core padded bank geometry overflows address width");
+    const DeviceAddr bytes =
+        tt::tt_metal::detail::calculate_bank_size_spread(size_per_bank, page_size, 1, alignment_bytes_);
+
+    std::unordered_set<uint32_t> selected;
+    selected.reserve(allocator_ids.size());
+    for (const auto id : allocator_ids) {
+        TT_FATAL(id.get() > 0 && id.get() <= num_banks() &&
+                     id.get() < allocator_dependencies_.num_allocators() && selected.insert(id.get()).second,
+                 "Common-core allocation requires distinct valid non-lockstep banks");
+        const auto& dependencies = allocator_dependencies_.dependencies[id.get()];
+        TT_FATAL(dependencies.size() == 1 && dependencies.front().get() == 0,
+                 "Common-core allocation requires HYBRID per-bank dependencies");
+        TT_FATAL(get_allocator_from_id(id), "Common-core bank allocator is not initialized");
+    }
+    for (const auto& range : additional_occupied_ranges) {
+        TT_FATAL(range.first < range.second, "Common-core external reservation is empty or reversed");
+    }
+
+    // Freeze the actual free intersection before reserving anything. Each
+    // bank subtracts its own occupancy, its lockstep dependency, and only the
+    // caller-selected cores' external/persistent ranges. No allocator 0 block
+    // is created, and no unselected bank contributes an allocation constraint.
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> common;
+    bool first = true;
+    for (const auto id : allocator_ids) {
+        auto available = compute_available_addresses(id, bytes, 0, additional_occupied_ranges);
+        if (first) {
+            common = std::move(available);
+            first = false;
+            continue;
+        }
+        std::vector<std::pair<DeviceAddr, DeviceAddr>> intersection;
+        size_t left = 0;
+        size_t right = 0;
+        while (left < common.size() && right < available.size()) {
+            const DeviceAddr begin = std::max(common[left].first, available[right].first);
+            const DeviceAddr end = std::min(common[left].second, available[right].second);
+            if (begin < end) {
+                intersection.emplace_back(begin, end);
+            }
+            if (common[left].second < available[right].second) {
+                ++left;
+            } else {
+                ++right;
+            }
+        }
+        common = std::move(intersection);
+    }
+    std::optional<DeviceAddr> chosen;
+    if (bottom_up) {
+        for (const auto& [begin, end] : common) {
+            const DeviceAddr remainder = begin % alignment_bytes_;
+            const DeviceAddr padding = remainder == 0 ? 0 : alignment_bytes_ - remainder;
+            if (padding <= end - begin && bytes <= end - begin - padding) {
+                chosen = begin + padding;
+                break;
+            }
+        }
+    } else {
+        for (auto range = common.rbegin(); range != common.rend(); ++range) {
+            if (bytes > range->second - range->first) {
+                continue;
+            }
+            const DeviceAddr latest = range->second - bytes;
+            const DeviceAddr aligned = latest - latest % alignment_bytes_;
+            if (aligned >= range->first) {
+                chosen = aligned;
+                break;
+            }
+        }
+    }
+    TT_FATAL(chosen.has_value(), "Out of Memory: no common aligned interval on the selected L1 banks");
+
+    // Insert all host bookkeeping before physical reservations. In particular,
+    // unordered_set node-allocation failure cannot lose a newly reserved bank.
+    // The owning AllocatorImpl mutex covers preflight, insertion and rollback.
+    size_t inserted = 0;
+    size_t attempted = 0;
+    try {
+        for (const auto id : allocator_ids) {
+            TT_FATAL(allocated_buffers_[id.get()].insert(*chosen).second,
+                     "Common-core reservation already exists in a selected bank");
+            ++inserted;
+        }
+        for (const auto id : allocator_ids) {
+            ++attempted;
+            const auto address = get_allocator_from_id(id)->allocate_at_address(*chosen, bytes);
+            TT_FATAL(address.has_value() && *address == *chosen,
+                     "Common-core bank failed to reserve its selected address");
+        }
+    } catch (...) {
+        // Include the attempted bank: a throwing algorithm may already have
+        // recorded its allocation. Never call AllocatorImpl::deallocate_buffer
+        // here, since its mutex is already held by the caller.
+        for (size_t index = 0; index < attempted; ++index) {
+            auto* allocator = get_allocator_from_id(allocator_ids[index]);
+            if (allocator->get_allocation_size(*chosen).has_value()) {
+                allocator->deallocate(*chosen);
+            }
+        }
+        for (size_t index = 0; index < inserted; ++index) {
+            allocated_buffers_[allocator_ids[index].get()].erase(*chosen);
+        }
+        for (const auto id : allocator_ids) {
+            invalidate_allocated_ranges_cache_for_dependent_allocators(id);
+        }
+        throw;
+    }
+    for (const auto id : allocator_ids) {
+        invalidate_allocated_ranges_cache_for_dependent_allocators(id);
+    }
+    if (tracking_high_water_mark_) {
+        allocation_high_water_mark_ = std::max(allocation_high_water_mark_, *chosen + bytes);
+    }
+    return *chosen;
+}
+
 void BankManager::deallocate_buffer(DeviceAddr address, BankManager::AllocatorDependencies::AllocatorID allocator_id) {
     auto* alloc = this->get_allocator_from_id(allocator_id);
     TT_FATAL(alloc, "Allocator not initialized!");

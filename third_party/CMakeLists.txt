@@ -146,16 +146,18 @@ CPMAddPackage(
 # googletest
 ############################################################################################################################
 
-CPMAddPackage(
-    NAME GTest
-    GITHUB_REPOSITORY google/googletest
-    GIT_TAG v1.13.0
-    VERSION 1.13.0
-    OPTIONS
-        "INSTALL_GTEST OFF"
-        "BUILD_SHARED_LIBS OFF"
-)
-CPMRegisterPackage("googletest" "1.13.0")
+if(TT_METAL_BUILD_TESTS OR TTNN_BUILD_TESTS OR TT_UMD_BUILD_TESTS OR TT_UMD_BUILD_ALL OR BUILD_TT_TRAIN)
+    CPMAddPackage(
+        NAME GTest
+        GITHUB_REPOSITORY google/googletest
+        GIT_TAG v1.13.0
+        VERSION 1.13.0
+        OPTIONS
+            "INSTALL_GTEST OFF"
+            "BUILD_SHARED_LIBS OFF"
+    )
+    CPMRegisterPackage("googletest" "1.13.0")
+endif()
 
 ############################################################################################################################
 # boost-ext reflect : https://github.com/boost-ext/reflect
@@ -221,32 +223,34 @@ CPMAddPackage(
 # nanobind : https://github.com/wjakob/nanobind
 ############################################################################################################################
 
-# GTest's own CMake (googletest/cmake/internal_utils.cmake) already calls
-# find_package(Python COMPONENTS Interpreter), which defines a Python::Interpreter target but no
-# Python::Module target. nanobind >= 2.13 only self-detects Python when *both* Python::Interpreter
-# and Python::Module are missing (previously: *either*), so with a partial Python::Interpreter
-# target already in scope, nanobind skips its own find_package(Python) call and fails when
-# nanobind-config.cmake asserts that Python::Module also exists. Find both components explicitly
-# here so nanobind sees a complete target set.
-find_package(
-    Python
-    REQUIRED
-    COMPONENTS
-        Interpreter
-        Development.Module
-    OPTIONAL_COMPONENTS
-        Development.SABIModule
-)
+if((TT_METAL_BUILD_TTNN AND WITH_PYTHON_BINDINGS) OR TT_UMD_BUILD_PYTHON OR TT_UMD_BUILD_ALL OR BUILD_TT_TRAIN)
+    # GTest's own CMake (googletest/cmake/internal_utils.cmake) already calls
+    # find_package(Python COMPONENTS Interpreter), which defines a Python::Interpreter target but no
+    # Python::Module target. nanobind >= 2.13 only self-detects Python when *both* Python::Interpreter
+    # and Python::Module are missing (previously: *either*), so with a partial Python::Interpreter
+    # target already in scope, nanobind skips its own find_package(Python) call and fails when
+    # nanobind-config.cmake asserts that Python::Module also exists. Find both components explicitly
+    # here so nanobind sees a complete target set.
+    find_package(
+        Python
+        REQUIRED
+        COMPONENTS
+            Interpreter
+            Development.Module
+        OPTIONAL_COMPONENTS
+            Development.SABIModule
+    )
 
-CPMAddPackage(
-    NAME nanobind
-    GITHUB_REPOSITORY wjakob/nanobind
-    GIT_TAG
-        86e5626728fc282637a6c338597120913dded1bb # 2.14.0
-    OPTIONS
-        "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
-        "NB_USE_SUBMODULE_DEPS ON"
-)
+    CPMAddPackage(
+        NAME nanobind
+        GITHUB_REPOSITORY wjakob/nanobind
+        GIT_TAG
+            86e5626728fc282637a6c338597120913dded1bb # 2.14.0
+        OPTIONS
+            "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
+            "NB_USE_SUBMODULE_DEPS ON"
+    )
+endif()
 
 ############################################################################################################################
 # nlohmann/json : https://github.com/nlohmann/json
@@ -322,23 +326,25 @@ endforeach()
 # benchmark : https://github.com/google/benchmark
 ############################################################################################################################
 
-CPMAddPackage(
-    NAME benchmark
-    GITHUB_REPOSITORY google/benchmark
-    GIT_TAG v1.9.1
-    OPTIONS
-        "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
-        "BENCHMARK_USE_LIBCXX ${ENABLE_LIBCXX}"
-        "BENCHMARK_ENABLE_TESTING OFF"
-)
-
-if(benchmark_ADDED)
-    set_target_properties(
-        benchmark
-        PROPERTIES
-            LIBRARY_OUTPUT_DIRECTORY
-                "${CMAKE_BINARY_DIR}/lib"
+if(TT_METAL_BUILD_TOOLS OR TT_METAL_BUILD_TESTS OR TTNN_BUILD_TESTS OR BUILD_TT_TRAIN)
+    CPMAddPackage(
+        NAME benchmark
+        GITHUB_REPOSITORY google/benchmark
+        GIT_TAG v1.9.1
+        OPTIONS
+            "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
+            "BENCHMARK_USE_LIBCXX ${ENABLE_LIBCXX}"
+            "BENCHMARK_ENABLE_TESTING OFF"
     )
+
+    if(benchmark_ADDED)
+        set_target_properties(
+            benchmark
+            PROPERTIES
+                LIBRARY_OUTPUT_DIRECTORY
+                    "${CMAKE_BINARY_DIR}/lib"
+        )
+    endif()
 endif()
 
 ############################################################################################################################

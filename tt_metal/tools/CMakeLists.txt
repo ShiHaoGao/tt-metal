@@ -1,10 +1,19 @@
-add_subdirectory(watcher_dump)
-add_subdirectory(dispatch_telemetry_dump)
-add_subdirectory(lightmetal_runner)
-add_subdirectory(mem_bench)
-add_subdirectory(precompile_fw)
-add_subdirectory(native_firmware_bundle)
-add_subdirectory(jit_compile_server)
+if(TT_METAL_BUILD_TOOLS)
+    add_subdirectory(watcher_dump)
+    add_subdirectory(dispatch_telemetry_dump)
+    add_subdirectory(lightmetal_runner)
+    add_subdirectory(mem_bench)
+    add_subdirectory(precompile_fw)
+    add_subdirectory(jit_compile_server)
+endif()
+
+# Supplier publication remains explicitly buildable without entering the SDK's
+# default build. Tests of the supplier implementation remain test-owned.
+if(TT_METAL_BUILD_TOOLS OR TT_METAL_BUILD_TESTS)
+    add_subdirectory(native_firmware_bundle)
+else()
+    add_subdirectory(native_firmware_bundle EXCLUDE_FROM_ALL)
+endif()
 
 include(sources.cmake)
 

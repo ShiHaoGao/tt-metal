@@ -5,6 +5,7 @@
 #pragma once
 
 #include <tt-metalium/buffer.hpp>
+#include <tt-metalium/experimental/per_core_allocation/buffer.hpp>
 
 #include <optional>
 
@@ -29,6 +30,8 @@ public:
     std::optional<ShardSpecBuffer> shard_spec_;
     TensorMemoryLayout buffer_layout_ = TensorMemoryLayout::INTERLEAVED;
     bool per_core_allocation_ = false;
+    experimental::per_core_allocation::AddressMode per_core_address_mode_ =
+        experimental::per_core_allocation::AddressMode::Independent;
     bool range_lockstep_allocation_ = false;
 };
 
