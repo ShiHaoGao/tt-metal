@@ -9,7 +9,7 @@
 #include <set>
 #include <tuple>
 
-#include "hal/generated/dev_msgs.hpp"
+#include <tt-metalium/hal/generated/dev_msgs.hpp>
 #include "llrt/hal.hpp"
 
 namespace tt::tt_metal {

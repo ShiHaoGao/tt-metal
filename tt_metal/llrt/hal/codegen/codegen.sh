@@ -8,12 +8,13 @@ set -o nounset
 SRC_ROOT="$1"
 OUT_DIR="$2"
 # Optional 3rd arg: index (0, 1, 2) to regenerate only one file pair.
-# When omitted, all files are regenerated (backward compatible).
+# When omitted, all files are regenerated.
 SINGLE_INDEX="${3:-all}"
 
-PYTHON=python3
+# CMake passes its selected interpreter explicitly as the fourth argument.
+PYTHON="${4:-python3}"
 SCRIPT="$(realpath --relative-to "$SRC_ROOT" "${BASH_SOURCE[0]}")"
-SCRIPT_PY="$(dirname ${BASH_SOURCE[0]})/codegen.py"
+SCRIPT_PY="$(dirname "${BASH_SOURCE[0]}")/codegen.py"
 YEAR=$(date +%Y)
 
 declare -a SRC_FILES=(
@@ -70,7 +71,7 @@ EOF
 // It should not be used anywhere else.
 EOF
 
-    if ! $PYTHON "${SCRIPT_PY}" \
+    if ! "${PYTHON}" "${SCRIPT_PY}" \
                  --append_mode \
                  --driver_ns="::tt::tt_metal::hal_structs" \
                  --driver_include_path="llrt/struct_view_driver.hpp" \

@@ -26,15 +26,15 @@ using namespace tt::tt_metal::blackhole::dram;
 namespace tt::tt_metal::blackhole {
 
 namespace dram_dev_msgs {
-#include "hal/generated/dev_msgs_impl.hpp"
+#include <tt-metalium/hal/generated/dev_msgs_impl.hpp>
 }
 
 namespace dram_fabric_telemetry {
-#include "hal/generated/fabric_telemetry_impl.hpp"
+#include <tt-metalium/hal/generated/fabric_telemetry_impl.hpp>
 }
 
 namespace dram_realtime_profiler_msgs {
-#include "hal/generated/realtime_profiler_msgs_impl.hpp"
+#include <tt-metalium/hal/generated/realtime_profiler_msgs_impl.hpp>
 }
 
 HalCoreInfoType create_dram_mem_map() {

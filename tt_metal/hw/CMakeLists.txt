@@ -38,142 +38,17 @@ set(IRAM_OPTIONS
     ENABLE_IRAM # With IRAM
 )
 
-# determine sfpi version information
-set(SFPI_BASE "${PROJECT_SOURCE_DIR}/runtime")
-file(MAKE_DIRECTORY ${SFPI_BASE})
-
-# sfpi-info.sh generates a cmake script, which we include just below.
-execute_process(
-    COMMAND
-        ${CMAKE_CURRENT_SOURCE_DIR}/../sfpi-info.sh CMAKE txz
-    OUTPUT_FILE ${SFPI_BASE}/sfpi-version.cmake
-    COMMAND_ERROR_IS_FATAL ANY
-)
-# sfpi-info.sh sources sfpi-version, if either changes we should reconfigure
-set_property(
-    DIRECTORY
-    APPEND
-    PROPERTY
-        CMAKE_CONFIGURE_DEPENDS
-            "../sfpi-info.sh;../sfpi-version"
-)
-# this script sets a bunch of variables of the form SFPI_snake_case_name
-include(${SFPI_BASE}/sfpi-version.cmake)
-
-if(TT_USE_SYSTEM_SFPI)
-    # we'll use the system's version
-    set(SFPI_BASE "/opt/tenstorrent")
-elseif(NOT "${SFPI_hash}" STREQUAL "")
-    # download a toolchain
-    include(FetchContent)
-    FetchContent_Declare(
-        sfpi
-        URL
-            "${SFPI_url}/${SFPI_filename}"
-        URL_HASH "${SFPI_HASHTYPE}=${SFPI_hash}"
-        SOURCE_DIR
-        "${SFPI_BASE}/sfpi"
-    )
-    FetchContent_MakeAvailable(sfpi)
-else()
-    message(STATUS "No downloadable SFPI tarball for ${SFPI_arch} ${SFPI_dist}")
-    if(IS_READABLE "${SFPI_BASE}/${SFPI_filename}")
-        message(STATUS "Locally-built ${SFPI_filename} present")
-    else()
-        file(REMOVE_RECURSE "${SFPI_BASE}/sfpi")
-        message(
-            STATUS
-            "Building SFPI, this could take some time (~10 CPU-hours)\n"
-            "Logging to ${SFPI_BASE}/sfpi-build.log ..."
-        )
-        execute_process(
-            COMMAND
-                ${CMAKE_CURRENT_SOURCE_DIR}/../sfpi-info.sh BUILD ${SFPI_BASE}/sfpi-src
-            OUTPUT_FILE ${SFPI_BASE}/sfpi-build.log
-            COMMAND_ERROR_IS_FATAL ANY
-        )
-    endif()
-    if(EXISTS "${SFPI_BASE}/sfpi")
-        message(STATUS "Locally-built toolchain present")
-    else()
-        message(STATUS "Unpacking locally-built ${SFPI_filename}")
-        execute_process(
-            COMMAND
-                tar xJf ${SFPI_BASE}/${SFPI_filename}
-            WORKING_DIRECTORY ${SFPI_BASE}
-            COMMAND_ERROR_IS_FATAL ANY
-        )
-    endif()
+# Generated resources belong to the vendor binary tree in both standalone and
+# embedded builds. The embedding project may select the same runtime root.
+if(NOT DEFINED TT_METAL_RUNTIME_ROOT)
+    set(TT_METAL_RUNTIME_ROOT "${PROJECT_BINARY_DIR}/runtime")
 endif()
-
-set(GPP_CMD "${SFPI_BASE}/sfpi/compiler/bin/riscv-tt-elf-g++")
-if(NOT EXISTS "${GPP_CMD}")
-    message(FATAL_ERROR "GPP_CMD path '${GPP_CMD}' does not exist. Please check your configuration.")
-endif()
-
-execute_process(
-    COMMAND
-        ${GPP_CMD} --version
-    COMMAND
-        sed -e "1{s/^[^ ]* //;p}" -e d
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    OUTPUT_VARIABLE GPP_VERSION
-)
-
-message(STATUS "Using SFPI compiler: ${GPP_CMD} ${GPP_VERSION}")
-# check this is the version we want (the system version might be wrong)
-string(REGEX REPLACE "^\\([^:]+:([^[)]+)(\\[[0-9]+\\])?\\) .*$" "\\1" GPP_VERSION ${GPP_VERSION})
-if(NOT ${GPP_VERSION} STREQUAL "${SFPI_version}")
-    if(TT_USE_SYSTEM_SFPI)
-        message(
-            FATAL_ERROR
-            "Installed SFPI version ${GPP_VERSION} does not match required version ${SFPI_version}\nYou need to run `${PROJECT_SOURCE_DIR}/install_dependencies.sh --sfpi`."
-        )
-    else()
-        message(FATAL_ERROR "SFPI packaging malfunction, ${SFPI_version} delivers ${GPP_VERSION}")
-    endif()
-endif()
-
-if(NOT TT_USE_SYSTEM_SFPI)
-    # Check each executable is loadable, as the user might not have installed the dependencies
-    # \tlibcsfml-window.so.2.2 => not found
-    # undefined symbol: blob\t(./a.out)
-    file(
-        GLOB SFPI_BINARIES
-        "${SFPI_BASE}/sfpi/compiler/bin/*"
-        "${SFPI_BASE}/sfpi/compiler/libexec/gcc/riscv-tt-elf/*/*"
-    )
-    execute_process(
-        COMMAND
-            echo ${SFPI_BINARIES}
-        COMMAND
-            sed "s/;/ /g"
-        COMMAND
-            xargs file
-        COMMAND
-            sed -e "/ELF ..-bit .SB executable,/{s/:.*//;p}" -e d
-        COMMAND
-            xargs ldd -d
-        COMMAND
-            sed -e "/=> not found/p" -e "/undefined symbol/{s/\t(.*)$//;p}" -e d
-        COMMAND
-            sort -u
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        OUTPUT_VARIABLE SFPI_UNMET
-    )
-    if(NOT "${SFPI_UNMET}" STREQUAL "")
-        message(NOTICE "Unsatisfied dependencies:\n${SFPI_UNMET}")
-        message(
-            FATAL_ERROR
-            "SFPI has unsatisfied dependencies. Either\n* set TT_USE_SYSTEM_SFPI and run install_dependencies.sh --install-sfpi, or\n* install the missing packages, or\n* (expert level) build your own sfpi and point sfpi-version at it"
-        )
-    endif()
-endif()
+include(cmake/SFPI.cmake)
 
 # old-style
 foreach(ARCH IN LISTS ARCHS)
     set(HW_INCLUDE "${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/internal/tt-1xx/${ARCH}")
-    set(HW_OUTPUT_DIR "runtime/hw/toolchain/${ARCH}")
+    set(HW_OUTPUT_DIR "${TT_METAL_RUNTIME_ROOT}/hw/toolchain/${ARCH}")
     string(TOUPPER ${ARCH} ARCH_DEFINE)
 
     set(ARCH_PROCS ${PROCS})
@@ -193,20 +68,24 @@ foreach(ARCH IN LISTS ARCHS)
 
                 add_custom_command(
                     OUTPUT
-                        ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                        ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
                     COMMAND
-                        ${CMAKE_CXX_COMPILER} ${IRAM_FLAG} -I${HW_INCLUDE} -E -P -x c -o
-                        ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                        ${CMAKE_COMMAND} -E make_directory ${HW_OUTPUT_DIR}
+                    COMMAND
+                        ${CMAKE_CXX_COMPILER} ${IRAM_FLAG} -I${HW_INCLUDE} -E -P -x c
+                        -MMD -MF ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}.d -MT ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                        -o ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/erisc-b0-${SCRIPT_TYPE}.ld
                     DEPENDS
                         ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
                         ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/erisc-b0-${SCRIPT_TYPE}.ld
                         ${HW_INCLUDE}/dev_mem_map.h
+                    DEPFILE ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}.d
                     COMMENT "Preprocessing ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}${IRAM_COMMENT}"
                     VERBATIM
                 )
 
-                list(APPEND LD_FILES ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE})
+                list(APPEND LD_FILES ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE})
             endforeach()
         endforeach()
     elseif(ARCH STREQUAL "blackhole")
@@ -223,23 +102,26 @@ foreach(ARCH IN LISTS ARCHS)
             # custom command to preprocess/generate the output file
             add_custom_command(
                 OUTPUT
-                    ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                    ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
                 COMMAND
                     ${CMAKE_COMMAND} -E make_directory ${HW_OUTPUT_DIR}
                 COMMAND
                     ${CMAKE_CXX_COMPILER} -DTYPE_${TYPE_DEFINE} -DCOMPILE_FOR_${PROC_DEFINE} -DARCH_${ARCH_DEFINE}
-                    -I${HW_INCLUDE} -E -P -x c -o ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                    -I${HW_INCLUDE} -E -P -x c
+                    -MMD -MF ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}.d -MT ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                    -o ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/main.ld
                 DEPENDS
                     ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
                     ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/main.ld
                     ${HW_INCLUDE}/dev_mem_map.h
+                DEPFILE ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}.d
                 COMMENT "Preprocessing ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}"
                 VERBATIM
             )
 
             # add output file to the custom target
-            list(APPEND LD_FILES ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE})
+            list(APPEND LD_FILES ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE})
         endforeach()
     endforeach()
 endforeach()
@@ -249,7 +131,7 @@ foreach(ARCH_CPU IN LISTS TLS_ARCH_CPUS)
     string(REPLACE ":" ";" ARCH_CPU_LIST ${ARCH_CPU})
     list(GET ARCH_CPU_LIST 0 ARCH)
     set(HW_INCLUDE "${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/internal/tt-2xx/${ARCH}")
-    set(HW_OUTPUT_DIR "runtime/hw/toolchain/${ARCH}")
+    set(HW_OUTPUT_DIR "${TT_METAL_RUNTIME_ROOT}/hw/toolchain/${ARCH}")
     string(TOUPPER ${ARCH} ARCH_DEFINE)
 
     foreach(PROC IN LISTS TLS_PROCS)
@@ -277,22 +159,25 @@ foreach(ARCH_CPU IN LISTS TLS_ARCH_CPUS)
                 # custom command to preprocess/generate the output file
                 add_custom_command(
                     OUTPUT
-                        ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                        ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
                     COMMAND
-                        ${CMAKE_COMMAND} -E make_directory ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}
+                        ${CMAKE_COMMAND} -E make_directory ${HW_OUTPUT_DIR}
                     COMMAND
                         ${CMAKE_CXX_COMPILER} -DTYPE_${TYPE_DEFINE} -DCOMPILE_FOR_${PROC_DEFINE} -DARCH_${ARCH_DEFINE}
-                        -I${HW_INCLUDE} -E -P -x c -o ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                        -I${HW_INCLUDE} -E -P -x c
+                        -MMD -MF ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}.d -MT ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
+                        -o ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/script_tng.ld
                     DEPENDS
                         ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
                         ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/script_tng.ld
+                    DEPFILE ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}.d
                     COMMENT "Preprocessing ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE}"
                     VERBATIM
                 )
 
                 # add output file to the custom target
-                list(APPEND LD_FILES ${PROJECT_SOURCE_DIR}/${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE})
+                list(APPEND LD_FILES ${HW_OUTPUT_DIR}/${HW_OUTPUT_FILE})
             endforeach()
         endforeach()
     endforeach()
@@ -353,7 +238,7 @@ foreach(ARCH IN LISTS ARCHS)
     )
 
     # Dump object files to this directory
-    set(HW_OBJ_DIR ${PROJECT_SOURCE_DIR}/runtime/hw/lib/${ARCH})
+    set(HW_OBJ_DIR ${TT_METAL_RUNTIME_ROOT}/hw/lib/${ARCH})
 
     # Includes independent from ARCH
     set(GPP_INCLUDES
@@ -396,11 +281,15 @@ foreach(ARCH IN LISTS ARCHS)
             COMMAND
                 ${CMAKE_COMMAND} -E make_directory ${HW_OBJ_DIR}
             COMMAND
-                ${GPP_CMD} ${GPP_FLAGS} ${GPP_DEFINES} ${GPP_INCLUDES} -c -o ${HW_OUTPUT_FILE}
+                ${GPP_CMD} ${GPP_FLAGS} ${GPP_DEFINES} ${GPP_INCLUDES}
+                -MMD -MF ${HW_OUTPUT_FILE}.d -MT ${HW_OUTPUT_FILE} -c -o ${HW_OUTPUT_FILE}
                 ${PROJECT_SOURCE_DIR}/${HWSRC}
             DEPENDS
                 ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
                 ${PROJECT_SOURCE_DIR}/${HWSRC}
+                ${GPP_CMD}
+                sfpi_toolchain
+            DEPFILE ${HW_OUTPUT_FILE}.d
             COMMENT "Building ${ARCH} hw lib ${HWOBJ}"
             VERBATIM
         )
@@ -432,7 +321,7 @@ foreach(ARCH_CPU IN LISTS TLS_ARCH_CPUS)
         -I${PROJECT_SOURCE_DIR}/tt_metal/hw/ckernels/${ARCH}/metal/common
         -I${PROJECT_SOURCE_DIR}/tt_metal/hw/ckernels/${ARCH}/metal/llk_io
     )
-    set(HW_OBJ_DIR ${PROJECT_SOURCE_DIR}/runtime/hw/lib/${ARCH})
+    set(HW_OBJ_DIR ${TT_METAL_RUNTIME_ROOT}/hw/lib/${ARCH})
     set(HW_OBJ_PATTERNS
         "substitutes.o:tt_metal/hw/toolchain/substitutes.cpp"
         "crt0-tls.o:tt_metal/hw/toolchain/crt0-tls.S"
@@ -472,11 +361,16 @@ foreach(ARCH_CPU IN LISTS TLS_ARCH_CPUS)
                 COMMAND
                     ${CMAKE_COMMAND} -E make_directory ${HW_OBJ_DIR}
                 COMMAND
-                    ${GPP_CMD} ${GPP_FLAGS} ${GPP_DEFINES} ${GPP_INCLUDES} -c -o ${HW_OBJ_DIR}/${HW_OBJ_FILE}
+                    ${GPP_CMD} ${GPP_FLAGS} ${GPP_DEFINES} ${GPP_INCLUDES}
+                    -MMD -MF ${HW_OBJ_DIR}/${HW_OBJ_FILE}.d -MT ${HW_OBJ_DIR}/${HW_OBJ_FILE}
+                    -c -o ${HW_OBJ_DIR}/${HW_OBJ_FILE}
                     ${PROJECT_SOURCE_DIR}/${HWSRC}
                 DEPENDS
                     ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
                     ${PROJECT_SOURCE_DIR}/${HWSRC}
+                    ${GPP_CMD}
+                    sfpi_toolchain
+                DEPFILE ${HW_OBJ_DIR}/${HW_OBJ_FILE}.d
                 COMMENT "Building ${ARCH}:${CPU} hw lib ${HW_OBJ_FILE} from ${HWSRC}"
                 VERBATIM
             )
@@ -522,7 +416,7 @@ target_sources(
         FILES ${blackhole_kernels} ${wormhole_kernels} ${HW_JIT_API_HEADERS}
         FILE_SET toolchain
         TYPE HEADERS
-        BASE_DIRS ${PROJECT_SOURCE_DIR}
+        BASE_DIRS ${TT_METAL_RUNTIME_ROOT}
         FILES ${LD_FILES} ${OBJ_FILES}
 )
 
@@ -540,6 +434,6 @@ install(
         COMPONENT metalium-runtime
     FILE_SET
     toolchain
-        DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium
+        DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/runtime
         COMPONENT metalium-runtime
 )

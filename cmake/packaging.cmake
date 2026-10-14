@@ -1,3 +1,46 @@
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    ${PROJECT_BINARY_DIR}/tt-metalium-config-version.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+configure_package_config_file(
+    ${CMAKE_CURRENT_LIST_DIR}/packaging.d/tt-metalium-config.cmake.in
+    ${PROJECT_BINARY_DIR}/tt-metalium-config.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-metalium
+)
+install(
+    FILES
+        ${PROJECT_BINARY_DIR}/tt-metalium-config.cmake
+        ${PROJECT_BINARY_DIR}/tt-metalium-config-version.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-metalium
+    COMPONENT metalium-dev
+)
+
+if(TT_METAL_BUILD_TTNN)
+    write_basic_package_version_file(
+        ${PROJECT_BINARY_DIR}/tt-nn-config-version.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+    configure_package_config_file(
+        ${CMAKE_CURRENT_LIST_DIR}/packaging.d/tt-nn-config.cmake.in
+        ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
+    )
+    install(
+        FILES
+            ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
+            ${PROJECT_BINARY_DIR}/tt-nn-config-version.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
+        COMPONENT ttnn-dev
+    )
+endif()
+
+if(NOT PROJECT_IS_TOP_LEVEL)
+    return()
+endif()
+
 set(CPACK_GENERATOR DEB)
 set(CPACK_PACKAGE_CONTACT "support@tenstorrent.com")
 set(CMAKE_PROJECT_HOMEPAGE_URL "https://tenstorrent.com")
@@ -52,45 +95,6 @@ set(CPACK_DEBIAN_TTML_PACKAGE_SHLIBDEPS FALSE)
 set(CPACK_DEBIAN_METALIUM-DEV_PACKAGE_DEPENDS "nlohmann-json3-dev (>= 3.10)")
 set(CPACK_DEBIAN_NN-DEV_PACKAGE_DEPENDS "libxtensor-dev (>= 0.23.10)")
 set(CPACK_DEBIAN_TTML_PACKAGE_DEPENDS "python3 (>= 3.8)")
-
-include(CMakePackageConfigHelpers)
-write_basic_package_version_file(
-    ${PROJECT_BINARY_DIR}/tt-metalium-config-version.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
-configure_package_config_file(
-    ${CMAKE_CURRENT_LIST_DIR}/packaging.d/tt-metalium-config.cmake.in
-    ${PROJECT_BINARY_DIR}/tt-metalium-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-metalium
-)
-install(
-    FILES
-        ${PROJECT_BINARY_DIR}/tt-metalium-config.cmake
-        ${PROJECT_BINARY_DIR}/tt-metalium-config-version.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-metalium
-    COMPONENT metalium-dev
-)
-
-if(TT_METAL_BUILD_TTNN)
-    write_basic_package_version_file(
-        ${PROJECT_BINARY_DIR}/tt-nn-config-version.cmake
-        VERSION ${PROJECT_VERSION}
-        COMPATIBILITY SameMajorVersion
-    )
-    configure_package_config_file(
-        ${CMAKE_CURRENT_LIST_DIR}/packaging.d/tt-nn-config.cmake.in
-        ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
-        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
-    )
-    install(
-        FILES
-            ${PROJECT_BINARY_DIR}/tt-nn-config.cmake
-            ${PROJECT_BINARY_DIR}/tt-nn-config-version.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tt-nn
-        COMPONENT ttnn-dev
-    )
-endif()
 
 get_cmake_property(CPACK_COMPONENTS_ALL COMPONENTS)
 list(

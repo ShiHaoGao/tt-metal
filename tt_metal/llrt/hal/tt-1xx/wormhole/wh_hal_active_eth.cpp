@@ -25,15 +25,15 @@ namespace tt::tt_metal::wormhole {
 
 // This file is intended to be wrapped inside arch-specific namespace.
 namespace active_eth_dev_msgs {
-#include "hal/generated/dev_msgs_impl.hpp"
+#include <tt-metalium/hal/generated/dev_msgs_impl.hpp>
 }
 
 namespace active_eth_fabric_telemetry {
-#include "hal/generated/fabric_telemetry_impl.hpp"
+#include <tt-metalium/hal/generated/fabric_telemetry_impl.hpp>
 }
 
 namespace active_eth_realtime_profiler_msgs {
-#include "hal/generated/realtime_profiler_msgs_impl.hpp"
+#include <tt-metalium/hal/generated/realtime_profiler_msgs_impl.hpp>
 }
 
 HalCoreInfoType create_active_eth_mem_map(bool is_base_routing_fw_enabled) {

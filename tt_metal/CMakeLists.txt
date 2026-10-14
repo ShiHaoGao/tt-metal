@@ -128,6 +128,7 @@ target_include_directories(
     PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/api>"
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/api>"
+        "$<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/generated>"
     PRIVATE
         api/tt-metalium # FIXME: Re-home the tests and remove this
 )
@@ -146,7 +147,9 @@ set_target_properties(
     tt_metal
     PROPERTIES
         INSTALL_RPATH
-            "/opt/openmpi-v5.0.7-ulfm/lib;$ORIGIN"
+            "$ORIGIN"
+        INSTALL_RPATH_USE_LINK_PATH
+            FALSE
         ADDITIONAL_CLEAN_FILES
             "${PROJECT_BINARY_DIR}/lib;${PROJECT_BINARY_DIR}/obj"
 )
@@ -158,6 +161,7 @@ endif()
 # Allow internal files to access the public API "by default" and without the
 # scoping that external consumers must use.  Scoping may still be used if desired.
 include_directories(
+    ${PROJECT_BINARY_DIR}/generated
     api
     api/tt-metalium
     ${CMAKE_CURRENT_BINARY_DIR}/api
@@ -173,6 +177,13 @@ add_subdirectory(tools)
 add_subdirectory(impl)
 add_subdirectory(detail)
 add_subdirectory(distributed)
+# Preserve non-system MPI directories from the actual linked target closure.
+# FindMPI may expose an interface target rather than a shared imported target,
+# so let CMake collect link paths instead of guessing an MPI installation root.
+# Single-host builds retain only the SDK-local $ORIGIN runtime search path.
+if(ENABLE_DISTRIBUTED AND TARGET OpenMPI::MPI)
+    set_property(TARGET tt_metal PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+endif()
 add_subdirectory(fabric)
 add_subdirectory(impl/experimental/udm)
 add_subdirectory(impl/experimental/noc_estimator)
@@ -186,6 +197,8 @@ if(TT_INSTALL)
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llrt COMPONENT metalium-dev)
     install(FILES impl/context/worker_stream_state_client.hpp
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/impl/context COMPONENT metalium-dev)
+    install(DIRECTORY "${PROJECT_BINARY_DIR}/generated/tt-metalium/hal"
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tt-metalium COMPONENT metalium-dev)
     install(
         TARGETS
             tt_metal

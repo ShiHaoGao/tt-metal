@@ -34,7 +34,7 @@
 #include "hostdevcommon/fabric_common.h"
 #include "fabric_host_utils.hpp"
 #include <tt-metalium/experimental/fabric/fabric_telemetry.hpp>
-#include "tt_metal/llrt/hal/generated/fabric_telemetry.hpp"
+#include <tt-metalium/hal/generated/fabric_telemetry.hpp>
 #include "distributed_context.hpp"
 #include <tt-metalium/experimental/fabric/fabric_types.hpp>
 #include "hal_types.hpp"

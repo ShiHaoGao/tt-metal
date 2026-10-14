@@ -6,7 +6,7 @@
 #include <buffer.hpp>
 #include <buffer_types.hpp>
 #include <circular_buffer_constants.h>
-#include "llrt/hal/generated/dev_msgs.hpp"
+#include <tt-metalium/hal/generated/dev_msgs.hpp>
 #include <core_coord.hpp>
 #include <device.hpp>
 #include <global_circular_buffer.hpp>

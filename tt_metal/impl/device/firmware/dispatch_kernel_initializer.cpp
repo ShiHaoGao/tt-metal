@@ -16,7 +16,7 @@
 
 #include "dispatch/topology.hpp"
 
-#include "llrt/hal/generated/dev_msgs.hpp"
+#include <tt-metalium/hal/generated/dev_msgs.hpp>
 
 namespace tt::llrt::internal_ {
 void wait_until_cores_done(

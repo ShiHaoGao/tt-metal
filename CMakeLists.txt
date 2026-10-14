@@ -36,6 +36,9 @@ project(
 )
 message(STATUS "Metalium version: ${PROJECT_VERSION}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+if(NOT DEFINED TT_METAL_RUNTIME_ROOT)
+    set(TT_METAL_RUNTIME_ROOT "${PROJECT_BINARY_DIR}/runtime")
+endif()
 GenerateVersionHeader()
 AddVersionHeaderTarget()
 
@@ -349,7 +352,7 @@ if(NOT TT_USE_SYSTEM_SFPI)
     # FIXME(17578): figure out what bits we actually need to ship and omit the rest
     install(
         DIRECTORY
-            runtime/sfpi
+            "${TT_METAL_RUNTIME_ROOT}/sfpi"
         DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/runtime
         USE_SOURCE_PERMISSIONS
         COMPONENT jit-build
@@ -360,7 +363,7 @@ endif()
 add_custom_target(
     clean-built
     COMMAND
-        ${CMAKE_COMMAND} -E remove_directory ${PROJECT_SOURCE_DIR}/built
+        ${CMAKE_COMMAND} -E remove_directory ${PROJECT_BINARY_DIR}/built
     COMMENT "Cleaning `built` directory"
 )
 

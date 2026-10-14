@@ -15,7 +15,7 @@
 #include "impl/device/device_manager.hpp"
 #include "impl/device/device_impl.hpp"
 #include "impl/dispatch/cq_shared_state.hpp"
-#include "llrt/hal/generated/dev_msgs.hpp"
+#include <tt-metalium/hal/generated/dev_msgs.hpp>
 #include "llrt/rtoptions.hpp"
 #include "llrt/llrt.hpp"
 #include "tt_cluster.hpp"

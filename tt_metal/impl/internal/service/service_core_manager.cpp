@@ -21,7 +21,7 @@
 
 #include <llrt/hal.hpp>
 #include "llrt/llrt.hpp"
-#include "llrt/hal/generated/dev_msgs.hpp"
+#include <tt-metalium/hal/generated/dev_msgs.hpp>
 
 namespace tt::tt_metal::internal {
 

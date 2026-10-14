@@ -14,7 +14,7 @@
 #include "dispatch/kernel_config/fd_kernel.hpp"
 #include "firmware_initializer.hpp"
 #include "firmware_images.hpp"
-#include "llrt/hal/generated/dev_msgs.hpp"
+#include <tt-metalium/hal/generated/dev_msgs.hpp>
 #include "llrt/worker_stream_state_provider.hpp"
 #include "llrt/tt_memory.h"
 #include "impl/experimental/native_kernel/native_image.hpp"

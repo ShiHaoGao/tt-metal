@@ -1,6 +1,8 @@
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+
 set(DEV_MSGS_CODEGEN_PY ${CMAKE_CURRENT_SOURCE_DIR}/codegen/codegen.py)
 set(DEV_MSGS_CODEGEN_SH ${CMAKE_CURRENT_SOURCE_DIR}/codegen/codegen.sh)
-set(HAL_GENERATED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/generated)
+set(HAL_GENERATED_DIR ${PROJECT_BINARY_DIR}/generated/tt-metalium/hal/generated)
 
 # ── Per-file codegen commands ──────────────────────────────────────────────────
 # Split into separate add_custom_command calls so that a change to dev_msgs.h
@@ -13,11 +15,12 @@ add_custom_command(
         ${HAL_GENERATED_DIR}/dev_msgs.hpp
         ${HAL_GENERATED_DIR}/dev_msgs_impl.hpp
     COMMAND
-        ${DEV_MSGS_CODEGEN_SH} ${PROJECT_SOURCE_DIR} ${HAL_GENERATED_DIR} 0
+        ${DEV_MSGS_CODEGEN_SH} ${PROJECT_SOURCE_DIR} ${HAL_GENERATED_DIR} 0 ${Python3_EXECUTABLE}
     DEPENDS
         ${DEV_MSGS_CODEGEN_PY}
         ${DEV_MSGS_CODEGEN_SH}
         ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/hostdev/dev_msgs.h
+    VERBATIM
 )
 
 # 2) fabric_telemetry
@@ -26,11 +29,12 @@ add_custom_command(
         ${HAL_GENERATED_DIR}/fabric_telemetry.hpp
         ${HAL_GENERATED_DIR}/fabric_telemetry_impl.hpp
     COMMAND
-        ${DEV_MSGS_CODEGEN_SH} ${PROJECT_SOURCE_DIR} ${HAL_GENERATED_DIR} 1
+        ${DEV_MSGS_CODEGEN_SH} ${PROJECT_SOURCE_DIR} ${HAL_GENERATED_DIR} 1 ${Python3_EXECUTABLE}
     DEPENDS
         ${DEV_MSGS_CODEGEN_PY}
         ${DEV_MSGS_CODEGEN_SH}
         ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/hostdev/fabric_telemetry_msgs.h
+    VERBATIM
 )
 
 # 3) realtime_profiler_msgs
@@ -39,11 +43,12 @@ add_custom_command(
         ${HAL_GENERATED_DIR}/realtime_profiler_msgs.hpp
         ${HAL_GENERATED_DIR}/realtime_profiler_msgs_impl.hpp
     COMMAND
-        ${DEV_MSGS_CODEGEN_SH} ${PROJECT_SOURCE_DIR} ${HAL_GENERATED_DIR} 2
+        ${DEV_MSGS_CODEGEN_SH} ${PROJECT_SOURCE_DIR} ${HAL_GENERATED_DIR} 2 ${Python3_EXECUTABLE}
     DEPENDS
         ${DEV_MSGS_CODEGEN_PY}
         ${DEV_MSGS_CODEGEN_SH}
         ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc/hostdev/realtime_profiler_msgs.h
+    VERBATIM
 )
 
 set(HAL_GENERATED_STRUCT_HEADERS

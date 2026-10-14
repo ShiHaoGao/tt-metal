@@ -26,15 +26,15 @@ namespace tt::tt_metal::quasar {
 
 // This file is intended to be wrapped inside arch/core-specific namespace.
 namespace tensix_dev_msgs {
-#include "hal/generated/dev_msgs_impl.hpp"
+#include <tt-metalium/hal/generated/dev_msgs_impl.hpp>
 }
 
 namespace tensix_fabric_telemetry {
-#include "hal/generated/fabric_telemetry_impl.hpp"
+#include <tt-metalium/hal/generated/fabric_telemetry_impl.hpp>
 }
 
 namespace tensix_realtime_profiler_msgs {
-#include "hal/generated/realtime_profiler_msgs_impl.hpp"
+#include <tt-metalium/hal/generated/realtime_profiler_msgs_impl.hpp>
 }
 
 HalCoreInfoType create_tensix_mem_map() {

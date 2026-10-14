@@ -163,20 +163,26 @@ if(TT_METAL_USE_EMULE)
     )
 endif()
 
-# Generate Inspector RPC stub file
-set(INSPECTOR_RPC_STUB_FILE ${PROJECT_SOURCE_DIR}/tools/triage/inspector_capnp.pyi)
-add_custom_command(
-    OUTPUT
-        ${INSPECTOR_RPC_STUB_FILE}
-    COMMAND
-        python3 ${CMAKE_CURRENT_SOURCE_DIR}/debug/inspector/generate_rpc_stub.py ${INSPECTOR_RPC_CAPNP}
-        ${INSPECTOR_RPC_STUB_FILE}
-    DEPENDS
-        ${INSPECTOR_RPC_CAPNP}
-        ${CMAKE_CURRENT_SOURCE_DIR}/debug/inspector/generate_rpc_stub.py
-    COMMENT "Generating RPC stub for ${INSPECTOR_RPC_CAPNP}"
-)
-add_custom_target(inspector_rpc_stub ALL DEPENDS ${INSPECTOR_RPC_STUB_FILE})
+# Python autocomplete metadata is a tool/binding product, not a native SDK
+# dependency. It must not create missing outputs on hosts without pycapnp.
+if(WITH_PYTHON_BINDINGS OR TT_METAL_BUILD_TOOLS)
+    # Generate Inspector RPC stub file
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(INSPECTOR_RPC_STUB_FILE ${PROJECT_BINARY_DIR}/tools/triage/inspector_capnp.pyi)
+    add_custom_command(
+        OUTPUT
+            ${INSPECTOR_RPC_STUB_FILE}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${PROJECT_BINARY_DIR}/tools/triage"
+        COMMAND
+            ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/debug/inspector/generate_rpc_stub.py ${INSPECTOR_RPC_CAPNP}
+            ${INSPECTOR_RPC_STUB_FILE}
+        DEPENDS
+            ${INSPECTOR_RPC_CAPNP}
+            ${CMAKE_CURRENT_SOURCE_DIR}/debug/inspector/generate_rpc_stub.py
+        COMMENT "Generating RPC stub for ${INSPECTOR_RPC_CAPNP}"
+    )
+    add_custom_target(inspector_rpc_stub ALL DEPENDS ${INSPECTOR_RPC_STUB_FILE})
 
-# Optionally, ensure impl depends on the stub file
-add_dependencies(impl inspector_rpc_stub)
+    # Optionally, ensure impl depends on the stub file
+    add_dependencies(impl inspector_rpc_stub)
+endif()

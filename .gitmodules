@@ -4,8 +4,8 @@
 	branch = master
 [submodule "tt_metal/third_party/umd"]
 	path = tt_metal/third_party/umd
-	url = https://github.com/tenstorrent/tt-umd.git
-	branch = main
+	url = https://github.com/Epiler-project/tt-umd.git
+	branch = trex/nested-build
 [submodule "tt_metal/third_party/tt-cluster-descriptors"]
 	path = tt_metal/third_party/tt-cluster-descriptors
 	url = https://github.com/tenstorrent/tt-cluster-descriptors.git

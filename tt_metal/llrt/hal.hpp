@@ -30,9 +30,9 @@
 
 #include "tt_memory.h"
 #include "hostdev/debug_ring_buffer_common.h"
-#include "hal/generated/dev_msgs.hpp"                // IWYU pragma: export
-#include "hal/generated/fabric_telemetry.hpp"        // IWYU pragma: export
-#include "hal/generated/realtime_profiler_msgs.hpp"  // IWYU pragma: export
+#include <tt-metalium/hal/generated/dev_msgs.hpp>                // IWYU pragma: export
+#include <tt-metalium/hal/generated/fabric_telemetry.hpp>        // IWYU pragma: export
+#include <tt-metalium/hal/generated/realtime_profiler_msgs.hpp>  // IWYU pragma: export
 
 #include <tt_stl/overloaded.hpp>
 #include <umd/device/types/core_coordinates.hpp>
