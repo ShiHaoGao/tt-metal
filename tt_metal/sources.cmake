@@ -7,6 +7,7 @@ set(TT_METAL_PUBLIC_API
     api/internal/reload_table.hpp
     api/tt-metalium/allocator.hpp
     api/tt-metalium/base_types.hpp
+    api/tt-metalium/build_identity.hpp
     api/tt-metalium/bfloat16.hpp
     api/tt-metalium/bfloat4.hpp
     api/tt-metalium/bfloat8.hpp
@@ -184,6 +185,7 @@ set(TT_METAL_PUBLIC_API
 )
 
 set(TT_METAL_SOURCES
+    impl/build_identity.cpp
     impl/host_api/tt_metal.cpp
     impl/experimental/offline_compile/offline_kernel_compile.cpp
     impl/graph/graph_tracking.cpp

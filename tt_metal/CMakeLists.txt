@@ -141,7 +141,13 @@ if(TT_METAL_USE_EMULE)
     target_link_options(tt_metal PRIVATE -rdynamic)
 endif()
 
-add_dependencies(tt_metal hw_toolchain)
+add_dependencies(tt_metal hw_toolchain tt_metal_version_header)
+# Only this translation unit records the SDK configuration. Keep that fact out
+# of public headers and avoid changing every SDK object's compile command.
+set_property(
+    SOURCE impl/build_identity.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS "TT_METAL_BUILD_TYPE=\"$<CONFIG>\""
+)
 
 set_target_properties(
     tt_metal
