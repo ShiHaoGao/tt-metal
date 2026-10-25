@@ -1938,42 +1938,56 @@ bool MeshDeviceImpl::is_mmio_capable() const {
 
 void MeshDeviceImpl::quiesce_internal() {
     metal_context().validate_worker_stream_state_access();
-    TT_FATAL(
-        get_active_sub_device_manager_id() == get_default_sub_device_manager_id(),
-        "Cannot quiesce when non-default sub-device manager is active");
-    for (const auto& submesh : submeshes_) {
-        if (auto submesh_ptr = submesh.lock()) {
-            submesh_ptr->quiesce_devices();
+    const auto validate_default_manager = [this] {
+        TT_FATAL(
+            get_active_sub_device_manager_id() == get_default_sub_device_manager_id(),
+            "Cannot quiesce when non-default sub-device manager is active");
+    };
+    std::vector<std::shared_ptr<MeshDevice>> submeshes;
+    {
+        auto lock = lock_api();
+        validate_default_manager();
+        for (const auto& submesh : submeshes_) {
+            if (auto submesh_ptr = submesh.lock()) submeshes.push_back(std::move(submesh_ptr));
         }
     }
-    // The launch message ring buffer and the worker GO mailboxes are shared across hardware CQs, so exactly
-    // one CQ resets them. Pick the last CQ that has work outstanding: wait_for_completion finishes each CQ in
-    // turn, so by then no other CQ can still have workers in flight whose GO mailboxes would be reset.
-    size_t launch_msg_reset_cq = mesh_command_queues_.size();
-    for (size_t cq_id = 0; cq_id < mesh_command_queues_.size(); ++cq_id) {
-        if (mesh_command_queues_[cq_id]->in_use()) {
-            launch_msg_reset_cq = cq_id;
+    for (const auto& submesh : submeshes) submesh->quiesce_devices();
+
+    std::vector<MeshCommandQueueBase*> completed_queues;
+    {
+        // No queue on this MeshDevice may enqueue between selecting the shared
+        // GO reset owner, draining the queues, and replacing their event epochs.
+        auto lock = lock_api();
+        validate_default_manager();
+        // The launch ring and GO mailboxes are shared across hardware CQs. Only
+        // the last used CQ resets them, after all earlier queues have drained.
+        size_t launch_msg_reset_cq = mesh_command_queues_.size();
+        for (size_t cq_id = 0; cq_id < mesh_command_queues_.size(); ++cq_id) {
+            if (mesh_command_queues_[cq_id]->in_use()) launch_msg_reset_cq = cq_id;
+        }
+        for (size_t cq_id = 0; cq_id < mesh_command_queues_.size(); ++cq_id) {
+            auto& command_queue = mesh_command_queues_[cq_id];
+            if (command_queue->wait_for_completion_nolock(cq_id == launch_msg_reset_cq))
+                completed_queues.push_back(command_queue.get());
+        }
+        for (auto& command_queue : mesh_command_queues_) {
+            command_queue->finish_and_reset_in_use_nolock();
+        }
+        // Each used CQ explicitly records zero in a new private event epoch;
+        // allocation never wraps UINT32_MAX into this quiescent state.
+        for (auto& command_queue : mesh_command_queues_) {
+            for (auto& device : get_devices()) {
+                TT_ASSERT(
+                    device->sysmem_manager().get_last_completed_event(command_queue->id()) == 0,
+                    "Last completed event is not 0");
+                TT_ASSERT(device->sysmem_manager().get_current_event(command_queue->id()) == 0, "Current event is not 0");
+            }
         }
     }
-    for (size_t cq_id = 0; cq_id < mesh_command_queues_.size(); ++cq_id) {
-        mesh_command_queues_[cq_id]->wait_for_completion(/*reset_launch_msg_state=*/cq_id == launch_msg_reset_cq);
-    }
-    for (auto& command_queue : mesh_command_queues_) {
-        command_queue->finish_and_reset_in_use();
-    }
+    for (auto* command_queue : completed_queues) command_queue->synchronize_quiescence();
 }
 
-void MeshDeviceImpl::quiesce_devices() {
-    quiesce_internal();
-    for (auto& command_queue : mesh_command_queues_) {
-        for (auto& device : get_devices()) {
-            TT_ASSERT(
-                device->sysmem_manager().get_last_completed_event(command_queue->id()) == 0,
-                "Last completed event is not 0");
-            TT_ASSERT(device->sysmem_manager().get_current_event(command_queue->id()) == 0, "Current event is not 0");
-        }
-    }
-}
+void MeshDeviceImpl::quiesce_devices() { quiesce_internal(); }
 
 // Allocator methods
 std::optional<DeviceAddr> MeshDeviceImpl::lowest_occupied_compute_l1_address() const {

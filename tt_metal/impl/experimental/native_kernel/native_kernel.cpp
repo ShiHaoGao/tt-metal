@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 #include "native_kernel.hpp"
+#include "impl/allocator/allocator_types.hpp"
 #include "impl/context/metal_env_accessor.hpp"
 #include "impl/context/metal_env_impl.hpp"
 #include "impl/program/program_impl.hpp"
 #include "llrt/llrt.hpp"
 #include "llrt/zone_meta.hpp"
+#include <algorithm>
+#include <set>
 #include <stdexcept>
 
 namespace tt::tt_metal {
@@ -85,6 +88,60 @@ void NativeElfKernel::validate_stream_owner(tt::worker_stream_state::Owner owner
         TT_FATAL(image.contract().worker_stream_owner == required,
                  "Native ELF worker stream ownership differs from Program");
     }
+}
+
+void NativeElfKernel::validate_managed_traffic() const {
+    if (const auto* dm = std::get_if<experimental::NativeDataMovementConfig>(&config_)) {
+        TT_FATAL(dm->noc_mode == NOC_MODE::DM_DYNAMIC_NOC,
+                 "Managed native DM requires the actual dynamic NoC counter producer");
+    }
+    for (const auto& image : native_images().images) {
+        const auto algorithm = image.noc_contract();
+        const auto firmware = image.firmware().niu_handoff();
+        TT_FATAL(algorithm, "Managed native algorithm has no verified NoC traffic declaration");
+        TT_FATAL(firmware && firmware->traffic_contract == algorithm->traffic_contract,
+                 "Managed native algorithm requires matching firmware NIU handoff support");
+    }
+}
+
+void NativeElfKernel::validate_managed_traffic(const AllocatorConfig& layout) const {
+    validate_managed_traffic();
+    TT_FATAL(layout.l1_unreserved_base && layout.l1_unreserved_base < layout.worker_l1_size,
+             "Managed native traffic requires the actual configured L1 data region");
+    for (const auto& image : native_images().images) {
+        const auto algorithm = *image.noc_contract();
+        TT_FATAL((algorithm.l1_begin == 0 && algorithm.l1_end == 0) ||
+                 (algorithm.l1_begin >= layout.l1_unreserved_base && algorithm.l1_end <= layout.worker_l1_size),
+                 "Managed native memory accesses overlap the actual SDK load region or leave L1");
+    }
+}
+
+void NativeElfKernel::validate_managed_endpoints(std::span<const tt_native_noc_endpoint> allowed) const {
+    for (const auto& image : native_images().images) {
+        for (const auto& endpoint : image.noc_endpoints()) {
+            const auto found = std::find_if(allowed.begin(), allowed.end(), [&](const auto& candidate) {
+                return candidate.noc == endpoint.noc && candidate.x == endpoint.x && candidate.y == endpoint.y;
+            });
+            TT_FATAL(found != allowed.end(),
+                     "Managed native algorithm endpoint is outside the actual invocation Worker footprint");
+        }
+    }
+}
+
+void NativeElfKernel::validate_managed_group(std::span<const NativeElfKernel* const> kernels) {
+    TT_FATAL(!kernels.empty(), "Managed native group requires actual algorithms");
+    std::set<CoreCoord> active;
+    std::set<CoreCoord> dynamic;
+    for (const auto* kernel : kernels) {
+        TT_FATAL(kernel, "Managed native group contains no actual algorithm");
+        kernel->validate_managed_traffic();
+        const auto& cores = kernel->logical_cores();
+        active.insert(cores.begin(), cores.end());
+        if (std::holds_alternative<experimental::NativeDataMovementConfig>(kernel->config_))
+            dynamic.insert(cores.begin(), cores.end());
+    }
+    TT_FATAL(std::includes(dynamic.begin(), dynamic.end(), active.begin(), active.end()),
+             "Managed native group requires a dynamic DM configuration on every active Worker");
 }
 
 void NativeElfKernel::retain_binaries() {

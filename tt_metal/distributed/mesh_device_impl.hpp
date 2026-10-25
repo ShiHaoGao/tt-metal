@@ -38,6 +38,9 @@
 #include <umd/device/types/core_coordinates.hpp>
 
 namespace tt::tt_metal {
+namespace detail {
+class ProgramExecution;
+}
 class Allocator;
 class HWCommandQueue;
 class MetalEnv;
@@ -229,6 +232,7 @@ private:
 
     friend class ::tt::tt_metal::experimental::DispatchContext;
     friend class MeshDevice;
+    friend class ::tt::tt_metal::detail::ProgramExecution;
 
 public:
     MeshDeviceImpl(

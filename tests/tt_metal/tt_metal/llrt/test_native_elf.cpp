@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <gtest/gtest.h>
 #include <elf.h>
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <string>
+#include <type_traits>
 #include <vector>
 #include "tt-metalium/experimental/native_kernel.hpp"
 #include "impl/context/metal_context.hpp"
+#include "impl/allocator/allocator_types.hpp"
 #include "impl/experimental/native_kernel/native_image.hpp"
 #include "impl/experimental/native_kernel/native_kernel.hpp"
 #include "llrt/rtoptions.hpp"
+#include "llrt/hal.hpp"
 
 namespace tt::tt_metal::experimental {
 namespace {
@@ -44,6 +49,33 @@ struct NativeElf {
         put(sections_offset+6*sizeof(Elf32_Shdr),Elf32_Shdr{48,SHT_STRTAB,0,0,0x170,1,0,0,1,0});
         put(sections_offset+7*sizeof(Elf32_Shdr),Elf32_Shdr{56,SHT_RELA,0,0,0x180,0,5,1,4,sizeof(Elf32_Rela)});
     }
+    void niu_metadata(std::span<const std::byte> metadata, uint32_t flags = 0,
+                      std::string_view section_name = ".tt_niu_handoff") {
+        Elf32_Ehdr header{};
+        std::memcpy(&header, bytes.data(), sizeof(header));
+        std::array<Elf32_Shdr, 8> original{};
+        std::memcpy(original.data(), bytes.data() + header.e_shoff, sizeof(original));
+        const auto& names_section = original[header.e_shstrndx];
+        std::string names(reinterpret_cast<const char*>(bytes.data() + names_section.sh_offset),
+                          names_section.sh_size);
+        const auto name_offset = names.size();
+        names.append(section_name);
+        names.push_back('\0');
+        const size_t names_offset = std::max<size_t>(0x500, (0x400 + metadata.size() + 0xff) & ~size_t{0xff});
+        const size_t table_offset = std::max<size_t>(0x600, (names_offset + names.size() + 0xff) & ~size_t{0xff});
+        bytes.resize(table_offset + 9 * sizeof(Elf32_Shdr));
+        std::memcpy(bytes.data() + 0x400, metadata.data(), metadata.size());
+        std::memcpy(bytes.data() + names_offset, names.data(), names.size());
+        original[header.e_shstrndx].sh_offset = names_offset;
+        original[header.e_shstrndx].sh_size = names.size();
+        std::memcpy(bytes.data() + table_offset, original.data(), sizeof(original));
+        put(table_offset + 8 * sizeof(Elf32_Shdr),
+            Elf32_Shdr{static_cast<uint32_t>(name_offset), SHT_PROGBITS, flags, 0, 0x400,
+                       static_cast<uint32_t>(metadata.size()), 0, 0, 4, 0});
+        header.e_shoff = table_offset;
+        header.e_shnum = 9;
+        put(0, header);
+    }
 };
 
 struct FirmwareInput {
@@ -52,7 +84,47 @@ struct FirmwareInput {
         return std::array<std::span<const std::byte>,5>{images[0].bytes,images[1].bytes,images[2].bytes,
             images[3].bytes,images[4].bytes};
     }
+    void niu_metadata() {
+        for (uint8_t role = 0; role < images.size(); ++role) {
+            const tt_niu_handoff_record record{
+                TT_NIU_HANDOFF_MAGIC, TT_NIU_HANDOFF_VERSION, TT_NIU_HANDOFF_RECORD_BYTES,
+                role, TT_NATIVE_ARCH_BLACKHOLE, 2, 16,
+                TT_NIU_HANDOFF_LAYOUT_VERSION, TT_NIU_HANDOFF_PROTOCOL,
+                0xa040, TT_NIU_HANDOFF_L1_BYTES, 0x8520, TT_NIU_HANDOFF_COUNTER_BYTES,
+                TT_NIU_HANDOFF_COUNTER_CONTRACT, TT_NIU_HANDOFF_PROCESSOR_MASK,
+                TT_NIU_HANDOFF_REQUEST_OFFSET, TT_NIU_HANDOFF_REQUEST_BYTES,
+                TT_NIU_HANDOFF_RECEIPT_OFFSET, TT_NIU_HANDOFF_RECEIPT_BYTES,
+                TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1};
+            images[role].niu_metadata(std::as_bytes(std::span(&record, 1)));
+        }
+    }
 };
+
+using NocEndpointBytes = std::array<uint8_t, 4>;
+
+std::vector<std::byte> noc_endpoint_metadata(
+    std::span<const NocEndpointBytes> endpoints = {}, uint8_t role = TT_NATIVE_ROLE_BRISC) {
+    // Encode the wire independently of the host's struct representation.
+    std::vector<std::byte> bytes;
+    const auto append = [&](uint32_t value, unsigned count) {
+        for (unsigned index = 0; index != count; ++index)
+            bytes.push_back(static_cast<std::byte>((value >> (8 * index)) & 0xff));
+    };
+    append(TT_NATIVE_NOC_MAGIC, 4);
+    append(TT_NATIVE_NOC_ABI_VERSION, 2);
+    append(28 + 4 * endpoints.size(), 2);
+    append(role, 1);
+    append(TT_NATIVE_ARCH_BLACKHOLE, 1);
+    append(0, 2);
+    append(TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1, 4);
+    append(0x20000, 4);
+    append(0x20004, 4);
+    append(endpoints.size(), 2);
+    append(0, 2);
+    for (const auto& endpoint : endpoints)
+        for (auto field : endpoint) append(field, 1);
+    return bytes;
+}
 
 TEST(NativeElf, CopiesFirmwareAndKernelWithoutContext) {
     ASSERT_FALSE(MetalContext::instance_exists());
@@ -101,6 +173,401 @@ TEST(NativeElf, RejectsUnsupportedOrUnavailableContracts) {
     EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes,firmware),std::exception);
 }
 
+TEST(NativeElf, RejectsMalformedDeclaredNiuHandoffCapability) {
+    FirmwareInput input;
+    // A declared firmware capability must be parsed, never silently treated as
+    // absent. These bytes cannot describe a supported NIU handoff protocol.
+    const std::array<std::byte, 48> malformed{};
+    input.images[0].niu_metadata(malformed);
+    EXPECT_THROW(FirmwareBundle::from_images(input.spans()), std::exception);
+    input.images[0] = NativeElf(0, 0);
+    input.images[0].niu_metadata(std::span(malformed).first(47));
+    EXPECT_THROW(FirmwareBundle::from_images(input.spans()), std::exception);
+    input.images[0] = NativeElf(0, 0);
+    input.images[0].niu_metadata({});
+    EXPECT_THROW(FirmwareBundle::from_images(input.spans()), std::exception);
+}
+
+TEST(NativeElf, RejectsMalformedDeclaredAlgorithmNocContract) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    for (const auto size : {size_t{0}, size_t{15}, size_t{16}, size_t{17}}) {
+        SCOPED_TRACE(size);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        std::vector<std::byte> metadata(size);
+        kernel.niu_metadata(metadata, 0, ".tt_native_noc");
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+    }
+}
+
+TEST(NativeElf, AlgorithmNocContractRetainsOriginalRoleBytesWithoutGrantingBoot) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    for (uint8_t role = 0; role != TT_NATIVE_ROLE_COUNT; ++role) {
+        SCOPED_TRACE(role);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, role);
+        EXPECT_FALSE(KernelElfImage::from_bytes(kernel.bytes, firmware).noc_contract());
+        const tt_native_noc_record record{
+            TT_NATIVE_NOC_MAGIC, TT_NATIVE_NOC_ABI_VERSION, sizeof(tt_native_noc_record),
+            role, TT_NATIVE_ARCH_BLACKHOLE, 0, TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1};
+        kernel.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+        const auto image = KernelElfImage::from_bytes(kernel.bytes, firmware);
+        std::fill(kernel.bytes.begin(), kernel.bytes.end(), std::byte{});
+        ASSERT_TRUE(image.noc_contract());
+        auto copy = *image.noc_contract();
+        EXPECT_EQ(std::memcmp(&copy, &record, sizeof(record)), 0);
+        copy.traffic_contract = 0;
+        EXPECT_EQ(image.noc_contract()->traffic_contract, TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1);
+        EXPECT_FALSE(image.firmware().niu_handoff());
+    }
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST(NativeElf, AlgorithmNocContractRejectsWrongRoleVersionAndLoadedDeclarations) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    const tt_native_noc_record record{
+        TT_NATIVE_NOC_MAGIC, TT_NATIVE_NOC_ABI_VERSION, sizeof(tt_native_noc_record),
+        TT_NATIVE_ROLE_BRISC, TT_NATIVE_ARCH_BLACKHOLE, 0, TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1};
+    for (const auto offset : {offsetof(tt_native_noc_record, magic), offsetof(tt_native_noc_record, version),
+            offsetof(tt_native_noc_record, record_bytes), offsetof(tt_native_noc_record, role),
+            offsetof(tt_native_noc_record, architecture), offsetof(tt_native_noc_record, reserved),
+            offsetof(tt_native_noc_record, traffic_contract)}) {
+        SCOPED_TRACE(offset);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        kernel.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+        kernel.bytes[0x400 + offset] ^= std::byte{0x80};
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+    }
+    NativeElf allocated(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+    allocated.niu_metadata(std::as_bytes(std::span(&record, 1)), SHF_ALLOC, TT_NATIVE_NOC_SECTION);
+    EXPECT_THROW(KernelElfImage::from_bytes(allocated.bytes, firmware), std::exception);
+    NativeElf overlapped(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+    overlapped.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+    overlapped.put(sizeof(Elf32_Ehdr) + offsetof(Elf32_Phdr, p_filesz), uint32_t{0x400});
+    overlapped.put(sizeof(Elf32_Ehdr) + offsetof(Elf32_Phdr, p_memsz), uint32_t{0x400});
+    EXPECT_THROW(KernelElfImage::from_bytes(overlapped.bytes, firmware), std::exception);
+    NativeElf duplicate(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+    duplicate.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+    Elf32_Shdr section{};
+    std::memcpy(&section, duplicate.bytes.data() + 0x600 + 8 * sizeof(section), sizeof(section));
+    duplicate.bytes.resize(0x600 + 10 * sizeof(section));
+    duplicate.put(0x600 + 9 * sizeof(section), section);
+    duplicate.put(offsetof(Elf32_Ehdr, e_shnum), uint16_t{10});
+    EXPECT_THROW(KernelElfImage::from_bytes(duplicate.bytes, firmware), std::exception);
+}
+
+TEST(NativeElf, AlgorithmNocContractRejectsMalformedMemoryEnvelope) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    for (const auto [begin, end] : {std::pair{0u, 4u}, std::pair{0x20000u, 0u},
+                                  std::pair{0x20000u, 0x20000u}, std::pair{0x30000u, 0x20000u}}) {
+        NativeElf elf(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        const tt_native_noc_record record{
+            TT_NATIVE_NOC_MAGIC, TT_NATIVE_NOC_ABI_VERSION, sizeof(tt_native_noc_record),
+            TT_NATIVE_ROLE_BRISC, TT_NATIVE_ARCH_BLACKHOLE, 0,
+            TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1, begin, end};
+        elf.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+        EXPECT_THROW(KernelElfImage::from_bytes(elf.bytes, firmware), std::exception);
+    }
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsRetainCanonicalBytesWithTheirImageOwner) {
+    ASSERT_FALSE(MetalContext::instance_exists());
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    const std::array<NocEndpointBytes, 4> expected{{{0, 0, 0, 0}, {0, 0, 63, 0},
+                                                  {0, 63, 0, 0}, {1, 63, 63, 0}}};
+    auto metadata = noc_endpoint_metadata(expected);
+    const auto retained = [&] {
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        kernel.niu_metadata(metadata, 0, TT_NATIVE_NOC_SECTION);
+        const auto image = KernelElfImage::from_bytes(kernel.bytes, firmware);
+        static_assert(std::is_same_v<decltype(image.noc_endpoints()),
+                                     std::span<const tt_native_noc_endpoint>>);
+        auto copy = image;
+        EXPECT_EQ(copy.noc_endpoints().data(), image.noc_endpoints().data());
+        std::fill(kernel.bytes.begin(), kernel.bytes.end(), std::byte{});
+        std::fill(metadata.begin(), metadata.end(), std::byte{});
+        return copy;
+    }();
+    ASSERT_TRUE(retained.noc_contract());
+    EXPECT_EQ(retained.noc_contract()->record_bytes, 28 + 4 * expected.size());
+    EXPECT_EQ(retained.noc_contract()->endpoint_count, expected.size());
+    EXPECT_EQ(retained.noc_contract()->reserved2, 0);
+    ASSERT_EQ(retained.noc_endpoints().size(), expected.size());
+    for (size_t index = 0; index != expected.size(); ++index) {
+        const auto& endpoint = retained.noc_endpoints()[index];
+        EXPECT_EQ(endpoint.noc, expected[index][0]);
+        EXPECT_EQ(endpoint.x, expected[index][1]);
+        EXPECT_EQ(endpoint.y, expected[index][2]);
+        EXPECT_EQ(endpoint.reserved, 0);
+    }
+    EXPECT_FALSE(retained.firmware().niu_handoff());
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsAreEmptyForAbsentAndEmptyDeclarations) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+    const auto absent = KernelElfImage::from_bytes(kernel.bytes, firmware);
+    EXPECT_FALSE(absent.noc_contract());
+    EXPECT_TRUE(absent.noc_endpoints().empty());
+    kernel.niu_metadata(noc_endpoint_metadata(), 0, TT_NATIVE_NOC_SECTION);
+    const auto empty = KernelElfImage::from_bytes(kernel.bytes, firmware);
+    ASSERT_TRUE(empty.noc_contract());
+    EXPECT_EQ(empty.noc_contract()->record_bytes, 28);
+    EXPECT_EQ(empty.noc_contract()->endpoint_count, 0);
+    EXPECT_TRUE(empty.noc_endpoints().empty());
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsRejectIncompleteHeaderAndReservedExtension) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    const auto metadata = noc_endpoint_metadata();
+    for (size_t length = 0; length != 28; ++length) {
+        SCOPED_TRACE(length);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        kernel.niu_metadata(std::span(metadata).first(length), 0, TT_NATIVE_NOC_SECTION);
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+    }
+    for (size_t offset : {size_t{26}, size_t{27}}) {
+        SCOPED_TRACE(offset);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        auto changed = metadata;
+        changed[offset] = std::byte{1};
+        kernel.niu_metadata(changed, 0, TT_NATIVE_NOC_SECTION);
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+    }
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsRejectCountLengthAndTrailingByteDisagreement) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    const std::array<NocEndpointBytes, 2> endpoints{{{0, 1, 2, 0}, {1, 3, 4, 0}}};
+    for (unsigned mutation = 0; mutation != 9; ++mutation) {
+        SCOPED_TRACE(mutation);
+        auto metadata = noc_endpoint_metadata(endpoints);
+        switch (mutation) {
+            case 0: metadata[24] = std::byte{0}; break;
+            case 1: metadata[24] = std::byte{1}; break;
+            case 2: metadata[24] = std::byte{3}; break;
+            case 3: metadata[6] = std::byte{28}; break;
+            case 4: metadata[6] = std::byte{35}; break;
+            case 5: metadata[6] = std::byte{37}; break;
+            case 6: metadata.pop_back(); break;
+            case 7: metadata.push_back(std::byte{}); break;
+            case 8:
+                metadata.push_back(std::byte{});
+                metadata[6] = static_cast<std::byte>(metadata.size());
+                break;
+        }
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        kernel.niu_metadata(metadata, 0, TT_NATIVE_NOC_SECTION);
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+    }
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsRejectDuplicatesAndEveryUnsortedCoordinate) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    const std::array<std::array<NocEndpointBytes, 2>, 4> invalid{{
+        {{{0, 1, 2, 0}, {0, 1, 2, 0}}},
+        {{{1, 0, 0, 0}, {0, 63, 63, 0}}},
+        {{{0, 2, 0, 0}, {0, 1, 63, 0}}},
+        {{{0, 1, 2, 0}, {0, 1, 1, 0}}},
+    }};
+    for (size_t index = 0; index != invalid.size(); ++index) {
+        SCOPED_TRACE(index);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        kernel.niu_metadata(noc_endpoint_metadata(invalid[index]), 0, TT_NATIVE_NOC_SECTION);
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+    }
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsRejectInvalidNocCoordinatesAndReservedBytes) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    const std::array<NocEndpointBytes, 8> invalid{{{2, 0, 0, 0}, {255, 0, 0, 0},
+        {0, 64, 0, 0}, {0, 255, 0, 0}, {0, 0, 64, 0}, {0, 0, 255, 0},
+        {0, 0, 0, 1}, {0, 0, 0, 255}}};
+    for (size_t index = 0; index != invalid.size(); ++index) {
+        SCOPED_TRACE(index);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        kernel.niu_metadata(noc_endpoint_metadata(std::span(&invalid[index], 1)), 0, TT_NATIVE_NOC_SECTION);
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+    }
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsAcceptTheCompleteBoundedCoordinateDomain) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    std::vector<NocEndpointBytes> endpoints;
+    for (uint8_t noc = 0; noc != 2; ++noc)
+        for (uint8_t x = 0; x != 64; ++x)
+            for (uint8_t y = 0; y != 64; ++y) endpoints.push_back({noc, x, y, 0});
+    ASSERT_EQ(endpoints.size(), 8192u);
+    NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+    kernel.niu_metadata(noc_endpoint_metadata(endpoints), 0, TT_NATIVE_NOC_SECTION);
+    const auto image = KernelElfImage::from_bytes(kernel.bytes, firmware);
+    ASSERT_TRUE(image.noc_contract());
+    EXPECT_EQ(image.noc_contract()->record_bytes, 32796);
+    EXPECT_EQ(image.noc_contract()->endpoint_count, 8192);
+    ASSERT_EQ(image.noc_endpoints().size(), endpoints.size());
+    for (size_t index = 0; index != endpoints.size(); ++index) {
+        const auto& endpoint = image.noc_endpoints()[index];
+        EXPECT_EQ(endpoint.noc, endpoints[index][0]);
+        EXPECT_EQ(endpoint.x, endpoints[index][1]);
+        EXPECT_EQ(endpoint.y, endpoints[index][2]);
+        EXPECT_EQ(endpoint.reserved, 0);
+    }
+}
+
+TEST(NativeElf, AlgorithmNocEndpointsRejectAnOverlargeDeclaredInventory) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    std::vector<NocEndpointBytes> endpoints(8193);
+    NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+    kernel.niu_metadata(noc_endpoint_metadata(endpoints), 0, TT_NATIVE_NOC_SECTION);
+    EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+}
+
+TEST(NativeElf, RetainsNiuHandoffDeclarationFromAllFiveOriginalImages) {
+    FirmwareInput input;
+    input.niu_metadata();
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    for (auto& image : input.images) std::fill(image.bytes.begin(), image.bytes.end(), std::byte{});
+    ASSERT_TRUE(firmware.niu_handoff());
+    EXPECT_EQ(firmware.niu_handoff()->role, TT_NATIVE_ROLE_BRISC);
+    EXPECT_EQ(firmware.niu_handoff()->l1_base, 0xa040u);
+    EXPECT_EQ(firmware.niu_handoff()->dynamic_counter_base, 0x8520u);
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST(NativeElf, AbsentNiuHandoffDeclarationDoesNotCreateACapability) {
+    FirmwareInput input;
+    EXPECT_FALSE(FirmwareBundle::from_images(input.spans()).niu_handoff());
+}
+
+TEST(NativeElf, NiuHandoffUsesActualHalReservedLayout) {
+    const Hal hal(tt::ARCH::BLACKHOLE, false, false, 0, false);
+    const auto core = HalProgrammableCoreType::TENSIX;
+    const auto region = hal.get_dev_addr(core, HalL1MemAddrType::NIU_HANDOFF);
+    EXPECT_NE(region, 0u);
+    EXPECT_EQ(region % TT_NIU_HANDOFF_ALIGNMENT, 0u);
+    EXPECT_EQ(hal.get_dev_size(core, HalL1MemAddrType::NIU_HANDOFF), sizeof(tt_niu_handoff_region));
+    EXPECT_EQ(region + sizeof(tt_niu_handoff_region),
+              hal.get_dev_addr(core, HalL1MemAddrType::KERNEL_CONFIG));
+    const auto counters = hal.get_dev_addr(core, HalL1MemAddrType::NOC_DYNAMIC_COUNTERS);
+    EXPECT_NE(counters, 0u);
+    EXPECT_EQ(hal.get_dev_size(core, HalL1MemAddrType::NOC_DYNAMIC_COUNTERS), TT_NIU_HANDOFF_COUNTER_BYTES);
+    EXPECT_LE(counters + TT_NIU_HANDOFF_COUNTER_BYTES, region);
+    EXPECT_EQ(hal.get_dev_size(HalProgrammableCoreType::ACTIVE_ETH, HalL1MemAddrType::NIU_HANDOFF), 0u);
+}
+
+TEST(NativeElf, NiuHandoffAdmissionRejectsForeignHalAndDeclaredAddresses) {
+    const Hal blackhole(tt::ARCH::BLACKHOLE, false, false, 0, false);
+    const Hal wormhole(tt::ARCH::WORMHOLE_B0, false, false, 0, false);
+    FirmwareInput input;
+    input.niu_metadata();
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    EXPECT_NO_THROW(native_detail::NativeImageAccess::validate_niu_handoff(firmware, blackhole));
+    EXPECT_THROW(native_detail::NativeImageAccess::validate_niu_handoff(firmware, wormhole), std::exception);
+    for (const auto offset : {offsetof(tt_niu_handoff_record, l1_base),
+                              offsetof(tt_niu_handoff_record, dynamic_counter_base)}) {
+        SCOPED_TRACE(offset);
+        FirmwareInput changed;
+        changed.niu_metadata();
+        for (auto& image : changed.images) image.put(0x400 + offset, uint32_t{0xb000});
+        const auto foreign = FirmwareBundle::from_images(changed.spans());
+        EXPECT_THROW(native_detail::NativeImageAccess::validate_niu_handoff(foreign, blackhole), std::exception);
+    }
+    FirmwareInput ordinary;
+    EXPECT_NO_THROW(native_detail::NativeImageAccess::validate_niu_handoff(
+        FirmwareBundle::from_images(ordinary.spans()), blackhole));
+}
+
+TEST(NativeElf, RejectsPartialOrDisagreeingNiuHandoffDeclaration) {
+    for (uint8_t role = 0; role < 5; ++role) {
+        SCOPED_TRACE(role);
+        FirmwareInput missing;
+        missing.niu_metadata();
+        missing.images[role] = NativeElf(0, role);
+        EXPECT_THROW(FirmwareBundle::from_images(missing.spans()), std::exception);
+        FirmwareInput changed;
+        changed.niu_metadata();
+        changed.images[role].put(0x400 + offsetof(tt_niu_handoff_record, l1_base), uint32_t{0xa060});
+        EXPECT_THROW(FirmwareBundle::from_images(changed.spans()), std::exception);
+    }
+}
+
+TEST(NativeElf, RejectsUnsupportedNiuHandoffFieldsAndUnsafeAddressRanges) {
+    const auto reject = [](size_t offset, auto value) {
+        SCOPED_TRACE(offset);
+        FirmwareInput input;
+        input.niu_metadata();
+        for (auto& image : input.images) image.put(0x400 + offset, value);
+        EXPECT_THROW(FirmwareBundle::from_images(input.spans()), std::exception);
+    };
+    reject(offsetof(tt_niu_handoff_record, magic), uint32_t{0});
+    reject(offsetof(tt_niu_handoff_record, version), uint16_t{2});
+    reject(offsetof(tt_niu_handoff_record, record_bytes), uint16_t{47});
+    reject(offsetof(tt_niu_handoff_record, role), uint8_t{5});
+    reject(offsetof(tt_niu_handoff_record, architecture), uint8_t{0});
+    reject(offsetof(tt_niu_handoff_record, noc_count), uint8_t{1});
+    reject(offsetof(tt_niu_handoff_record, selectors_per_noc), uint8_t{32});
+    reject(offsetof(tt_niu_handoff_record, layout_version), uint16_t{2});
+    reject(offsetof(tt_niu_handoff_record, protocol), uint16_t{2});
+    reject(offsetof(tt_niu_handoff_record, l1_base), uint32_t{0});
+    reject(offsetof(tt_niu_handoff_record, l1_base), uint32_t{0xa041});
+    reject(offsetof(tt_niu_handoff_record, l1_base), uint32_t{0xffffffe0});
+    reject(offsetof(tt_niu_handoff_record, l1_base), uint32_t{0x8520});
+    reject(offsetof(tt_niu_handoff_record, l1_bytes), uint32_t{576});
+    reject(offsetof(tt_niu_handoff_record, dynamic_counter_base), uint32_t{0});
+    reject(offsetof(tt_niu_handoff_record, dynamic_counter_base), uint32_t{0x8521});
+    reject(offsetof(tt_niu_handoff_record, dynamic_counter_base), uint32_t{0xfffffffc});
+    reject(offsetof(tt_niu_handoff_record, counter_bytes), uint16_t{40});
+    reject(offsetof(tt_niu_handoff_record, counter_contract), uint16_t{0});
+    reject(offsetof(tt_niu_handoff_record, processor_mask), uint32_t{0x03});
+    reject(offsetof(tt_niu_handoff_record, request_offset), uint16_t{4});
+    reject(offsetof(tt_niu_handoff_record, request_bytes), uint16_t{32});
+    reject(offsetof(tt_niu_handoff_record, receipt_offset), uint16_t{0});
+    reject(offsetof(tt_niu_handoff_record, receipt_bytes), uint16_t{512});
+    reject(offsetof(tt_niu_handoff_record, traffic_contract), uint32_t{0});
+}
+
+TEST(NativeElf, RejectsNiuHandoffDuplicateTypeAndLoadedPayloadOverlap) {
+    for (unsigned mutation = 0; mutation < 3; ++mutation) {
+        SCOPED_TRACE(mutation);
+        FirmwareInput input;
+        input.niu_metadata();
+        auto& elf = input.images[0];
+        constexpr auto section = 0x600 + 8 * sizeof(Elf32_Shdr);
+        Elf32_Shdr metadata{};
+        std::memcpy(&metadata, elf.bytes.data() + section, sizeof(metadata));
+        if (mutation == 0) {
+            elf.bytes.resize(0x600 + 10 * sizeof(Elf32_Shdr));
+            elf.put(0x600 + 9 * sizeof(Elf32_Shdr), metadata);
+            elf.put(offsetof(Elf32_Ehdr, e_shnum), uint16_t{10});
+        } else if (mutation == 1) {
+            metadata.sh_type = SHT_NOTE;
+            elf.put(section, metadata);
+        } else {
+            metadata.sh_offset = 0x80;
+            elf.put(section, metadata);
+        }
+        EXPECT_THROW(FirmwareBundle::from_images(input.spans()), std::exception);
+    }
+}
+
+TEST(NativeElf, RejectsLoadedNiuHandoffMetadata) {
+    FirmwareInput input;
+    const std::array<std::byte, 48> record{};
+    input.images[0].niu_metadata(record, SHF_ALLOC);
+    EXPECT_THROW(FirmwareBundle::from_images(input.spans()), std::exception);
+}
+
 TEST(NativeElf, ComputeGroupRejectsRolePermutationAndDifferentFirmware) {
     FirmwareInput input;
     auto firmware = FirmwareBundle::from_images(input.spans());
@@ -141,6 +608,11 @@ protected:
     KernelElfImage image(uint8_t role) {
         return KernelElfImage::from_bytes(NativeElf(TT_NATIVE_IMAGE_KERNEL, role).bytes, firmware, "native");
     }
+    KernelElfImage image(uint8_t role, std::span<const NocEndpointBytes> endpoints) {
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, role);
+        kernel.niu_metadata(noc_endpoint_metadata(endpoints, role), 0, TT_NATIVE_NOC_SECTION);
+        return KernelElfImage::from_bytes(kernel.bytes, firmware, "native");
+    }
 };
 
 TEST_F(NativeKernel, RetainsImageAndRejectsSourceCompilationWithoutContext) {
@@ -176,6 +648,180 @@ TEST_F(NativeKernel, ComputeRetainsExactRoleImagesAndPackedStorage) {
         EXPECT_EQ(kernel.get_kernel_processor_type(index), index);
         EXPECT_EQ(binaries[index],
                   &native_detail::NativeImageAccess::memory(kernel.native_images().images[index]));
+    }
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedTrafficRequiresAlgorithmAndMatchingFirmwareDeclarations) {
+    const auto qualified = [](uint8_t role, const FirmwareBundle& firmware) {
+        NativeElf elf(TT_NATIVE_IMAGE_KERNEL, role);
+        const tt_native_noc_record record{
+            TT_NATIVE_NOC_MAGIC, TT_NATIVE_NOC_ABI_VERSION, sizeof(tt_native_noc_record),
+            role, TT_NATIVE_ARCH_BLACKHOLE, 0, TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1};
+        elf.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+        return KernelElfImage::from_bytes(elf.bytes, firmware);
+    };
+    FirmwareInput capable;
+    capable.niu_metadata();
+    const auto capable_firmware = FirmwareBundle::from_images(capable.spans());
+    const auto unqualified = KernelElfImage::from_bytes(NativeElf(TT_NATIVE_IMAGE_KERNEL, 0).bytes, capable_firmware);
+    const NativeDataMovementConfig missing_algorithm{unqualified, NOC::NOC_0, NOC_MODE::DM_DYNAMIC_NOC};
+    NativeElfKernel no_algorithm(context, DEFAULT_CONTEXT_ID, cores, missing_algorithm);
+    EXPECT_THROW(no_algorithm.validate_managed_traffic(), std::exception);
+    NativeElfKernel no_firmware(context, DEFAULT_CONTEXT_ID, cores,
+        NativeDataMovementConfig{qualified(0, firmware), NOC::NOC_0, NOC_MODE::DM_DYNAMIC_NOC});
+    EXPECT_THROW(no_firmware.validate_managed_traffic(), std::exception);
+    NativeElfKernel static_noc(context, DEFAULT_CONTEXT_ID, cores,
+        NativeDataMovementConfig{qualified(0, capable_firmware)});
+    EXPECT_THROW(static_noc.validate_managed_traffic(), std::exception);
+    NativeElfKernel eligible(context, DEFAULT_CONTEXT_ID, cores,
+        NativeDataMovementConfig{qualified(0, capable_firmware), NOC::NOC_0, NOC_MODE::DM_DYNAMIC_NOC});
+    EXPECT_NO_THROW(eligible.validate_managed_traffic());
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedComputeTrafficRequiresEveryActualRoleDeclaration) {
+    FirmwareInput capable;
+    capable.niu_metadata();
+    const auto capable_firmware = FirmwareBundle::from_images(capable.spans());
+    std::array<NativeElf, 3> elves{{{1, 2}, {1, 3}, {1, 4}}};
+    for (uint8_t index = 0; index != elves.size(); ++index) {
+        const tt_native_noc_record record{
+            TT_NATIVE_NOC_MAGIC, TT_NATIVE_NOC_ABI_VERSION, sizeof(tt_native_noc_record),
+            static_cast<uint8_t>(index + 2), TT_NATIVE_ARCH_BLACKHOLE, 0, TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1};
+        elves[index].niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+    }
+    const auto unpack = KernelElfImage::from_bytes(elves[0].bytes, capable_firmware);
+    const auto math = KernelElfImage::from_bytes(elves[1].bytes, capable_firmware);
+    const auto pack = KernelElfImage::from_bytes(elves[2].bytes, capable_firmware);
+    const auto missing = KernelElfImage::from_bytes(NativeElf(1, 3).bytes, capable_firmware);
+    NativeElfKernel incomplete(context, DEFAULT_CONTEXT_ID, cores, NativeComputeConfig{unpack, missing, pack});
+    EXPECT_THROW(incomplete.validate_managed_traffic(), std::exception);
+    NativeElfKernel complete(context, DEFAULT_CONTEXT_ID, cores, NativeComputeConfig{unpack, math, pack});
+    EXPECT_NO_THROW(complete.validate_managed_traffic());
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedTrafficExcludesTheActualConfiguredKernelLoadRegion) {
+    FirmwareInput capable;
+    capable.niu_metadata();
+    const auto capable_firmware = FirmwareBundle::from_images(capable.spans());
+    const auto with_range = [&](uint32_t begin, uint32_t end) {
+        NativeElf elf(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_BRISC);
+        const tt_native_noc_record record{
+            TT_NATIVE_NOC_MAGIC, TT_NATIVE_NOC_ABI_VERSION, sizeof(tt_native_noc_record),
+            TT_NATIVE_ROLE_BRISC, TT_NATIVE_ARCH_BLACKHOLE, 0,
+            TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1, begin, end};
+        elf.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+        return NativeDataMovementConfig{KernelElfImage::from_bytes(elf.bytes, capable_firmware),
+                                       NOC::NOC_0, NOC_MODE::DM_DYNAMIC_NOC};
+    };
+    AllocatorConfig layout;
+    layout.l1_unreserved_base = 0x20000;
+    layout.worker_l1_size = 0x180000;
+    NativeElfKernel code_write(context, DEFAULT_CONTEXT_ID, cores, with_range(0x10000, 0x10004));
+    EXPECT_THROW(code_write.validate_managed_traffic(layout), std::exception);
+    NativeElfKernel crossing(context, DEFAULT_CONTEXT_ID, cores, with_range(0x1fffc, 0x20004));
+    EXPECT_THROW(crossing.validate_managed_traffic(layout), std::exception);
+    NativeElfKernel outside(context, DEFAULT_CONTEXT_ID, cores, with_range(0x17fffc, 0x180004));
+    EXPECT_THROW(outside.validate_managed_traffic(layout), std::exception);
+    NativeElfKernel data(context, DEFAULT_CONTEXT_ID, cores, with_range(0x20000, 0x20004));
+    EXPECT_NO_THROW(data.validate_managed_traffic(layout));
+    // Same algorithm becomes ineligible when the actual config ring grows.
+    layout.l1_unreserved_base = 0x30000;
+    EXPECT_THROW(data.validate_managed_traffic(layout), std::exception);
+    NativeElfKernel no_access(context, DEFAULT_CONTEXT_ID, cores, with_range(0, 0));
+    EXPECT_NO_THROW(no_access.validate_managed_traffic(layout));
+    layout.worker_l1_size = 0;
+    EXPECT_THROW(no_access.validate_managed_traffic(layout), std::exception);
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedGroupRequiresDynamicDmOnEveryActualComputeCore) {
+    FirmwareInput capable;
+    capable.niu_metadata();
+    const auto capable_firmware = FirmwareBundle::from_images(capable.spans());
+    const auto qualified = [&](uint8_t role) {
+        NativeElf elf(TT_NATIVE_IMAGE_KERNEL, role);
+        const tt_native_noc_record record{
+            TT_NATIVE_NOC_MAGIC, TT_NATIVE_NOC_ABI_VERSION, sizeof(tt_native_noc_record),
+            role, TT_NATIVE_ARCH_BLACKHOLE, 0, TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1, 0, 0};
+        elf.niu_metadata(std::as_bytes(std::span(&record, 1)), 0, TT_NATIVE_NOC_SECTION);
+        return KernelElfImage::from_bytes(elf.bytes, capable_firmware);
+    };
+    const CoreRangeSet both({CoreRange({0, 0}, {1, 0})});
+    const CoreRangeSet first({CoreRange({0, 0}, {0, 0})});
+    const CoreRangeSet second({CoreRange({1, 0}, {1, 0})});
+    NativeElfKernel compute(context, DEFAULT_CONTEXT_ID, both,
+                            NativeComputeConfig{qualified(2), qualified(3), qualified(4)});
+    NativeElfKernel first_dm(context, DEFAULT_CONTEXT_ID, first,
+        NativeDataMovementConfig{qualified(0), NOC::NOC_0, NOC_MODE::DM_DYNAMIC_NOC});
+    NativeElfKernel second_dm(context, DEFAULT_CONTEXT_ID, second,
+        NativeDataMovementConfig{qualified(1), NOC::NOC_1, NOC_MODE::DM_DYNAMIC_NOC});
+    const std::array<const NativeElfKernel*, 1> compute_only{&compute};
+    EXPECT_THROW(NativeElfKernel::validate_managed_group(compute_only), std::exception);
+    const std::array<const NativeElfKernel*, 2> uncovered{&compute, &first_dm};
+    EXPECT_THROW(NativeElfKernel::validate_managed_group(uncovered), std::exception);
+    const std::array<const NativeElfKernel*, 3> covered{&compute, &first_dm, &second_dm};
+    EXPECT_NO_THROW(NativeElfKernel::validate_managed_group(covered));
+    const std::array<const NativeElfKernel*, 1> dm_only{&first_dm};
+    EXPECT_NO_THROW(NativeElfKernel::validate_managed_group(dm_only));
+    EXPECT_THROW(NativeElfKernel::validate_managed_group({}), std::exception);
+    const std::array<const NativeElfKernel*, 1> absent{nullptr};
+    EXPECT_THROW(NativeElfKernel::validate_managed_group(absent), std::exception);
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedEndpointsAcceptAnUnorderedSupersetOnBothNocs) {
+    const std::array<NocEndpointBytes, 2> endpoints{{{0, 1, 2, 0}, {1, 3, 4, 0}}};
+    NativeElfKernel kernel(context, DEFAULT_CONTEXT_ID, cores,
+        NativeDataMovementConfig{image(TT_NATIVE_ROLE_BRISC, endpoints)});
+    const std::array<tt_native_noc_endpoint, 3> allowed{{{1, 3, 4, 0}, {0, 63, 63, 0}, {0, 1, 2, 0}}};
+    EXPECT_NO_THROW(kernel.validate_managed_endpoints(allowed));
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedEndpointsRejectMissingNocCoordinateOrRemoteCore) {
+    const std::array<NocEndpointBytes, 2> endpoints{{{0, 1, 2, 0}, {1, 3, 4, 0}}};
+    NativeElfKernel kernel(context, DEFAULT_CONTEXT_ID, cores,
+        NativeDataMovementConfig{image(TT_NATIVE_ROLE_BRISC, endpoints)});
+    const std::array<std::array<tt_native_noc_endpoint, 2>, 4> incomplete{{
+        {{{0, 1, 2, 0}, {0, 3, 4, 0}}},
+        {{{0, 1, 2, 0}, {1, 4, 4, 0}}},
+        {{{0, 1, 2, 0}, {1, 3, 5, 0}}},
+        {{{1, 1, 2, 0}, {1, 3, 4, 0}}},
+    }};
+    for (size_t index = 0; index != incomplete.size(); ++index) {
+        SCOPED_TRACE(index);
+        EXPECT_THROW(kernel.validate_managed_endpoints(incomplete[index]), std::exception);
+    }
+    const std::array<tt_native_noc_endpoint, 1> first_only{{{0, 1, 2, 0}}};
+    EXPECT_THROW(kernel.validate_managed_endpoints(first_only), std::exception);
+    EXPECT_THROW(kernel.validate_managed_endpoints({}), std::exception);
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedEndpointsAllowAnEmptyDeclarationAndEmptyAllowedInventory) {
+    NativeElfKernel kernel(context, DEFAULT_CONTEXT_ID, cores,
+        NativeDataMovementConfig{image(TT_NATIVE_ROLE_NCRISC, {})});
+    EXPECT_NO_THROW(kernel.validate_managed_endpoints({}));
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeKernel, ManagedEndpointsRequireEveryActualComputeRole) {
+    const std::array<NocEndpointBytes, 3> endpoints{{{0, 1, 2, 0}, {0, 3, 4, 0}, {1, 5, 6, 0}}};
+    NativeElfKernel kernel(context, DEFAULT_CONTEXT_ID, cores, NativeComputeConfig{
+        image(TT_NATIVE_ROLE_TRISC0, std::span(&endpoints[0], 1)),
+        image(TT_NATIVE_ROLE_TRISC1, std::span(&endpoints[1], 1)),
+        image(TT_NATIVE_ROLE_TRISC2, std::span(&endpoints[2], 1))});
+    const std::array<tt_native_noc_endpoint, 3> allowed{{{1, 5, 6, 0}, {0, 1, 2, 0}, {0, 3, 4, 0}}};
+    EXPECT_NO_THROW(kernel.validate_managed_endpoints(allowed));
+    for (size_t omitted = 0; omitted != allowed.size(); ++omitted) {
+        SCOPED_TRACE(omitted);
+        std::vector<tt_native_noc_endpoint> incomplete;
+        for (size_t index = 0; index != allowed.size(); ++index)
+            if (index != omitted) incomplete.push_back(allowed[index]);
+        EXPECT_THROW(kernel.validate_managed_endpoints(incomplete), std::exception);
     }
     EXPECT_FALSE(MetalContext::instance_exists());
 }

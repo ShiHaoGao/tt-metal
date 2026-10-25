@@ -45,6 +45,7 @@ class Data;
 class ContextDescriptor;
 class DataCollector;
 class DeviceManager;
+class NiuAdmission;
 class RiscFirmwareInitializer;
 namespace experimental::native_detail { class LoadedFirmware; }
 class FabricFirmwareInitializer;
@@ -98,6 +99,8 @@ public:
     static void validate_all_worker_stream_state_traces();
     std::shared_ptr<const WorkerStreamStateProvider> worker_stream_state_provider(ChipId device_id) const;
     std::shared_ptr<const experimental::native_detail::LoadedFirmware> native_firmware(ChipId device_id) const;
+    NiuAdmission& niu_admission() { return *niu_admission_; }
+    std::weak_ptr<NiuAdmission> niu_admission_owner() const { return niu_admission_; }
 
     // Returns the id of this instance. The ID cannot be used to uniquely identify the context.
     // IDs are recycled after instances are destroyed.
@@ -326,6 +329,7 @@ private:
     bool env_owned_ = false;
     ContextId context_id_;
 
+    std::shared_ptr<NiuAdmission> niu_admission_;
     std::unique_ptr<internal::ServiceCoreManager> service_core_manager_;
     std::unique_ptr<dispatch_core_manager> dispatch_core_manager_;
     std::unique_ptr<DispatchQueryManager> dispatch_query_manager_;

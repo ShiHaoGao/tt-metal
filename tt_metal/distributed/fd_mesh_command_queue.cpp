@@ -170,6 +170,7 @@ dispatch_telemetry_types::SMCDispatchCoreCoords build_smc_dispatch_core_coords(D
 struct MeshReadEventDescriptor {
     ReadEventDescriptor single_device_descriptor;
     MeshCoordinateRange device_range;
+    std::shared_ptr<MeshEventCompletion> completion;
 };
 
 struct MeshBufferReadDescriptor {
@@ -185,6 +186,45 @@ struct MeshCoreDataReadDescriptor {
     ReadCoreDataDescriptor single_core_descriptor;
     MeshCoordinate device_coord;
 };
+
+// A receipt request frozen by the actual record-enqueue owner. The public
+// numeric MeshEvent constructors cannot manufacture this object.
+class MeshEventCompletion {
+    friend class FDMeshCommandQueue;
+    friend class MeshEventImpl;
+    struct Observation {
+        std::shared_ptr<FDMeshCommandQueue::NiuExecution> pending;
+        std::vector<SubDeviceId> completed;
+        FDMeshCommandQueue::NiuExecution::CompletionScope scope;
+        NiuAdmission::Boots boots;
+        decltype(FDMeshCommandQueue::NiuExecution::managed_group) managed_group;
+    };
+    std::shared_ptr<FDMeshCommandQueue::EventOwner> owner;
+    std::shared_ptr<const FDMeshCommandQueue::EventEpoch> epoch;
+    std::vector<std::pair<MeshCoordinate, IDevice*>> devices;
+    std::vector<Observation> observations;
+    uint32_t event_id = 0;
+    bool received = false;
+    std::atomic<bool> observed{false};
+
+    bool query() {
+        // Teardown withdraws the original queue before destroying it. Holding
+        // this lock prevents a retained event from dereferencing a dead owner.
+        std::lock_guard owner_lock(owner->mutex);
+        TT_FATAL(owner->queue, "Recorded event belongs to a closed command queue");
+        auto api_lock = owner->queue->lock_api_function_();
+        return owner->queue->receive_event_completion(*this);
+    }
+};
+
+std::optional<bool> MeshEventImpl::query_completion() const {
+    if (!completion_) return std::nullopt;
+    return completion_->query();
+}
+
+bool MeshEventImpl::completion_observed() const noexcept {
+    return completion_ && completion_->observed.load(std::memory_order_acquire);
+}
 
 FDMeshCommandQueue::FDMeshCommandQueue(
     MeshDevice* mesh_device,
@@ -232,6 +272,10 @@ FDMeshCommandQueue::FDMeshCommandQueue(
 }
 
 FDMeshCommandQueue::~FDMeshCommandQueue() {
+    {
+        std::lock_guard owner_lock(event_owner_->mutex);
+        event_owner_->queue = nullptr;
+    }
     // Mock/emulated devices don't have actual completion queues, skip validation
     auto target_type = this->get_target_device_type();
     bool is_mock = target_type == tt::TargetDevice::Mock || target_type == tt::TargetDevice::Emule;
@@ -243,7 +287,11 @@ FDMeshCommandQueue::~FDMeshCommandQueue() {
         // This allows physical device close to proceed correctly, since we still
         // rely on single device CQs during this step. Not needed for functionality
         // once single device CQs are removed, however this is still good practice.
-        this->clear_expected_num_workers_completed();
+        try {
+            this->clear_expected_num_workers_completed();
+        } catch (const std::exception& error) {
+            log_warning(LogMetal, "FD NIU retirement could not observe completion: {}", error.what());
+        }
     }
 
     // Log warnings instead of aborting - destructors should never throw or abort.
@@ -283,6 +331,8 @@ FDMeshCommandQueue::~FDMeshCommandQueue() {
         reader_thread_cv_.notify_one();
     }
     completion_queue_reader_thread_.join();
+    for (auto& pending : niu_executions_) pending->execution->quarantine();
+    niu_executions_.clear();
 
     // After join(), this destructor has exclusive ownership of reader state and
     // can safely perform destructive cleanup.
@@ -371,7 +421,8 @@ void FDMeshCommandQueue::clear_expected_num_workers_completed() {
 
     auto sub_device_ids = buffer_dispatch::select_sub_device_ids(mesh_device_, {});
     auto& sysmem_manager = this->reference_sysmem_manager();
-    auto event = MeshEvent(sysmem_manager.get_next_event(id_), *this, MeshCoordinateRange(mesh_device_->shape()));
+    auto event = MeshEvent(sysmem_manager.get_next_drain_event(id_), *this, MeshCoordinateRange(mesh_device_->shape()));
+    event.impl().completion_ = capture_event_completion(event, sub_device_ids);
 
     // Issue commands to clear expected_num_workers_completed counter(s) on the dispatcher
     for (auto* device : mesh_device_->get_devices()) {
@@ -397,24 +448,129 @@ void FDMeshCommandQueue::clear_expected_num_workers_completed() {
     completion_queue_reads_.push(std::make_shared<MeshCompletionReaderVariant>(
         std::in_place_type<MeshReadEventDescriptor>,
         ReadEventDescriptor(event.impl().id()),
-        event.impl().device_range()));
+        event.impl().device_range(),
+        event.impl().completion_));
     this->increment_num_entries_in_completion_queue();
     std::unique_lock<std::mutex> lock(reads_processed_cv_mutex_);
     this->wait_for_outstanding_reads(lock);
+    lock.unlock();
+    if (!thread_exception_state_.load(std::memory_order_acquire) && !should_handle_exception_.load() &&
+        num_outstanding_reads_.load() == 0) {
+        TT_FATAL(receive_event_completion(*event.impl().completion_), "Completion wait omitted its recorded event");
+    } else {
+        for (auto& pending : niu_executions_) pending->execution->quarantine();
+    }
+}
+
+std::shared_ptr<MeshEventCompletion> FDMeshCommandQueue::capture_event_completion(
+    const MeshEvent& event, ttsl::Span<const SubDeviceId> completed, bool reset_event_id) {
+    const auto event_id = event.impl().id();
+    TT_FATAL(reset_event_id ? event_id == 0 && last_recorded_event_id_ == 0
+                            : event_id > last_recorded_event_id_,
+             "Recorded event ID must advance within its original command-queue epoch");
+    auto completion = std::shared_ptr<MeshEventCompletion>(new MeshEventCompletion);
+    completion->owner = event_owner_;
+    completion->epoch = event_epoch_;
+    completion->event_id = event_id;
+    for_each_local(mesh_device_, event.impl().device_range(), [&](const auto& coord) {
+        completion->devices.emplace_back(coord, mesh_device_->impl().get_device(coord));
+    });
+    for (const auto& pending : niu_executions_) {
+        // A partial-mesh event cannot certify the complete physical footprint
+        // of a group. Keep it pending until a record covers all its chips.
+        const bool covers_execution = std::all_of(
+            pending->execution->footprint.begin(), pending->execution->footprint.end(), [&](const auto& entry) {
+                return std::any_of(completion->devices.begin(), completion->devices.end(), [&](const auto& device) {
+                    return device.second->id() == entry.first;
+                });
+            });
+        if (!covers_execution) continue;
+        MeshEventCompletion::Observation observation{
+            pending, {}, pending->completion_scope, pending->execution->boots, pending->managed_group};
+        for (auto id : pending->subdevices) {
+            if (std::find(completed.begin(), completed.end(), id) != completed.end())
+                observation.completed.push_back(id);
+        }
+        if (!observation.completed.empty() || observation.scope == NiuExecution::CompletionScope::QueuePrefix)
+            completion->observations.push_back(std::move(observation));
+    }
+    last_recorded_event_id_ = event_id;
+    return completion;
+}
+
+void FDMeshCommandQueue::validate_event_completion(const MeshEventCompletion& completion) const {
+    TT_FATAL(completion.owner == event_owner_ && completion.epoch == event_epoch_,
+             "Recorded event belongs to another command queue or reset epoch");
+    TT_FATAL(!thread_exception_state_.load(std::memory_order_acquire) && !should_handle_exception_.load(),
+             "Recorded event cannot receive completion from a poisoned command queue");
+    TT_FATAL(mesh_device_->is_initialized(), "Recorded event requires its original open MeshDevice");
+    for (const auto& [coord, device] : completion.devices) {
+        TT_FATAL(mesh_device_->impl().get_device(coord) == device && device->is_initialized(),
+                 "Recorded event physical Device changed before completion");
+    }
+    auto& context = MetalContext::instance(mesh_device_->impl().get_context_id());
+    // Validate every retained boot before advancing any original group.
+    for (const auto& observation : completion.observations) {
+        TT_FATAL(observation.pending->execution->boots == observation.boots,
+                 "Recorded event execution firmware identity changed");
+        TT_FATAL(observation.pending->managed_group == observation.managed_group,
+                 "Recorded event workload group identity changed");
+        for (const auto& [chip, firmware] : observation.boots) {
+            TT_FATAL(context.native_firmware(chip) == firmware,
+                     "Recorded event belongs to another actual firmware boot");
+        }
+    }
+}
+
+bool FDMeshCommandQueue::receive_event_completion(MeshEventCompletion& completion) {
+    validate_event_completion(completion);
+    for (const auto& [coord, device] : completion.devices) {
+        std::lock_guard receipt_lock(event_owner_->receipt_mutex);
+        const auto found = event_owner_->receipts.find(device);
+        if (found == event_owner_->receipts.end() || found->second.epoch != completion.epoch ||
+            found->second.event_id < completion.event_id) return false;
+    }
+    if (completion.received) return true;
+    for (const auto& observation : completion.observations) {
+        const auto& pending = observation.pending;
+        if (std::find(niu_executions_.begin(), niu_executions_.end(), pending) == niu_executions_.end()) continue;
+        auto remaining = pending->subdevices;
+        // The scope is frozen at record time: a later manager reset must not
+        // enlarge the prefix certified by an earlier event.
+        if (observation.scope == NiuExecution::CompletionScope::QueuePrefix) remaining.clear();
+        std::erase_if(remaining, [&](auto id) {
+            return std::find(observation.completed.begin(), observation.completed.end(), id) !=
+                   observation.completed.end();
+        });
+        if (remaining.empty()) {
+            if (observation.managed_group) pending->execution->stop(*observation.managed_group);
+            else pending->execution->stop();
+            std::erase(niu_executions_, pending);
+        } else {
+            pending->subdevices = std::move(remaining);
+        }
+    }
+    completion.received = true;
+    return true;
 }
 
 void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool blocking) {
+    auto niu_preparation =
+        ::tt::tt_metal::detail::ProgramExecution::reserve_workload(*mesh_device_, mesh_workload);
     for (const auto& [range, program] : mesh_workload.get_programs())
         program.impl().validate_worker_stream_state_client(
             MetalContext::instance(mesh_device_->impl().get_context_id()));
     ZoneScopedN("EnqueueProgram");
     auto lock = lock_api_function_();
+    TT_FATAL(!thread_exception_state_.load(std::memory_order_acquire), "Cannot submit to a poisoned FD queue");
     in_use_ = true;
     // The active sub-device manager id doubles as the key for per-program cached command sequences.
     const uint64_t active_sub_device_manager_id = *mesh_device_->get_active_sub_device_manager_id();
     const auto& sub_device_ids = mesh_workload.impl().determine_sub_device_ids(mesh_device_);
     TT_FATAL(sub_device_ids.size() == 1, "Programs must be executed on a single sub-device");
     SubDeviceId sub_device_id = *(sub_device_ids.begin());
+    auto niu_execution = ::tt::tt_metal::detail::ProgramExecution::reserve_dispatch(*mesh_device_, std::array{sub_device_id}, mesh_workload);
+    auto niu_failure = niu_execution->watch_failure();
     auto mesh_device_id = mesh_device_->id();
     const ProgramBinaryStatus program_binary_status = mesh_workload.impl().get_program_binary_status(mesh_device_id);
     auto& sysmem_manager = this->reference_sysmem_manager();
@@ -465,10 +621,18 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
         trace_node.multicast_go_signals = mcast_go_signals;
         trace_node.unicast_go_signals = unicast_go_signals;
         trace_node.sub_device_id = sub_device_id;
+        trace_ctx_->niu_footprints_.push_back(niu_execution->snapshot(std::array{sub_device_id}));
         return;
     }
 
     program_dispatch::ProgramDispatchMetadata dispatch_metadata;
+    niu_executions_.reserve(niu_executions_.size() + 1);
+    NiuExecution niu_pending{{sub_device_id}, niu_execution};
+    if (niu_preparation.execution()) niu_pending.managed_group = niu_execution->group_key(mesh_workload);
+    auto niu_submission =
+        niu_pending.managed_group ? niu_execution->issue(*niu_pending.managed_group) : niu_execution->issue();
+    if (niu_execution->state == ::tt::tt_metal::detail::ProgramExecution::State::Issued)
+        niu_executions_.push_back(std::make_shared<NiuExecution>(std::move(niu_pending)));
     // Expected number of workers from the previous run
     uint32_t expected_num_workers_completed = sysmem_manager.get_bypass_mode()
                                                   ? trace_ctx_->descriptors[sub_device_id].num_completion_worker_cores
@@ -621,6 +785,7 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
     // From the dispatcher's perspective, binaries are now committed to DRAM
     mesh_workload.impl().set_program_binary_status(mesh_device_id, ProgramBinaryStatus::Committed);
     mesh_workload.set_last_used_command_queue_for_testing(this);
+    niu_submission.commit();
 
     if (blocking) {
         this->finish_nolock({{sub_device_id}});
@@ -756,6 +921,11 @@ void FDMeshCommandQueue::enqueue_read_shard_from_core(
 }
 
 void FDMeshCommandQueue::finish_nolock(ttsl::Span<const SubDeviceId> sub_device_ids) {
+    finish_prefix_nolock(sub_device_ids, EventRecord::Normal);
+}
+
+void FDMeshCommandQueue::finish_prefix_nolock(
+    ttsl::Span<const SubDeviceId> sub_device_ids, EventRecord record) {
     ZoneScopedN("FDMeshCommandQueue::finish_nolock");
 
     if (this->get_target_device_type() == tt::TargetDevice::Mock ||
@@ -772,7 +942,7 @@ void FDMeshCommandQueue::finish_nolock(ttsl::Span<const SubDeviceId> sub_device_
         }
     }
 
-    auto event = this->enqueue_record_event_to_host_nolock(sub_device_ids);
+    auto event = this->enqueue_record_event_to_host_nolock(sub_device_ids, std::nullopt, record);
 
     std::unique_lock<std::mutex> lock(reads_processed_cv_mutex_);
     this->wait_for_outstanding_reads(lock);
@@ -790,9 +960,17 @@ void FDMeshCommandQueue::finish_nolock(ttsl::Span<const SubDeviceId> sub_device_
             reads_processed_cv_.notify_all();
             lock.unlock();
             in_use_ = false;
+            for (auto& pending : niu_executions_) pending->execution->quarantine();
             std::rethrow_exception(exception_ptr);
         }
     }
+    if (thread_exception_state_.load(std::memory_order_acquire) || num_outstanding_reads_.load() != 0) {
+        for (auto& pending : niu_executions_) pending->execution->quarantine();
+        TT_THROW("FD NIU completion requires a successful actual completion wait");
+    }
+    lock.unlock();
+    TT_FATAL(event.impl().completion_ && receive_event_completion(*event.impl().completion_),
+             "Completion wait omitted its recorded event prefix");
 }
 
 void FDMeshCommandQueue::finish(ttsl::Span<const SubDeviceId> sub_device_ids) {
@@ -966,7 +1144,8 @@ void FDMeshCommandQueue::submit_core_data_memcpy_request(
 MeshEvent FDMeshCommandQueue::enqueue_record_event_helper(
     ttsl::Span<const SubDeviceId> sub_device_ids,
     bool notify_host,
-    const std::optional<MeshCoordinateRange>& device_range) {
+    const std::optional<MeshCoordinateRange>& device_range,
+    EventRecord record) {
     if (this->get_target_device_type() == tt::TargetDevice::Mock ||
         this->get_target_device_type() == tt::TargetDevice::Emule) {
         // Return a dummy event for mock devices
@@ -977,10 +1156,16 @@ MeshEvent FDMeshCommandQueue::enqueue_record_event_helper(
     TT_FATAL(!trace_id_.has_value(), "Event Synchronization is not supported during trace capture.");
 
     auto& sysmem_manager = this->reference_sysmem_manager();
+    uint32_t event_id = 0;
+    if (record == EventRecord::Normal) event_id = sysmem_manager.get_next_event(id_);
+    else if (record == EventRecord::Drain) event_id = sysmem_manager.get_next_drain_event(id_);
     auto event = MeshEvent(
-        sysmem_manager.get_next_event(id_), *this, device_range.value_or(MeshCoordinateRange(mesh_device_->shape())));
+        event_id,
+        *this,
+        device_range.value_or(MeshCoordinateRange(mesh_device_->shape())));
 
     sub_device_ids = buffer_dispatch::select_sub_device_ids(mesh_device_, sub_device_ids);
+    event.impl().completion_ = capture_event_completion(event, sub_device_ids, record == EventRecord::Reset);
     auto dispatch_lambda = [this, &event, &sub_device_ids, notify_host](const MeshCoordinate& coord) {
         event_dispatch::issue_record_event_commands(
             mesh_device_,
@@ -1017,11 +1202,19 @@ MeshEvent FDMeshCommandQueue::enqueue_record_event(
 
 MeshEvent FDMeshCommandQueue::enqueue_record_event_to_host_nolock(
     ttsl::Span<const SubDeviceId> sub_device_ids, const std::optional<MeshCoordinateRange>& device_range) {
-    auto event = this->enqueue_record_event_helper(sub_device_ids, /*notify_host=*/true, device_range);
+    return enqueue_record_event_to_host_nolock(sub_device_ids, device_range, EventRecord::Normal);
+}
+
+MeshEvent FDMeshCommandQueue::enqueue_record_event_to_host_nolock(
+    ttsl::Span<const SubDeviceId> sub_device_ids,
+    const std::optional<MeshCoordinateRange>& device_range,
+    EventRecord record) {
+    auto event = this->enqueue_record_event_helper(sub_device_ids, /*notify_host=*/true, device_range, record);
     completion_queue_reads_.push(std::make_shared<MeshCompletionReaderVariant>(
         std::in_place_type<MeshReadEventDescriptor>,
         ReadEventDescriptor(event.impl().id()),
-        event.impl().device_range()));
+        event.impl().device_range(),
+        event.impl().completion_));
     this->increment_num_entries_in_completion_queue();
     auto& sub_device_cq_owner = cq_shared_state_->sub_device_cq_owner;
     for (const auto& sub_device_id : buffer_dispatch::select_sub_device_ids(mesh_device_, sub_device_ids)) {
@@ -1039,6 +1232,17 @@ MeshEvent FDMeshCommandQueue::enqueue_record_event_to_host(
 
 void FDMeshCommandQueue::enqueue_wait_for_event(const MeshEvent& sync_event) {
     auto lock = lock_api_function_();
+    if (const auto& completion = sync_event.impl().completion_) {
+        TT_FATAL(sync_event.device() == mesh_device_, "Recorded event wait requires its original MeshDevice");
+        TT_FATAL(sync_event.impl().mesh_cq_id() < mesh_device_->num_hw_cqs(),
+                 "Recorded event wait has no original command queue");
+        // Queues on the same MeshDevice share this API mutex. Validate the
+        // source under it without acquiring its lifetime lock in reverse order.
+        auto* source = dynamic_cast<FDMeshCommandQueue*>(
+            &mesh_device_->mesh_command_queue(sync_event.impl().mesh_cq_id()));
+        TT_FATAL(source, "Recorded event wait requires its original fast-dispatch queue");
+        source->validate_event_completion(*completion);
+    }
     in_use_ = true;
     TT_FATAL(!trace_id_.has_value(), "Event Synchronization is not supported during trace capture.");
     for_each_local(mesh_device_, sync_event.impl().device_range(), [&](const auto& coord) {
@@ -1184,7 +1388,20 @@ void FDMeshCommandQueue::read_completion_queue_event(MeshReadEventDescriptor& re
             channel,
             id_,
             device->sysmem_manager());
+        TT_FATAL(read_event_descriptor.completion,
+                 "Actual event read omitted its original SDK record");
+        auto& completion = *read_event_descriptor.completion;
+        TT_FATAL(completion.owner == event_owner_, "Actual event read belongs to another command queue");
+        std::lock_guard receipt_lock(event_owner_->receipt_mutex);
+        event_owner_->receipts.insert_or_assign(
+            device, EventOwner::Receipt{completion.epoch, completion.event_id});
     });
+    if (!exit_condition_.load() && !thread_exception_state_.load()) {
+        TT_FATAL(read_event_descriptor.completion, "Actual event read omitted its original SDK record");
+        // This immutable historical fact is sufficient to release the pinned
+        // transfer's barrier. It does not mutate an execution's stop/clean state.
+        read_event_descriptor.completion->observed.store(true, std::memory_order_release);
+    }
 }
 
 void FDMeshCommandQueue::read_l1_data_from_completion_queue(MeshCoreDataReadDescriptor& read_l1_data_descriptor) {
@@ -1213,6 +1430,14 @@ void FDMeshCommandQueue::reset_worker_state(
     const std::vector<std::pair<CoreRangeSet, uint32_t>>& core_go_message_mapping,
     ttsl::Span<const uint32_t> workers_per_sub_device) {
     MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
+    TT_FATAL(!thread_exception_state_.load(std::memory_order_acquire), "Cannot reset through a poisoned FD queue");
+    const auto target = this->get_target_device_type();
+    const bool simulated = target == tt::TargetDevice::Mock || target == tt::TargetDevice::Emule;
+    std::shared_ptr<::tt::tt_metal::detail::ProgramExecution> niu_execution;
+    std::optional<::tt::tt_metal::detail::ProgramExecution::Submission> niu_submission;
+    const auto old_subdevices = mesh_device_->get_sub_device_ids();
+    if (reset_launch_msg_state)
+        niu_execution = ::tt::tt_metal::detail::ProgramExecution::reserve_dispatch(*mesh_device_, old_subdevices);
     for (auto* device : mesh_device_->get_devices()) {
         TT_FATAL(!device->sysmem_manager().get_bypass_mode(), "Cannot reset worker state during trace capture");
     }
@@ -1264,17 +1489,28 @@ void FDMeshCommandQueue::reset_worker_state(
     }
     std::rotate(sub_device_setup_commands_.begin(), cached, std::next(cached));
     cached = sub_device_setup_commands_.begin();
-    for (size_t i = 0; i < devices.size(); ++i) {
-        // Old-manager completion counts remain dynamic. The cached tail still resets GO mailboxes
-        // and retains all barriers; batching changes only host submission granularity.
-        program_dispatch::reset_worker_dispatch_state_on_device(
-            mesh_device_,
-            devices[i]->sysmem_manager(),
-            id_,
-            this->virtual_program_dispatch_core(),
-            expected_num_workers_completed_,
-            reset_launch_msg_state,
-            cached->device_batches[i]);
+    if (niu_execution && !simulated) {
+        niu_executions_.reserve(niu_executions_.size() + 1);
+        NiuExecution pending{old_subdevices, niu_execution};
+        niu_submission.emplace(niu_execution->issue());
+        if (niu_execution->state == ::tt::tt_metal::detail::ProgramExecution::State::Issued)
+            niu_executions_.push_back(std::make_shared<NiuExecution>(std::move(pending)));
+    }
+    // Mock skips host CQ initialization and has no writable issue queue.
+    // Preserve Emule's existing model commands without giving it NIU receipts.
+    if (target != tt::TargetDevice::Mock) {
+        for (size_t i = 0; i < devices.size(); ++i) {
+            // Old-manager completion counts remain dynamic. The cached tail still resets GO mailboxes
+            // and retains all barriers; batching changes only host submission granularity.
+            program_dispatch::reset_worker_dispatch_state_on_device(
+                mesh_device_,
+                devices[i]->sysmem_manager(),
+                id_,
+                this->virtual_program_dispatch_core(),
+                expected_num_workers_completed_,
+                reset_launch_msg_state,
+                cached->device_batches[i]);
+        }
     }
     program_dispatch::reset_config_buf_mgrs_and_expected_workers(
         MetalContext::instance(mesh_device_->impl().get_context_id()).hal(),
@@ -1287,6 +1523,13 @@ void FDMeshCommandQueue::reset_worker_state(
             this->cq_shared_state_->worker_launch_message_buffer_state.begin(),
             this->cq_shared_state_->worker_launch_message_buffer_state.begin() + num_sub_devices,
             std::mem_fn(&LaunchMessageRingBufferState::reset));
+    }
+    if (niu_submission) niu_submission->commit();
+    // All local queues now contain the old-manager waits (and reset ACK waits
+    // when requested). Do not receive stop until a real subsequent host event.
+    if (!simulated) {
+        for (auto& pending : niu_executions_)
+            pending->completion_scope = NiuExecution::CompletionScope::QueuePrefix;
     }
 }
 
@@ -1335,9 +1578,12 @@ void FDMeshCommandQueue::write_go_signal_sequences_to_unused_sub_grids(
 void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blocking) {
     MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     auto lock = lock_api_function_();
+    TT_FATAL(!thread_exception_state_.load(std::memory_order_acquire), "Cannot replay through a poisoned FD queue");
     in_use_ = true;
     auto trace_inst = mesh_device_->get_mesh_trace(trace_id);
     auto descriptor = trace_inst->desc;
+    auto niu_execution = ::tt::tt_metal::detail::ProgramExecution::reserve_replay(
+        *mesh_device_, descriptor->niu_footprints_, descriptor->sub_device_ids);
     auto buffer = trace_inst->mesh_buffer;
     uint32_t num_sub_devices = descriptor->sub_device_ids.size();
     auto& sub_device_cq_owner = cq_shared_state_->sub_device_cq_owner;
@@ -1356,6 +1602,11 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
         buffer->num_pages(),
         buffer->address());
 
+    niu_executions_.reserve(niu_executions_.size() + 1);
+    NiuExecution niu_pending{descriptor->sub_device_ids, niu_execution};
+    auto niu_submission = niu_execution->issue();
+    if (niu_execution->state == ::tt::tt_metal::detail::ProgramExecution::State::Issued)
+        niu_executions_.push_back(std::make_shared<NiuExecution>(std::move(niu_pending)));
     for (auto* device : mesh_device_->get_devices()) {
         trace_dispatch::issue_trace_commands(
             mesh_device_, device->sysmem_manager(), dispatch_md, id_, expected_num_workers_completed_, dispatch_core_);
@@ -1370,6 +1621,7 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
         cq_shared_state_->worker_launch_message_buffer_state,
         config_buffer_mgr_,
         expected_num_workers_completed_);
+    niu_submission.commit();
 
     if (blocking) {
         this->finish_nolock();
@@ -1379,6 +1631,9 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
 void FDMeshCommandQueue::record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) {
     MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_trace();
     auto lock = lock_api_function_();
+    ctx->niu_footprints_.clear();
+    auto capture = ::tt::tt_metal::detail::ProgramExecution::reserve_dispatch(*mesh_device_, {});
+    ctx->niu_footprints_.push_back(capture->snapshot({}));
     trace_dispatch::reset_host_dispatch_state_for_trace(
         mesh_device_->num_sub_devices(),
         cq_shared_state_->worker_launch_message_buffer_state,
@@ -1775,15 +2030,31 @@ int FDMeshCommandQueue::get_prefetcher_cache_sizeB() const {
     return this->prefetcher_cache_manager_->get_cache_sizeB();
 }
 
-void FDMeshCommandQueue::wait_for_completion(bool reset_launch_msg_state) {
+bool FDMeshCommandQueue::wait_for_completion_nolock(bool reset_launch_msg_state) {
     MetalContext::instance(mesh_device_->impl().get_context_id()).validate_worker_stream_state_access();
-    if (in_use_) {
-        size_t num_sub_devices = mesh_device_->num_sub_devices();
-        for (auto* device : mesh_device_->get_devices()) {
-            TT_FATAL(!device->sysmem_manager().get_bypass_mode(), "Cannot reset worker state during trace capture");
-        }
-        cq_shared_state_->sub_device_cq_owner.clear();
-        cq_shared_state_->sub_device_cq_owner.resize(num_sub_devices);
+    if (!in_use_) return false;
+    TT_FATAL(!thread_exception_state_.load(std::memory_order_acquire), "Cannot reset through a poisoned FD queue");
+    const auto target = this->get_target_device_type();
+    const bool simulated = target == tt::TargetDevice::Mock || target == tt::TargetDevice::Emule;
+    std::shared_ptr<::tt::tt_metal::detail::ProgramExecution> niu_execution;
+    std::optional<::tt::tt_metal::detail::ProgramExecution::Submission> niu_submission;
+    const auto old_subdevices = mesh_device_->get_sub_device_ids();
+    if (reset_launch_msg_state)
+        niu_execution = ::tt::tt_metal::detail::ProgramExecution::reserve_dispatch(*mesh_device_, old_subdevices);
+    size_t num_sub_devices = mesh_device_->num_sub_devices();
+    for (auto* device : mesh_device_->get_devices()) {
+        TT_FATAL(!device->sysmem_manager().get_bypass_mode(), "Cannot reset worker state during trace capture");
+    }
+    cq_shared_state_->sub_device_cq_owner.clear();
+    cq_shared_state_->sub_device_cq_owner.resize(num_sub_devices);
+    if (niu_execution && !simulated) {
+        niu_executions_.reserve(niu_executions_.size() + 1);
+        NiuExecution pending{old_subdevices, niu_execution};
+        niu_submission.emplace(niu_execution->issue());
+        if (niu_execution->state == ::tt::tt_metal::detail::ProgramExecution::State::Issued)
+            niu_executions_.push_back(std::make_shared<NiuExecution>(std::move(pending)));
+    }
+    if (target != tt::TargetDevice::Mock) {
         for (auto* device : mesh_device_->get_devices()) {
             program_dispatch::reset_worker_dispatch_state_on_device(
                 mesh_device_,
@@ -1794,36 +2065,78 @@ void FDMeshCommandQueue::wait_for_completion(bool reset_launch_msg_state) {
                 reset_launch_msg_state,
                 /*setup_commands=*/{});
         }
-        program_dispatch::reset_config_buf_mgrs_and_expected_workers(
-            MetalContext::instance(mesh_device_->impl().get_context_id()).hal(),
-            config_buffer_mgr_,
-            expected_num_workers_completed_,
-            mesh_device_->num_sub_devices(),
-            mesh_device_->allocator_impl()->get_config().l1_unreserved_base);
-        if (reset_launch_msg_state) {
-            std::for_each(
-                this->cq_shared_state_->worker_launch_message_buffer_state.begin(),
-                this->cq_shared_state_->worker_launch_message_buffer_state.begin() + num_sub_devices,
-                std::mem_fn(&LaunchMessageRingBufferState::reset));
-        }
-        finish();
     }
+    program_dispatch::reset_config_buf_mgrs_and_expected_workers(
+        MetalContext::instance(mesh_device_->impl().get_context_id()).hal(),
+        config_buffer_mgr_,
+        expected_num_workers_completed_,
+        mesh_device_->num_sub_devices(),
+        mesh_device_->allocator_impl()->get_config().l1_unreserved_base);
+    if (reset_launch_msg_state) {
+        std::for_each(
+            this->cq_shared_state_->worker_launch_message_buffer_state.begin(),
+            this->cq_shared_state_->worker_launch_message_buffer_state.begin() + num_sub_devices,
+            std::mem_fn(&LaunchMessageRingBufferState::reset));
+    }
+    if (niu_submission) niu_submission->commit();
+    if (!simulated) {
+        for (auto& pending : niu_executions_)
+            pending->completion_scope = NiuExecution::CompletionScope::QueuePrefix;
+    }
+    // The last ID is reserved for this actual quiescence prefix, so normal
+    // event exhaustion cannot strand the following explicit epoch reset.
+    finish_prefix_nolock({}, EventRecord::Drain);
+    return true;
 }
 
-void FDMeshCommandQueue::finish_and_reset_in_use() {
+void FDMeshCommandQueue::synchronize_quiescence() {
+    {
+        TTZoneScopedDN(RT_PROFILER, "RealtimeProfilerSyncCheck");
+        mesh_device_->impl().trigger_realtime_profiler_sync_check();
+    }
+    active_distributed_context_->barrier();
+}
+
+void FDMeshCommandQueue::finish_and_reset_in_use_nolock() {
     if (in_use_) {
-        auto lock = lock_api_function_();
+        TT_FATAL(!thread_exception_state_.load(std::memory_order_acquire) &&
+                     !should_handle_exception_.load() && num_outstanding_reads_.load() == 0,
+                 "Event ID reset requires a successful actual quiescent queue prefix");
+        TT_FATAL(niu_executions_.empty(), "Event ID reset cannot discard pending NIU executions");
         uint32_t current_event = reference_sysmem_manager().get_current_event(id_);
         for (auto* device : mesh_device_->get_devices()) {
-            TT_ASSERT(
+            TT_FATAL(
                 device->sysmem_manager().get_last_completed_event(id_) == current_event,
                 "Current event must be equal to last completed event");
-            bool is_reference_cq = &device->sysmem_manager() == &reference_sysmem_manager();
-            // Ensure the next command will be recorded as event 0
-            device->sysmem_manager().set_current_and_last_completed_event(
-                id_, is_reference_cq ? UINT32_MAX : 0, UINT32_MAX);
         }
-        finish_nolock({});
+        // This actual reset replaces the identity owner. Retained events from
+        // the old epoch cannot observe or consume a reused numeric event ID.
+        event_epoch_ = std::make_shared<EventEpoch>();
+        last_recorded_event_id_ = 0;
+        {
+            std::lock_guard receipt_lock(event_owner_->receipt_mutex);
+            event_owner_->receipts.clear();
+        }
+        for (auto* device : mesh_device_->get_devices())
+            device->sysmem_manager().set_current_and_last_completed_event(id_, 0, 0);
+
+        const auto target = get_target_device_type();
+        if (target != tt::TargetDevice::Mock && target != tt::TargetDevice::Emule) {
+            auto event = enqueue_record_event_helper({}, true, std::nullopt, EventRecord::Reset);
+            completion_queue_reads_.push(std::make_shared<MeshCompletionReaderVariant>(
+                std::in_place_type<MeshReadEventDescriptor>,
+                ReadEventDescriptor(0),
+                event.impl().device_range(),
+                event.impl().completion_));
+            increment_num_entries_in_completion_queue();
+            std::unique_lock reads_lock(reads_processed_cv_mutex_);
+            wait_for_outstanding_reads(reads_lock);
+            reads_lock.unlock();
+            TT_FATAL(!thread_exception_state_.load(std::memory_order_acquire) &&
+                         !should_handle_exception_.load() && num_outstanding_reads_.load() == 0 &&
+                         receive_event_completion(*event.impl().completion_),
+                     "Event ID reset did not receive its actual reset event");
+        }
 
         in_use_ = false;
     }

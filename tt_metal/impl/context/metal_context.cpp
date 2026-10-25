@@ -16,6 +16,7 @@
 #include <tracy/Tracy.hpp>
 
 #include "metal_context.hpp"
+#include "niu_admission.hpp"
 #include "impl/lightmetal/lightmetal_capture.hpp"
 #include "context_types.hpp"
 #include <internal/service/service_core_manager.hpp>
@@ -398,7 +399,7 @@ MetalContext::worker_stream_state_provider(ChipId device_id) const {
 
 std::shared_ptr<const experimental::native_detail::LoadedFirmware>
 MetalContext::native_firmware(ChipId device_id) const {
-    return risc_firmware_initializer_ ? risc_firmware_initializer_->native_firmware(device_id) : nullptr;
+    return niu_admission_->native_firmware(device_id);
 }
 
 WorkerStreamStateAdmission::WorkerStreamStateAdmission()
@@ -711,7 +712,7 @@ void MetalContext::teardown_dispatch_state() {
 }
 
 MetalContext::MetalContext(ContextId context_id, tt::tt_metal::MetalEnv& metal_env) :
-    env_(&metal_env), context_id_(context_id) {
+    env_(&metal_env), context_id_(context_id), niu_admission_(std::make_shared<NiuAdmission>()) {
     check_context_id(context_id);
     // Construct before the dispatch managers: dispatch core (re)initialization queries it to exclude
     // claimed service cores from the FD pool.

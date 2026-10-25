@@ -27,6 +27,11 @@ public:
     Publication& operator=(const Publication&) = delete;
     const std::filesystem::path& payload() const { return payload_; }
     std::filesystem::path cache() const { return staging_ / "cache"; }
+    // Supplier compilation needs the source tree and the generated Hardware
+    // projection together. Keep this view private to publication; never write
+    // a runtime symlink into the shared source checkout.
+    std::filesystem::path create_build_root(
+        const std::filesystem::path& source, const std::filesystem::path& runtime);
     void copy(const std::filesystem::path& source, const std::filesystem::path& relative);
     void commit();
 

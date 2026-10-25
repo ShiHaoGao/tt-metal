@@ -5,13 +5,21 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/mesh_event.hpp>
 
+namespace tt::tt_metal::experimental {
+class PinnedMemoryImpl;
+}
+
 namespace tt::tt_metal::distributed {
 
 class MeshDevice;
+class FDMeshCommandQueue;
+class MeshEventCompletion;
 
 class MeshEventImpl {
 public:
@@ -23,6 +31,15 @@ public:
     const MeshCoordinateRange& device_range() const { return device_range_; }
 
 private:
+    friend class FDMeshCommandQueue;
+    friend void EventSynchronize(const MeshEvent& event);
+    friend bool EventQuery(const MeshEvent& event);
+    friend class ::tt::tt_metal::experimental::PinnedMemoryImpl;
+    // Only an actual SDK record can attach this receiver. Publicly constructed
+    // numeric events, including mock event zero, carry no execution authority.
+    std::optional<bool> query_completion() const;
+    bool completion_observed() const noexcept;
+    std::shared_ptr<MeshEventCompletion> completion_;
     uint32_t id_ = 0;
     MeshDevice* device_ = nullptr;
     uint32_t mesh_cq_id_ = 0;

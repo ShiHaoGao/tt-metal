@@ -7,10 +7,12 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include "hostdev/worker_stream_state_contract.h"
 #include "llrt/tt_elffile.hpp"
+#include "llrt/hal.hpp"
 
 namespace tt::tt_metal::experimental {
 namespace {
@@ -39,6 +41,87 @@ tt_native_image_record read_contract(ll_api::ElfFile& elf, uint8_t kind) {
         (result.loading != TT_NATIVE_LOADING_DISCRETE || result.worker_stream_owner != TT_NATIVE_WORKER_STREAM_SDK))
         throw std::invalid_argument("firmware requires discrete loading and SDK default worker ownership");
     return result;
+}
+
+std::optional<tt_niu_handoff_record> read_niu_handoff(ll_api::ElfFile& elf, uint8_t role) {
+    const auto bytes = elf.GetMetadataSection(TT_NIU_HANDOFF_SECTION, ll_api::ElfFile::MetadataSize::Nonempty);
+    if (bytes.empty()) return std::nullopt;
+    if (bytes.size() != sizeof(tt_niu_handoff_record))
+        throw std::invalid_argument("NIU handoff requires one exact capability record");
+    tt_niu_handoff_record result{};
+    std::memcpy(&result, bytes.data(), sizeof(result));
+    if (result.magic != TT_NIU_HANDOFF_MAGIC || result.version != TT_NIU_HANDOFF_VERSION ||
+        result.record_bytes != sizeof(result) || result.role != role ||
+        result.architecture != TT_NATIVE_ARCH_BLACKHOLE ||
+        result.noc_count != TT_NIU_HANDOFF_NOC_COUNT ||
+        result.selectors_per_noc != TT_NIU_HANDOFF_SELECTOR_COUNT ||
+        result.layout_version != TT_NIU_HANDOFF_LAYOUT_VERSION || result.protocol != TT_NIU_HANDOFF_PROTOCOL ||
+        result.l1_bytes != TT_NIU_HANDOFF_L1_BYTES || result.counter_bytes != TT_NIU_HANDOFF_COUNTER_BYTES ||
+        result.counter_contract != TT_NIU_HANDOFF_COUNTER_CONTRACT ||
+        result.processor_mask != TT_NIU_HANDOFF_PROCESSOR_MASK ||
+        result.request_offset != TT_NIU_HANDOFF_REQUEST_OFFSET ||
+        result.request_bytes != TT_NIU_HANDOFF_REQUEST_BYTES ||
+        result.receipt_offset != TT_NIU_HANDOFF_RECEIPT_OFFSET ||
+        result.receipt_bytes != TT_NIU_HANDOFF_RECEIPT_BYTES ||
+        result.traffic_contract != TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1)
+        throw std::invalid_argument("unsupported NIU handoff capability");
+    const uint64_t region_end = uint64_t(result.l1_base) + result.l1_bytes;
+    const uint64_t counters_end = uint64_t(result.dynamic_counter_base) + result.counter_bytes;
+    if (!result.l1_base || result.l1_base % TT_NIU_HANDOFF_ALIGNMENT ||
+        !result.dynamic_counter_base || result.dynamic_counter_base % alignof(uint32_t) ||
+        region_end > UINT32_MAX || counters_end > UINT32_MAX ||
+        (result.l1_base < counters_end && result.dynamic_counter_base < region_end))
+        throw std::invalid_argument("invalid NIU handoff address ranges");
+    return result;
+}
+
+struct NativeNocDeclaration {
+    tt_native_noc_record record;
+    std::vector<tt_native_noc_endpoint> endpoints;
+};
+
+std::optional<NativeNocDeclaration> read_noc_contract(ll_api::ElfFile& elf, uint8_t role) {
+    const auto bytes = elf.GetMetadataSection(TT_NATIVE_NOC_SECTION, ll_api::ElfFile::MetadataSize::Nonempty);
+    if (bytes.empty()) return std::nullopt;
+    if (bytes.size() < TT_NATIVE_NOC_HEADER_BYTES)
+        throw std::invalid_argument("native algorithm requires one complete NoC contract header");
+    const auto read8 = [&](size_t offset) { return std::to_integer<uint8_t>(bytes[offset]); };
+    const auto read16 = [&](size_t offset) {
+        return static_cast<uint16_t>(read8(offset) | (uint16_t(read8(offset + 1)) << 8));
+    };
+    const auto read32 = [&](size_t offset) {
+        return uint32_t(read16(offset)) | (uint32_t(read16(offset + 2)) << 16);
+    };
+    NativeNocDeclaration declaration{
+        {read32(0), read16(4), read16(6), read8(8), read8(9), read16(10),
+         read32(12), read32(16), read32(20), read16(24), read16(26)}, {}};
+    const auto& result = declaration.record;
+    if (result.magic != TT_NATIVE_NOC_MAGIC || result.version != TT_NATIVE_NOC_ABI_VERSION ||
+        result.role != role || result.architecture != TT_NATIVE_ARCH_BLACKHOLE ||
+        result.reserved || result.reserved2 || result.endpoint_count > TT_NATIVE_NOC_MAX_ENDPOINTS ||
+        result.traffic_contract != TT_NIU_TRAFFIC_TRACKED_ISSUING_NIU_V1 ||
+        ((result.l1_begin != 0 || result.l1_end != 0) &&
+         (result.l1_begin == 0 || result.l1_begin >= result.l1_end)))
+        throw std::invalid_argument("unsupported native algorithm NoC contract");
+    const size_t expected_bytes = TT_NATIVE_NOC_HEADER_BYTES +
+        size_t(result.endpoint_count) * sizeof(tt_native_noc_endpoint);
+    if (result.record_bytes != bytes.size() || bytes.size() != expected_bytes)
+        throw std::invalid_argument("native algorithm NoC endpoint count and section size differ");
+    declaration.endpoints.reserve(result.endpoint_count);
+    for (size_t offset = TT_NATIVE_NOC_HEADER_BYTES; offset != bytes.size();
+         offset += sizeof(tt_native_noc_endpoint)) {
+        const tt_native_noc_endpoint endpoint{read8(offset), read8(offset + 1), read8(offset + 2), read8(offset + 3)};
+        if (endpoint.noc >= TT_NATIVE_NOC_COUNT || endpoint.x >= TT_NATIVE_NOC_COORDINATE_LIMIT ||
+            endpoint.y >= TT_NATIVE_NOC_COORDINATE_LIMIT || endpoint.reserved)
+            throw std::invalid_argument("native algorithm has an invalid NoC endpoint");
+        if (!declaration.endpoints.empty()) {
+            const auto& previous = declaration.endpoints.back();
+            if (std::tie(previous.noc, previous.x, previous.y) >= std::tie(endpoint.noc, endpoint.x, endpoint.y))
+                throw std::invalid_argument("native algorithm NoC endpoints must be unique and sorted");
+        }
+        declaration.endpoints.push_back(endpoint);
+    }
+    return declaration;
 }
 
 void validate_executable(std::span<const std::byte> bytes, const ll_api::ElfFile& elf) {
@@ -82,10 +165,12 @@ struct Image {
 
 struct FirmwareBundle::Impl {
     std::array<Image, TT_NATIVE_ROLE_COUNT> images;
+    std::optional<tt_niu_handoff_record> niu_handoff;
 };
 
 struct KernelElfImage::Impl {
     Image image;
+    std::optional<NativeNocDeclaration> noc_contract;
     FirmwareBundle firmware;
     std::string label;
     Impl(FirmwareBundle fw, std::string_view text) : firmware(std::move(fw)), label(text) {}
@@ -108,6 +193,14 @@ FirmwareBundle FirmwareBundle::from_images(
         if (role && (image.contract.profile != owner->images[0].contract.profile ||
                      image.contract.print != owner->images[0].contract.print))
             throw std::invalid_argument("firmware bundle observation transports differ");
+        auto capability = read_niu_handoff(elf, role);
+        // Keep one canonical record only after every original ELF agrees.
+        // Normalizing the role here does not weaken its exact-role check above.
+        if (capability) capability->role = TT_NATIVE_ROLE_BRISC;
+        if (!role) owner->niu_handoff = capability;
+        else if (capability.has_value() != owner->niu_handoff.has_value() ||
+                 (capability && std::memcmp(&*capability, &*owner->niu_handoff, sizeof(*capability))))
+            throw std::invalid_argument("firmware bundle NIU handoff capabilities differ");
         image.exports = symbols(elf);
         image.memory = ll_api::memory(image.bytes, ll_api::memory::Loading::DISCRETE, label);
         constexpr std::array<std::string_view, 2> strong{"__fw_export_*", "__global_pointer$"};
@@ -127,6 +220,9 @@ std::span<const std::byte> FirmwareBundle::link_image_bytes(TensixKernelRole rol
 const tt_native_image_record& FirmwareBundle::contract(TensixKernelRole role) const {
     return impl_->images[index(role)].contract;
 }
+std::optional<tt_niu_handoff_record> FirmwareBundle::niu_handoff() const {
+    return impl_->niu_handoff;
+}
 bool FirmwareBundle::matches(const FirmwareBundle& other) const {
     if (impl_ == other.impl_) return true;
     for (size_t role = 0; role != TT_NATIVE_ROLE_COUNT; ++role)
@@ -143,6 +239,7 @@ KernelElfImage KernelElfImage::from_bytes(
     elf.ReadImage(image.bytes, label);
     validate_executable(image.bytes, elf);
     image.contract = read_contract(elf, TT_NATIVE_IMAGE_KERNEL);
+    owner->noc_contract = read_noc_contract(elf, image.contract.role);
     const auto role = static_cast<TensixKernelRole>(image.contract.role);
     const auto& available = firmware.contract(role);
     if ((image.contract.profile && image.contract.profile != available.profile) ||
@@ -178,12 +275,31 @@ KernelElfImage KernelElfImage::from_bytes(
 TensixKernelRole KernelElfImage::role() const { return static_cast<TensixKernelRole>(impl_->image.contract.role); }
 std::span<const std::byte> KernelElfImage::image_bytes() const { return impl_->image.bytes; }
 const tt_native_image_record& KernelElfImage::contract() const { return impl_->image.contract; }
+std::optional<tt_native_noc_record> KernelElfImage::noc_contract() const {
+    if (!impl_->noc_contract) return std::nullopt;
+    return impl_->noc_contract->record;
+}
+std::span<const tt_native_noc_endpoint> KernelElfImage::noc_endpoints() const {
+    if (!impl_->noc_contract) return {};
+    return impl_->noc_contract->endpoints;
+}
 const FirmwareBundle& KernelElfImage::firmware() const { return impl_->firmware; }
 std::string_view KernelElfImage::label() const { return impl_->label; }
 
 const ll_api::memory& native_detail::NativeImageAccess::memory(const KernelElfImage& image) { return image.impl_->image.memory; }
 const ll_api::memory& native_detail::NativeImageAccess::memory(const FirmwareBundle& image, TensixKernelRole role) {
     return image.impl_->images[index(role)].memory;
+}
+void native_detail::NativeImageAccess::validate_niu_handoff(const FirmwareBundle& firmware, const Hal& hal) {
+    const auto capability = firmware.niu_handoff();
+    if (!capability) return;
+    constexpr auto core = HalProgrammableCoreType::TENSIX;
+    if (hal.get_arch() != tt::ARCH::BLACKHOLE ||
+        capability->l1_base != hal.get_dev_addr(core, HalL1MemAddrType::NIU_HANDOFF) ||
+        capability->l1_bytes != hal.get_dev_size(core, HalL1MemAddrType::NIU_HANDOFF) ||
+        capability->dynamic_counter_base != hal.get_dev_addr(core, HalL1MemAddrType::NOC_DYNAMIC_COUNTERS) ||
+        capability->counter_bytes != hal.get_dev_size(core, HalL1MemAddrType::NOC_DYNAMIC_COUNTERS))
+        throw std::invalid_argument("NIU handoff declaration differs from the actual HAL layout");
 }
 void native_detail::NativeImageAccess::validate_compute(const NativeComputeConfig& images) {
     if (images.trisc0.role() != TensixKernelRole::Trisc0 || images.trisc1.role() != TensixKernelRole::Trisc1 ||

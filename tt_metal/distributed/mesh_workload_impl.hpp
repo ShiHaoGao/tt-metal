@@ -13,6 +13,9 @@
 #include "program/program_impl.hpp"
 
 namespace tt::tt_metal {
+namespace detail {
+class ProgramExecution;
+}
 namespace distributed {
 class MeshWorkloadImpl;
 class MeshDevice;
@@ -81,6 +84,8 @@ private:
     std::vector<std::vector<std::shared_ptr<KernelGroup>>> kernel_groups_;
     std::vector<Semaphore> semaphores_;
     std::unordered_map<MeshCoordinateRange, Program> programs_;
+    std::weak_ptr<::tt::tt_metal::detail::ProgramExecution> managed_niu_invocation_;
+    bool managed_niu_bound_ = false;
     // Presence marks the workload finalized and makes all derived enqueue metadata available together.
     std::optional<FinalizedMetadata> finalized_metadata_;
     std::unordered_map<MeshCoordinateRange, std::unordered_map<KernelHandle, RuntimeArgsPerCore>> runtime_args_;
@@ -99,6 +104,7 @@ private:
     friend void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload, bool blocking);
     friend FDMeshCommandQueue;
     friend class tt::tt_metal::Program;
+    friend class ::tt::tt_metal::detail::ProgramExecution;
 
     bool use_prefetcher_cache_ = false;
 

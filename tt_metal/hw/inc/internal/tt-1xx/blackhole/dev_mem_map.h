@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "hostdev/niu_handoff_layout.h"
+
 // This file contains the memory map for the tensix device
 //
 // It is included on the device, on the host and in linker scripts to
@@ -63,13 +65,20 @@
 #define MEM_BANK_OFFSET_SIZE 1024
 
 /////////////
-// Firmware/kernel code holes
-#define MEM_BRISC_FIRMWARE_SIZE (6 * 1024 + 2560)
-// TODO: perhaps put NCRISC FW in the scratch area and free 1.5K after init (GS/WH)
-#define MEM_NCRISC_FIRMWARE_SIZE 2560
-#define MEM_TRISC0_FIRMWARE_SIZE 2560
-#define MEM_TRISC1_FIRMWARE_SIZE 2560
-#define MEM_TRISC2_FIRMWARE_SIZE 2560
+// Firmware code holes share one fixed L1 envelope. BRISC owns the NIU handoff
+// and Program profiler; distribute the resident budget by that responsibility.
+// All five roles, their reset-PC values and firmware-derived kernel imports
+// must be rebuilt together when this software layout changes.
+#define MEM_TENSIX_FIRMWARE_SIZE 18944
+#define MEM_BRISC_FIRMWARE_SIZE 10944
+#define MEM_NCRISC_FIRMWARE_SIZE 2240
+#define MEM_TRISC0_FIRMWARE_SIZE 2272
+#define MEM_TRISC1_FIRMWARE_SIZE 1216
+#define MEM_TRISC2_FIRMWARE_SIZE 2272
+#if (MEM_BRISC_FIRMWARE_SIZE + MEM_NCRISC_FIRMWARE_SIZE + MEM_TRISC0_FIRMWARE_SIZE + \
+     MEM_TRISC1_FIRMWARE_SIZE + MEM_TRISC2_FIRMWARE_SIZE) != MEM_TENSIX_FIRMWARE_SIZE
+#error "Tensix firmware code holes must preserve their complete L1 envelope"
+#endif
 
 // Blackhole Architecture - No IRAM constraints
 // Per-kernel limits set to maximum available L1
@@ -177,8 +186,14 @@
 
 // Read-only reserved memory boundary for watcher checks
 #define MEM_MAP_READ_ONLY_END (MEM_TENSIX_FABRIC_CONNECTIONS_BASE + MEM_TENSIX_FABRIC_OFFSET_OF_ALIGNED_INFO)
+// NIU handoff is a separate region, never part of the launch mailbox or the
+// existing dynamic counter bank. Reserve it before kernel configuration.
+#define MEM_NIU_HANDOFF_BASE \
+    (((MEM_PACKET_HEADER_POOL_BASE + MEM_PACKET_HEADER_POOL_SIZE + TT_NIU_HANDOFF_ALIGNMENT - 1) / \
+      TT_NIU_HANDOFF_ALIGNMENT) * TT_NIU_HANDOFF_ALIGNMENT)
+#define MEM_NIU_HANDOFF_SIZE TT_NIU_HANDOFF_L1_BYTES
 // Read-write reserved memory boundary for watcher checks
-#define MEM_MAP_END (MEM_PACKET_HEADER_POOL_BASE + MEM_PACKET_HEADER_POOL_SIZE)
+#define MEM_MAP_END (MEM_NIU_HANDOFF_BASE + MEM_NIU_HANDOFF_SIZE)
 
 // Every address after MEM_MAP_END is a "scratch" address
 // These can be used by FW during init, but aren't usable once FW reaches "ready"

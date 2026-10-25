@@ -8,6 +8,8 @@
 #include "context/context_types.hpp"
 #include "context/metal_env_accessor.hpp"
 #include "device_impl.hpp"
+#include "impl/program/program_execution.hpp"
+#include <array>
 
 #include <core_descriptor.hpp>
 #include <host_api.hpp>
@@ -400,6 +402,7 @@ void Device::init_command_queue_device_with_topology(DispatchTopology* topo) {
     TT_ASSERT(topo != nullptr, "Dispatch topology required for init_command_queue_device_with_topology");
     this->command_queue_programs_.push_back(topo->get_compiled_cq_program(this));
     TT_ASSERT(this->command_queue_programs_.size() == 1);
+    auto execution = detail::ProgramExecution::reserve(*this->command_queue_programs_[0], std::array<IDevice*, 1>{this});
     this->configure_command_queue_programs(topo);
     Program& command_queue_program = *this->command_queue_programs_[0];
     MetalEnvImpl& env_impl = MetalEnvAccessor(*env_).impl();
@@ -464,6 +467,7 @@ void Device::init_command_queue_device_with_topology(DispatchTopology* topo) {
     }
 
     std::vector<std::vector<CoreCoord>> logical_cores = command_queue_program.impl().logical_cores();
+    auto submission = execution->issue();
     for (uint32_t index = 0; index < hal.get_programmable_core_type_count(); index++) {
         const auto& logical_dispatch_cores = logical_cores[index];
         CoreType core_type = hal.get_core_type(index);
@@ -512,6 +516,7 @@ void Device::init_command_queue_device_with_topology(DispatchTopology* topo) {
         command_queue->set_go_signal_noc_data_and_dispatch_sems(
             num_sub_devices(), noc_mcast_unicast_data, workers_per_sub_device);
     }
+    submission.commit();
 }
 
 void Device::init_command_queue_device() { TT_FATAL(false, "Call init_command_queue_device_with_topology instead"); }
@@ -525,6 +530,7 @@ void Device::configure_fabric() {
     if (fabric_program_ == nullptr) {
         return;
     }
+    auto execution = detail::ProgramExecution::reserve(*fabric_program_, std::array<IDevice*, 1>{this});
 
     tt::tt_fabric::configure_fabric_cores(this);
 
@@ -539,6 +545,7 @@ void Device::configure_fabric() {
     env_impl.get_cluster().l1_barrier(this->id());
     std::vector<std::vector<CoreCoord>> logical_cores_used_in_program = fabric_program_->impl().logical_cores();
     const auto& hal = env_impl.get_hal();
+    auto submission = execution->issue();
     for (uint32_t programmable_core_type_index = 0; programmable_core_type_index < logical_cores_used_in_program.size();
          programmable_core_type_index++) {
         CoreType core_type = hal.get_core_type(programmable_core_type_index);
@@ -558,6 +565,7 @@ void Device::configure_fabric() {
                 hal.get_dev_addr(this->get_programmable_core_type(physical_core), HalL1MemAddrType::LAUNCH));
         }
     }
+    submission.commit();
     log_debug(tt::LogMetal, "Fabric initialized on Device {}", this->id_);
 }
 
@@ -568,6 +576,7 @@ bool Device::initialize(
     size_t worker_l1_size,
     ttsl::Span<const std::uint32_t> l1_bank_remap,
     bool minimal) {
+    context_->niu_admission().validate_device_open(this->id_);
     context_->validate_worker_stream_state_access();
     ZoneScoped;
     // Every initialization call should enable program cache
@@ -696,6 +705,7 @@ bool Device::close() {
         .get_service_core_manager()
         .impl()
         .on_device_close(this->id_);
+    context_->niu_admission().withdraw_device(this->id_);
 
     this->disable_and_clear_program_cache();
     this->set_program_cache_misses_allowed(true);

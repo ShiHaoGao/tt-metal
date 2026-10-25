@@ -6,10 +6,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 
 #include "hostdev/native_kernel_contract.h"
+#include "hostdev/niu_handoff_contract.h"
 #include "tt-metalium/core_coord.hpp"
 #include "tt-metalium/kernel_types.hpp"
 
@@ -38,6 +40,9 @@ public:
     std::span<const std::byte> image_bytes(TensixKernelRole role) const;
     std::span<const std::byte> link_image_bytes(TensixKernelRole role) const;
     const tt_native_image_record& contract(TensixKernelRole role) const;
+    // Parsed immutable declaration only; live boot and receipt admission are
+    // separate. The canonical record has BRISC role after five-role agreement.
+    std::optional<tt_niu_handoff_record> niu_handoff() const;
     bool matches(const FirmwareBundle& other) const;
 private:
     struct Impl;
@@ -56,6 +61,11 @@ public:
     TensixKernelRole role() const;
     std::span<const std::byte> image_bytes() const;
     const tt_native_image_record& contract() const;
+    // Immutable algorithm declaration only. It does not create a firmware
+    // capability, boot, NIU reservation, or completion receipt.
+    std::optional<tt_native_noc_record> noc_contract() const;
+    // Borrowed immutable view retained by this image's shared owner.
+    std::span<const tt_native_noc_endpoint> noc_endpoints() const;
     const FirmwareBundle& firmware() const;
     std::string_view label() const;
 private:

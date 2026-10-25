@@ -65,6 +65,14 @@ protected:
     tt::TargetDevice get_target_device_type() const;
 
 private:
+    friend class MeshDeviceImpl;
+    // MeshDevice holds its shared API lock across queue selection, all drains,
+    // and every event-epoch reset. Individual queue calls use the same hooks.
+    virtual bool wait_for_completion_nolock(bool) { return false; }
+    virtual void finish_and_reset_in_use_nolock() {}
+    // Profiler and distributed synchronization run after releasing the API lock.
+    virtual void synchronize_quiescence() {}
+
     // Helper functions for read and write entire Sharded-MeshBuffers
     void write_sharded_buffer(const MeshBuffer& buffer, const void* src);
     void read_sharded_buffer(MeshBuffer& buffer, void* dst);
@@ -163,9 +171,19 @@ public:
         bool blocking,
         ttsl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
 
-    virtual void wait_for_completion(bool) {}
+    void wait_for_completion(bool reset_launch_msg_state) {
+        bool completed;
+        {
+            auto lock = lock_api_function_();
+            completed = wait_for_completion_nolock(reset_launch_msg_state);
+        }
+        if (completed) synchronize_quiescence();
+    }
     // May only be called after wait_for_completion has been called on both command queues on the device.
-    virtual void finish_and_reset_in_use() {}
+    void finish_and_reset_in_use() {
+        auto lock = lock_api_function_();
+        finish_and_reset_in_use_nolock();
+    }
 };
 
 }  // namespace tt::tt_metal::distributed

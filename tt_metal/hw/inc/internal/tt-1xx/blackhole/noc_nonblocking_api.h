@@ -51,16 +51,6 @@ constexpr std::underlying_type_t<EthProcessorTypes> proc_type =
 
 ////
 /*TODO: RT review this file, currently using wormhole b0 copy, check if any changes needed for BH*/
-constexpr uint32_t DYNAMIC_NOC_NCRISC_WR_CMD_BUF = 2;  // all writes share cmd buf
-constexpr uint32_t DYNAMIC_NOC_NCRISC_WR_REG_CMD_BUF = 2;
-constexpr uint32_t DYNAMIC_NOC_NCRISC_AT_CMD_BUF = 3;
-constexpr uint32_t DYNAMIC_NOC_NCRISC_RD_CMD_BUF = 3;
-
-constexpr uint32_t DYNAMIC_NOC_BRISC_WR_CMD_BUF = 0;  // all writes share cmd buf
-constexpr uint32_t DYNAMIC_NOC_BRISC_WR_REG_CMD_BUF = 0;
-constexpr uint32_t DYNAMIC_NOC_BRISC_AT_CMD_BUF = 1;
-constexpr uint32_t DYNAMIC_NOC_BRISC_RD_CMD_BUF = 1;
-
 constexpr uint32_t NCRISC_WR_CMD_BUF = 0;      // for large writes
 constexpr uint32_t NCRISC_RD_CMD_BUF = 1;      // for all reads
 constexpr uint32_t NCRISC_WR_REG_CMD_BUF = 2;  // for small writes (e.g., registers, semaphores)

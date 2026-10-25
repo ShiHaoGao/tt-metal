@@ -304,16 +304,10 @@ void PinnedMemoryImpl::add_barrier_event(const distributed::MeshEvent& event) {
             barrier_events_.pop_front();
             continue;
         }
-        bool all_devices_completed = true;
-        for (const auto& coord : event.impl().device_range()) {
-            auto* physical_device = event.device()->impl().get_device(coord);
-            if (physical_device->sysmem_manager().get_last_completed_event(event.impl().mesh_cq_id()) <
-                event.impl().id()) {
-                all_devices_completed = false;
-                break;
-            }
-        }
-        if (all_devices_completed) {
+        // The caller may hold the queue API lock. Consume only the private,
+        // fully read device response; do not query numeric progress or invoke a
+        // receiver that acquires that lock and advances managed execution state.
+        if (event.impl().completion_observed()) {
             barrier_events_.pop_front();
         } else {
             break;
@@ -326,7 +320,9 @@ bool PinnedMemoryImpl::lock_may_block() const { return !barrier_events_.empty();
 void PinnedMemoryImpl::drain_barrier_events() {
     while (!barrier_events_.empty()) {
         auto& event = barrier_events_.front();
-        distributed::EventSynchronize(event);
+        // A fully read original transfer stays complete after its queue closes
+        // or changes epoch. This retires only this barrier, never a later one.
+        if (!event.impl().completion_observed()) distributed::EventSynchronize(event);
         barrier_events_.pop_front();
     }
 }

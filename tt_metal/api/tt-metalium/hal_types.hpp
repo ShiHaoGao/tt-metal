@@ -69,6 +69,8 @@ enum class HalL1MemAddrType : uint8_t {
     TENSIX_FABRIC_CONNECTIONS,
     FABRIC_CONNECTION_LOCK,
     ETH_PTP_TRACE,  // Runtime FW entry/exit PTP stamps (Blackhole only)
+    NIU_HANDOFF,
+    NOC_DYNAMIC_COUNTERS,
     COUNT           // Keep this last so it always indicates number of enum options
 };
 

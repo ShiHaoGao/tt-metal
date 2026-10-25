@@ -22,6 +22,9 @@
 #ifndef TT_NATIVE_FIRMWARE_SDK_ROOT
 #error "The supplier tool must be built against an explicit SDK source root"
 #endif
+#ifndef TT_NATIVE_FIRMWARE_RUNTIME_ROOT
+#error "The supplier tool requires its generated Hardware projection"
+#endif
 
 namespace tt::tt_metal::native_firmware_bundle {
 namespace {
@@ -62,9 +65,10 @@ void publish(const DeploymentPublishOptions& paths) {
     const auto sdk = fs::canonical(TT_NATIVE_FIRMWARE_SDK_ROOT);
     require_shell_path(sdk);
     require_shell_path(publication.cache());
+    const auto build_root = publication.create_build_root(sdk, TT_NATIVE_FIRMWARE_RUNTIME_ROOT);
     const auto mode = facts.profile == "program" ? DeviceProfilerMode::Program : DeviceProfilerMode::Disabled;
     llrt::RunTimeOptions options(llrt::RunTimeOptions::ExplicitBuildOptions{
-        .root_dir = sdk.string(), .cache_dir = publication.cache().string(), .profiler_mode = mode});
+        .root_dir = build_root.string(), .cache_dir = publication.cache().string(), .profiler_mode = mode});
     options.set_disable_precompiled_fw(true);
     options.set_enable_2_erisc_mode(true);
     const auto profiler_bytes = get_profiler_dram_bank_size_for_hal_allocation(options);

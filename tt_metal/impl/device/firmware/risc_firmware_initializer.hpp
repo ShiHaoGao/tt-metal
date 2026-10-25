@@ -49,7 +49,6 @@ public:
     void run_async_build_phase(const std::set<tt::ChipId>& device_ids);
     void run_launch_phase(const std::set<tt::ChipId>& device_ids);
     std::shared_ptr<const WorkerStreamStateProvider> worker_stream_state_provider(tt::ChipId device_id) const;
-    std::shared_ptr<const experimental::native_detail::LoadedFirmware> native_firmware(tt::ChipId device_id) const;
 
 private:
     void withdraw_worker_stream_state();
@@ -134,6 +133,7 @@ private:
     std::unordered_map<tt::ChipId, std::shared_ptr<const WorkerStreamStateProvider>> worker_providers_;
     std::unordered_map<tt::ChipId, uint8_t> native_loaded_roles_;
     std::unordered_map<tt::ChipId, std::shared_ptr<const experimental::native_detail::LoadedFirmware>> native_firmware_;
+    std::unordered_map<tt::ChipId, std::shared_ptr<detail::NiuLedger>> native_niu_ledgers_;
     bool initialized_ = false;
 };
 

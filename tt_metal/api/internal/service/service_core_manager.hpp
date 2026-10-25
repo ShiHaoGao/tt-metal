@@ -44,8 +44,10 @@ class ServiceCoreManagerImpl;
 // Supported configurations: Blackhole or UBB Galaxy, with an active manual FD session.
 // claim() and get_claimable_cores() TT_FATAL outside these conditions.
 //
-// NOTE: not thread-safe api. Expected usage is sequential calls from the main thread during
-// application setup/teardown.
+// Expected usage remains sequential calls from the main thread during application setup/teardown.
+// Claim state and per-core allocator access share the context NIU admission lock with dispatch
+// assignment. This serialization does not extend device, program, or returned-address lifetimes
+// and does not make application launch/teardown sequences generally thread-safe.
 //
 // No-mixing contract: a program runs entirely on claimed service cores or entirely on the worker
 // grid - never both. And a MeshWorkload is entirely a service workload (all programs on service
@@ -97,17 +99,19 @@ public:
     //   - no manual FD session is active (the pool is only fully partitioned after
     //     initialize_fast_dispatch() completes; calling before that returns a misleading set)
     //   - no cores are available (all dispatch-column cores are in use by FD or already claimed)
-    // Use this immediately before claim() — the query and then claim is the intended idiom.
+    // This is a snapshot. claim() revalidates the complete request against the current pool.
     std::vector<CoreCoord> get_claimable_cores(IDevice* device) const;
 
     // Reserve one or more free FD-column cores for service use. Constructs a per-core L1
-    // allocator for each claimed core. Claimed cores are explicitly removed from
-    // dispatch_core_manager's pool on every initialize_fast_dispatch() so FD never
-    // allocates them, regardless of how many FD teardown/re-init cycles occur.
+    // allocator for each claimed core. The entire batch is validated and reserved before any
+    // claim is published. Dispatch queries and allocations immediately exclude these cores,
+    // including after FD teardown/re-init cycles.
     // TT_FATALs if:
     //   - arch is not Blackhole or UBB Galaxy
     //   - no manual FD session is active (initialize_fast_dispatch not yet called)
-    //   - any core in the list is already claimed
+    //   - the device belongs to another context or dispatch uses non-worker cores
+    //   - any requested core is duplicated, already claimed, or allocated by dispatch
+    //   - a physical worker NIU cannot admit its ordinary reservation
     void claim(IDevice* device, const std::vector<CoreCoord>& cores);
 
     // Release one or more claimed cores and destroy their L1 allocators. All addresses
@@ -116,6 +120,9 @@ public:
     // Caller contract: the service kernel must already be stopped before release() - the
     // runtime cannot detect completion of a persistent (looping) kernel. Pair with wait_done()
     // when the caller needs to block until the kernel has actually exited.
+    // An unlaunched, still-reserved claim can relinquish its NIU reservation. A claim marked
+    // launched retains a quarantined NIU reservation: neither release() nor wait_done() is a
+    // separate NIU-clean receipt, so they cannot authorize physical NIU reuse.
     void release(IDevice* device, const std::vector<CoreCoord>& cores);
 
     // Block until the persistent service kernel on `core` of `device` has returned (left the GO

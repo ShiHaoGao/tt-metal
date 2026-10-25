@@ -4,8 +4,12 @@
 
 #include <internal/service/service_core_manager.hpp>
 #include "impl/internal/service/service_core_manager_impl.hpp"
+#include "impl/program/program_execution.hpp"
 
 #include <memory>
+#include <algorithm>
+#include <array>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -15,6 +19,7 @@
 #include <tt-metalium/tt_align.hpp>
 #include "impl/allocator/algorithms/free_list_opt.hpp"
 #include "impl/context/metal_env_impl.hpp"
+#include "impl/device/device_impl.hpp"
 #include "impl/dispatch/dispatch_core_manager.hpp"
 #include "impl/context/metal_context.hpp"
 #include <tt-metalium/device.hpp>
@@ -43,36 +48,91 @@ std::pair<DeviceAddr, DeviceAddr> l1_service_range(const Hal& hal) {
 
 ServiceCoreManagerImpl::ServiceCoreManagerImpl(MetalEnvImpl& env, MetalContext& ctx) : env_(env), ctx_(ctx) {}
 
+void ServiceCoreManagerImpl::validate_device(const IDevice* device) const {
+    TT_FATAL(dynamic_cast<const Device*>(device) != nullptr, "Service cores require an actual local Device");
+    TT_FATAL(device != nullptr && extract_context_id(device) == ctx_.get_context_id(),
+             "Service core device belongs to another context");
+}
+
 void ServiceCoreManagerImpl::claim(IDevice* device, const std::vector<CoreCoord>& cores) {
+    validate_device(device);
     const auto& cluster = env_.get_cluster();
     TT_FATAL(
         cluster.is_ubb_galaxy() || cluster.arch() == tt::ARCH::BLACKHOLE,
         "Service core claims are only supported on Blackhole and UBB Galaxy clusters.");
-    TT_FATAL(
-        env_.get_rtoptions().get_fast_dispatch(),
-        "Service cores can only be claimed while Fast Dispatch is active. "
-        "Call initialize_fast_dispatch() before claim().");
-
-    auto& state = devices_[device->id()];
-    // Capture FD Grid snapshot. Useful to create truly disjoint-worker-sets if we switch to SD
-    // later.
-    if (state.cores.empty()) {
-        state.fd_compute_grid = device->compute_with_storage_grid_size();
+    auto& admission = ctx_.niu_admission();
+    auto guard = admission.lock();
+    TT_FATAL(env_.get_rtoptions().get_fast_dispatch(),
+             "Service cores can only be claimed while Fast Dispatch is active. "
+             "Call initialize_fast_dispatch() before claim().");
+    auto& dispatch = ctx_.get_dispatch_core_manager();
+    TT_FATAL(dispatch.get_dispatch_core_type() == CoreType::WORKER,
+             "Service cores require a worker dispatch pool");
+    const auto available = dispatch.get_available_dispatch_cores_locked(guard, device->id());
+    std::set<CoreCoord> requested;
+    for (const auto& core : cores) {
+        TT_FATAL(requested.insert(core).second, "Service core claim repeats core {}", core);
+        TT_FATAL(std::find(available.begin(), available.end(), core) != available.end(),
+                 "Service core {} is no longer available on device {}", core, device->id());
     }
+    if (cores.empty()) return;
 
-    // Init per-core allocator
-    auto [base, size] = l1_service_range(env_.get_hal());
+    // Stage all allocators and map nodes before reserving any NIU. Map node
+    // transfer below cannot allocate, so a rejected batch publishes no claims.
+    std::map<ChipId, DeviceServiceState> pending;
+    auto& staged = pending[device->id()];
+    staged.fd_compute_grid = tt::get_compute_grid_size(
+        env_, device->id(), device->num_hw_cqs(), dispatch.get_dispatch_core_config());
+    const auto [base, size] = l1_service_range(env_.get_hal());
     const DeviceAddr dram_align = env_.get_hal().get_alignment(HalMemType::DRAM);
     for (const auto& core : cores) {
-        auto& slot = state.cores[core];
-        TT_FATAL(!slot.alloc, "internal::ServiceCoreManager::claim: core {} is already claimed", core);
+        auto& slot = staged.cores[core];
         slot.alloc = std::make_unique<allocator::FreeListOpt>(
             size, base, dram_align, dram_align, allocator::FreeListOpt::SearchPolicy::FIRST);
         slot.alloc->init();
     }
+    std::vector<CoreState*> reserved;
+    reserved.reserve(cores.size());
+    try {
+        for (auto& [core, state] : staged.cores) {
+            const auto physical = cluster.get_soc_desc(device->id()).get_physical_tensix_core_from_logical(core);
+            const std::array keys{detail::NiuKey{device->id(), physical, detail::NiuNoc::Noc0},
+                                  detail::NiuKey{device->id(), physical, detail::NiuNoc::Noc1}};
+            std::string error;
+            auto token = admission.reserve_ordinary_locked(guard, keys, error);
+            TT_FATAL(token.has_value(), "Service core NIU reservation failed: {}", error);
+            state.reservation = std::move(*token);
+            reserved.push_back(&state);
+        }
+    } catch (...) {
+        for (auto* state : reserved) {
+            std::string ignored;
+            admission.cancel_unissued_locked(guard, state->reservation, ignored);
+        }
+        throw;
+    }
+    auto current = devices_.find(device->id());
+    if (current == devices_.end()) {
+        devices_.merge(pending);
+    } else {
+        if (current->second.cores.empty()) current->second.fd_compute_grid = staged.fd_compute_grid;
+        current->second.cores.merge(staged.cores);
+    }
+}
+
+void ServiceCoreManagerImpl::retire_claim_locked(const NiuAdmission::Guard& guard, CoreState& core) {
+    auto& admission = ctx_.niu_admission();
+    std::string error;
+    // Actual issued/stopped exclusions belong to ProgramExecution. The claim
+    // remains a planning reservation, independently of launch-once metadata.
+    if (admission.cancel_unissued_locked(guard, core.reservation, error)) return;
+    TT_FATAL(admission.quarantine_locked(guard, core.reservation, error),
+             "Cannot retain released service NIU reservation: {}", error);
 }
 
 void ServiceCoreManagerImpl::release(IDevice* device, const std::vector<CoreCoord>& cores) {
+    validate_device(device);
+    auto guard = ctx_.niu_admission().lock();
     auto it = devices_.find(device->id());
     if (it == devices_.end()) {
         log_warning(
@@ -82,8 +142,18 @@ void ServiceCoreManagerImpl::release(IDevice* device, const std::vector<CoreCoor
             device->id());
         return;
     }
+    // Retain all launched exclusions before erasing any public claim.
     for (const auto& core : cores) {
-        if (it->second.cores.erase(core) == 0) {
+        auto found = it->second.cores.find(core);
+        if (found != it->second.cores.end() && found->second.launched)
+            retire_claim_locked(guard, found->second);
+    }
+    for (const auto& core : cores) {
+        auto found = it->second.cores.find(core);
+        if (found != it->second.cores.end()) {
+            if (!found->second.launched) retire_claim_locked(guard, found->second);
+            it->second.cores.erase(found);
+        } else {
             log_warning(
                 tt::LogMetal,
                 "internal::ServiceCoreManager::release: core {} was not claimed on device {}; skipped.",
@@ -94,13 +164,24 @@ void ServiceCoreManagerImpl::release(IDevice* device, const std::vector<CoreCoor
 }
 
 void ServiceCoreManagerImpl::wait_done(IDevice* device, CoreCoord core) const {
+    validate_device(device);
     const auto physical_core = device->virtual_core_from_logical_core(core, CoreType::WORKER);
     std::unordered_set<CoreCoord> not_done{physical_core};
     auto& context = MetalContext::instance(extract_context_id(device));
+    const auto physical = context.get_cluster().get_soc_desc(device->id()).get_physical_tensix_core_from_logical(core);
+    auto completion = detail::ProgramExecution::observe_cores(context, device->id(), {physical});
     tt::llrt::internal_::wait_until_cores_done(context, device->id(), dev_msgs::RUN_MSG_GO, not_done);
+    completion.receive();
 }
 
 std::unordered_set<CoreCoord> ServiceCoreManagerImpl::claimed_cores(ChipId device_id) const {
+    auto guard = ctx_.niu_admission().lock();
+    return claimed_cores_locked(guard, device_id);
+}
+
+std::unordered_set<CoreCoord> ServiceCoreManagerImpl::claimed_cores_locked(
+    const NiuAdmission::Guard& guard, ChipId device_id) const {
+    ctx_.niu_admission().validate_guard(guard);
     std::unordered_set<CoreCoord> out;
     auto it = devices_.find(device_id);
     if (it != devices_.end()) {
@@ -112,6 +193,7 @@ std::unordered_set<CoreCoord> ServiceCoreManagerImpl::claimed_cores(ChipId devic
 }
 
 std::optional<CoreCoord> ServiceCoreManagerImpl::get_safe_compute_grid(ChipId device_id) const {
+    auto guard = ctx_.niu_admission().lock();
     auto it = devices_.find(device_id);
     if (it == devices_.end() || it->second.cores.empty()) {
         return std::nullopt;
@@ -120,14 +202,13 @@ std::optional<CoreCoord> ServiceCoreManagerImpl::get_safe_compute_grid(ChipId de
 }
 
 std::vector<CoreCoord> ServiceCoreManagerImpl::get_claimable_cores(IDevice* device) const {
+    validate_device(device);
+    auto guard = ctx_.niu_admission().lock();
     TT_FATAL(
         env_.get_rtoptions().get_fast_dispatch(),
         "get_claimable_cores() requires Fast Dispatch to be active. "
         "Call initialize_fast_dispatch() first.");
-    auto available = ctx_.get_dispatch_core_manager().get_available_dispatch_cores(device->id());
-    // Filter out cores already claimed in this session so consecutive calls reflect current state.
-    const auto claimed = claimed_cores(device->id());
-    std::erase_if(available, [&claimed](const CoreCoord& c) { return claimed.contains(c); });
+    auto available = ctx_.get_dispatch_core_manager().get_available_dispatch_cores_locked(guard, device->id());
     TT_FATAL(
         !available.empty(),
         "No claimable dispatch-column cores on device {}. "
@@ -136,9 +217,16 @@ std::vector<CoreCoord> ServiceCoreManagerImpl::get_claimable_cores(IDevice* devi
     return available;
 }
 
-void ServiceCoreManagerImpl::on_device_close(ChipId device_id) { devices_.erase(device_id); }
+void ServiceCoreManagerImpl::on_device_close(ChipId device_id) {
+    auto guard = ctx_.niu_admission().lock();
+    auto found = devices_.find(device_id);
+    if (found == devices_.end()) return;
+    for (auto& [core, state] : found->second.cores) retire_claim_locked(guard, state);
+    devices_.erase(found);
+}
 
 bool ServiceCoreManagerImpl::has_any_claims() const {
+    auto guard = ctx_.niu_admission().lock();
     for (const auto& [id, state] : devices_) {
         if (!state.cores.empty()) {
             return true;
@@ -147,7 +235,8 @@ bool ServiceCoreManagerImpl::has_any_claims() const {
     return false;
 }
 
-void ServiceCoreManagerImpl::mark_launched(ChipId device_id, CoreCoord core) {
+void ServiceCoreManagerImpl::validate_launch(ChipId device_id, CoreCoord core) {
+    auto guard = ctx_.niu_admission().lock();
     auto dit = devices_.find(device_id);
     if (dit == devices_.end()) {
         return;
@@ -162,15 +251,46 @@ void ServiceCoreManagerImpl::mark_launched(ChipId device_id, CoreCoord core) {
         "enqueue; release() it before enqueueing again.",
         core,
         device_id);
-    cit->second.launched = true;
+    std::string error;
+    TT_FATAL(ctx_.niu_admission().validate_ordinary_locked(guard, cit->second.reservation, error),
+             "Service core NIU reservation is no longer admissible: {}", error);
+}
+
+std::vector<ServiceCoreManagerImpl::CoreState*> ServiceCoreManagerImpl::prepare_launch_locked(
+    const NiuAdmission::Guard& guard, const detail::ProgramExecution& execution) {
+    ctx_.niu_admission().validate_guard(guard);
+    TT_FATAL(execution.owner.lock() == ctx_.niu_admission_owner().lock(),
+             "Service launch belongs to another NIU admission owner");
+    std::vector<CoreState*> claims;
+    for (const auto& [chip, workers] : execution.footprint) {
+        auto device = devices_.find(chip);
+        if (device == devices_.end()) continue;
+        const auto& soc = env_.get_cluster().get_soc_desc(chip);
+        for (auto& [logical, claim] : device->second.cores) {
+            if (!workers.contains(soc.get_physical_tensix_core_from_logical(logical))) continue;
+            TT_FATAL(!claim.launched, "Service core has already received its launch");
+            std::string error;
+            TT_FATAL(ctx_.niu_admission().validate_ordinary_locked(guard, claim.reservation, error),
+                     "Service launch NIU admission failed: {}", error);
+            claims.push_back(&claim);
+        }
+    }
+    return claims;
+}
+
+void ServiceCoreManagerImpl::commit_launch_locked(const std::vector<CoreState*>& claims) noexcept {
+    for (auto* claim : claims) claim->launched = true;
 }
 
 bool ServiceCoreManagerImpl::is_service_core(ChipId device_id, CoreCoord core) const {
+    auto guard = ctx_.niu_admission().lock();
     auto it = devices_.find(device_id);
     return it != devices_.end() && it->second.cores.contains(core);
 }
 
 DeviceAddr ServiceCoreManagerImpl::allocate_l1(IDevice* device, CoreCoord core, size_t size) {
+    validate_device(device);
+    auto guard = ctx_.niu_admission().lock();
     auto dit = devices_.find(device->id());
     TT_FATAL(
         dit != devices_.end() && dit->second.cores.contains(core),
@@ -182,6 +302,8 @@ DeviceAddr ServiceCoreManagerImpl::allocate_l1(IDevice* device, CoreCoord core, 
 }
 
 void ServiceCoreManagerImpl::reserve_l1_to_top(IDevice* device, CoreCoord core, DeviceAddr addr) {
+    validate_device(device);
+    auto guard = ctx_.niu_admission().lock();
     auto dit = devices_.find(device->id());
     TT_FATAL(
         dit != devices_.end() && dit->second.cores.contains(core),
@@ -216,6 +338,8 @@ void ServiceCoreManagerImpl::reserve_l1_to_top(IDevice* device, CoreCoord core, 
 }
 
 void ServiceCoreManagerImpl::deallocate_l1(IDevice* device, CoreCoord core, DeviceAddr addr) {
+    validate_device(device);
+    auto guard = ctx_.niu_admission().lock();
     auto dit = devices_.find(device->id());
     TT_FATAL(
         dit != devices_.end() && dit->second.cores.contains(core),
@@ -225,6 +349,8 @@ void ServiceCoreManagerImpl::deallocate_l1(IDevice* device, CoreCoord core, Devi
 }
 
 size_t ServiceCoreManagerImpl::bytes_available(IDevice* device, CoreCoord core) const {
+    validate_device(device);
+    auto guard = ctx_.niu_admission().lock();
     auto dit = devices_.find(device->id());
     TT_FATAL(
         dit != devices_.end() && dit->second.cores.contains(core),
@@ -239,6 +365,7 @@ size_t ServiceCoreManagerImpl::bytes_available(IDevice* device, CoreCoord core) 
 }
 
 std::optional<DeviceAddr> ServiceCoreManagerImpl::lowest_allocated_address(ChipId device_id, CoreCoord core) const {
+    auto guard = ctx_.niu_admission().lock();
     auto dit = devices_.find(device_id);
     if (dit == devices_.end()) {
         return std::nullopt;

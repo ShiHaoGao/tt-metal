@@ -26,6 +26,9 @@
 #include "hostdev/dev_msgs.h"
 #include "hostdev/worker_stream_state_contract.h"
 #include "internal/native_firmware_contract.h"
+#ifdef ARCH_BLACKHOLE
+#include "internal/niu_handoff.h"
+#endif
 #include "hostdev/remote_dfb_constants.h"
 #include "internal/risc_attribs.h"
 #include "internal/circular_buffer_interface.h"
@@ -87,6 +90,142 @@ uint32_t noc_nonposted_writes_num_issued[NUM_NOCS] __attribute__((used));
 uint32_t noc_nonposted_writes_acked[NUM_NOCS] __attribute__((used));
 uint32_t noc_nonposted_atomics_acked[NUM_NOCS] __attribute__((used));
 uint32_t noc_posted_writes_num_issued[NUM_NOCS] __attribute__((used));
+
+// Boot, stage transitions and profiler controls use the same five-counter
+// snapshot. Retain the register-read order in the original hardware helper.
+__attribute__((noinline)) static void initialize_control_counters(uint32_t noc) {
+    noc_local_state_init(noc);
+}
+
+// GO and unmanaged control completion issue the same dispatcher write. Keep
+// that MMIO sequence in one body while each caller retains its own ordering.
+__attribute__((noinline)) static void notify_dispatcher(uint64_t dispatch_addr, uint8_t dispatch_noc) {
+    notify_dispatch_core_done(dispatch_addr, dispatch_noc);
+}
+
+struct LaunchNotification {
+    launch_msg_t* launch_msg_address;
+    uint32_t launch_msg_rd_ptr;
+    decltype(launch_msg_t{}.kernel_config.mode) dispatch_mode;
+
+    void operator()() const {
+        // A preloaded launch may enter before GO arrives. Snapshot its
+        // notification only after the real GO was consumed, before DONE.
+        const uint32_t go_message_index = mailboxes->go_message_index;
+        const uint64_t dispatch_addr = calculate_dispatch_addr(&mailboxes->go_messages[go_message_index]);
+        mailboxes->go_messages[go_message_index].signal = RUN_MSG_DONE;
+        DEVICE_PRINT_KERNEL_FINISHED();
+
+        // Notify dispatcher core that tensix has completed running kernels, if the launch_msg was populated
+        if (dispatch_mode == DISPATCH_MODE_DEV) {
+            // Set launch message to invalid, so that the next time this slot is encountered, kernels are only run
+            // if a valid launch message is sent.
+            launch_msg_address->kernel_config.enables = 0;
+            launch_msg_address->kernel_config.preload = 0;
+            DEBUG_SANITIZE_NOC_ADDR(noc_index, dispatch_addr, 4);
+            // Only executed if watcher is enabled. Ensures that we don't report stale data due to invalid launch
+            // messages in the ring buffer. Must be executed before the atomic increment, as after that the launch
+            // message is no longer owned by us.
+            CLEAR_PREVIOUS_LAUNCH_MESSAGE_ENTRY_FOR_WATCHER();
+            notify_dispatcher(dispatch_addr, noc_index);
+            mailboxes->launch_msg_rd_ptr = (launch_msg_rd_ptr + 1) & (launch_msg_buffer_num_entries - 1);
+        }
+    }
+};
+
+#if defined(ARCH_BLACKHOLE)
+namespace {
+tt::niu_handoff::Receiver niu_handoff_receiver;
+volatile tt::niu_handoff::Admission niu_handoff_failure = tt::niu_handoff::Admission::Disabled;
+
+[[noreturn]] void reject_niu_handoff() {
+    niu_handoff_failure = tt::niu_handoff::Admission::Rejected;
+    WAYPOINT("NIUH");
+    while (true) invalidate_l1_cache();
+}
+
+struct NiuHandoffIO {
+    const LaunchNotification* notify_body = nullptr;
+
+    void invalidate() {
+        // On Blackhole the same full fence also invalidates the L1 cache.
+        // Keep the compiler memory barrier without issuing that fence twice.
+        asm volatile("fence iorw, iorw" ::: "memory");
+    }
+    void poll() { invalidate(); }
+    uint32_t requestGeneration() {
+        auto* region = reinterpret_cast<volatile tt_l1_ptr tt_niu_handoff_region*>(MEM_NIU_HANDOFF_BASE);
+        return region->request.request_generation;
+    }
+    __attribute__((noinline, optimize("no-tree-loop-optimize"))) tt_niu_handoff_request readRequest() {
+        tt_niu_handoff_request result;
+        auto* source = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(MEM_NIU_HANDOFF_BASE);
+        auto* destination = reinterpret_cast<uint32_t*>(&result);
+#pragma GCC unroll 0
+        for (unsigned word = 0; word != sizeof(result) / sizeof(uint32_t); ++word)
+            destination[word] = source[word];
+        return result;
+    }
+    uint8_t subordinateSignal(unsigned role) {
+        auto* signals = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(subordinate_sync);
+        return signals[role];
+    }
+    static constexpr uint8_t doneSignal() { return RUN_SYNC_MSG_DONE; }
+    uint32_t sourceExpected(unsigned noc, unsigned risc, unsigned counter) {
+        auto* counters = reinterpret_cast<volatile tt_l1_ptr NocBarrierCounter*>(MEM_NOC_COUNTER_BASE);
+        return counters->noc[noc].risc[risc].barrier[counter];
+    }
+    uint32_t observedCounter(unsigned noc, unsigned counter) {
+        static constexpr uint32_t status[] = {NIU_MST_RD_RESP_RECEIVED, NIU_MST_NONPOSTED_WR_REQ_SENT,
+                                      NIU_MST_WR_ACK_RECEIVED, NIU_MST_ATOMIC_RESP_RECEIVED,
+                                      NIU_MST_POSTED_WR_REQ_SENT};
+        return NOC_STATUS_READ_REG(noc, status[counter]);
+    }
+    uint32_t controlExpected(unsigned noc, unsigned counter) {
+        static uint32_t* const banks[] = {
+            noc_reads_num_issued, noc_nonposted_writes_num_issued, noc_nonposted_writes_acked,
+            noc_nonposted_atomics_acked, noc_posted_writes_num_issued};
+        if (counter >= TT_NIU_HANDOFF_COUNTER_COUNT) reject_niu_handoff();
+        return banks[counter][noc];
+    }
+    __attribute__((noinline, optimize("no-tree-loop-optimize"))) static void initializeCommands() {
+        noc_init(MEM_NOC_ATOMIC_RET_VAL_ADDR);
+    }
+    __attribute__((noinline, optimize("no-tree-loop-optimize"))) void rebaseControl() {
+#pragma GCC unroll 0
+        for (unsigned noc = 0; noc != NUM_NOCS; ++noc) initialize_control_counters(noc);
+    }
+    void notify() { (*notify_body)(); }
+    bool descriptorReady(unsigned noc, unsigned buffer) { return noc_cmd_buf_ready(noc, buffer); }
+    void descriptorReadback(unsigned noc, unsigned buffer) {
+        (void)NOC_CMD_BUF_READ_REG(noc, buffer, NOC_CMD_CTRL);
+    }
+    tt_niu_handoff_selector_observation selectorObserved(unsigned noc, unsigned selector) {
+        return {NOC_STATUS_READ_REG(noc, NIU_MST_REQS_OUTSTANDING_ID(selector)),
+                NOC_STATUS_READ_REG(noc, NIU_MST_WRITE_REQS_OUTGOING_ID(selector))};
+    }
+    void invalidateReceipt() {
+        auto* sequence = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+            MEM_NIU_HANDOFF_BASE + offsetof(tt_niu_handoff_region, receipt));
+        *sequence = UINT32_MAX;
+        asm volatile("fence iorw, iorw" ::: "memory");
+    }
+    void publish(const tt_niu_handoff_receipt& receipt) {
+        auto* destination = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+            MEM_NIU_HANDOFF_BASE + offsetof(tt_niu_handoff_region, receipt));
+        auto* source = reinterpret_cast<const uint32_t*>(&receipt);
+        destination[0] = receipt.header.publish_sequence - 1;
+        asm volatile("fence iorw, iorw" ::: "memory");
+#pragma GCC unroll 0
+        for (unsigned word = 1; word != sizeof(receipt) / sizeof(uint32_t); ++word)
+            destination[word] = source[word];
+        asm volatile("fence iorw, iorw" ::: "memory");
+        destination[0] = receipt.header.publish_sequence;
+        asm volatile("fence iorw, iorw" ::: "memory");
+    }
+};
+}  // namespace
+#endif
 
 CBInterface cb_interface[NUM_CIRCULAR_BUFFERS] __attribute__((used));
 
@@ -446,12 +585,28 @@ int main() {
     // Initialize the NoCs to a safe state
     // This ensures if we send any noc txns without running a kernel setup are valid
     // ex. Immediately after starting, we send a RUN_MSG_RESET_READ_PTR signal
+#if defined(ARCH_BLACKHOLE)
+    NiuHandoffIO::initializeCommands();
+    // Boot has not released any source issuer. Initialize both actual NIUs,
+    // then let initializeBoot prove descriptor and control closure.
+    NiuHandoffIO boot_io;
+    boot_io.rebaseControl();
+#else
     noc_init(MEM_NOC_ATOMIC_RET_VAL_ADDR);
     noc_local_state_init(noc_index);
+#endif
     noc_clear_all_packet_tags();
     // Boot owns the quiescent platform state independently of any launch.
     // Host-visible readiness must follow the actual TRISC0 MMIO acknowledgment.
     complete_worker_stream_reset(worker_stream_state::Decision::ClearSdkCounters);
+#if defined(ARCH_BLACKHOLE)
+    // This boot owns the reserved handoff mailbox before reporting readiness.
+    auto* handoff_words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(MEM_NIU_HANDOFF_BASE);
+#pragma GCC unroll 0
+    for (unsigned word = 0; word != MEM_NIU_HANDOFF_SIZE / sizeof(uint32_t); ++word) handoff_words[word] = 0;
+    asm volatile("fence iorw, iorw" ::: "memory");
+    if (!niu_handoff_receiver.initializeBoot(boot_io)) reject_niu_handoff();
+#endif
     mailboxes->go_messages[0].signal = RUN_MSG_DONE;
 
     DeviceProfilerInit();
@@ -472,36 +627,58 @@ int main() {
             if ((go_message_signal == RUN_MSG_RESET_READ_PTR) ||
                 (go_message_signal == RUN_MSG_RESET_READ_PTR_FROM_HOST) ||
                 (go_message_signal == RUN_MSG_REPLAY_TRACE)) {
-                // Set the rd_ptr on workers to specified value
-                mailboxes->launch_msg_rd_ptr = 0;
-                if (go_message_signal == RUN_MSG_RESET_READ_PTR || go_message_signal == RUN_MSG_REPLAY_TRACE) {
-                    if (go_message_signal == RUN_MSG_REPLAY_TRACE) {
-                        DeviceIncrementTraceCount();
-                        DeviceTraceOnlyProfilerInit();
+                auto unmanaged_control = [&] {
+                    // Set the rd_ptr on workers to specified value
+                    mailboxes->launch_msg_rd_ptr = 0;
+                    if (go_message_signal == RUN_MSG_RESET_READ_PTR || go_message_signal == RUN_MSG_REPLAY_TRACE) {
+                        if (go_message_signal == RUN_MSG_REPLAY_TRACE) {
+                            DeviceIncrementTraceCount();
+                            DeviceTraceOnlyProfilerInit();
+                        }
+                        uint32_t go_message_index = mailboxes->go_message_index;
+                        // Querying the noc_index is safe here, since the RUN_MSG_RESET_READ_PTR go signal is currently
+                        // guaranteed to only be seen after a RUN_MSG_GO signal, which will set the noc_index to a valid
+                        // value. For future proofing, the noc_index value is initialized to 0, to ensure an invalid NOC txn
+                        // is not issued.
+                        uint64_t dispatch_addr = calculate_dispatch_addr(&mailboxes->go_messages[go_message_index]);
+                        mailboxes->go_messages[go_message_index].signal = RUN_MSG_DONE;
+                        // Notify dispatcher that this has been done
+                        DEBUG_SANITIZE_NOC_ADDR(noc_index, dispatch_addr, 4);
+                        notify_dispatcher(dispatch_addr, noc_index);
                     }
-                    uint32_t go_message_index = mailboxes->go_message_index;
-                    // Querying the noc_index is safe here, since the RUN_MSG_RESET_READ_PTR go signal is currently
-                    // guaranteed to only be seen after a RUN_MSG_GO signal, which will set the noc_index to a valid
-                    // value. For future proofing, the noc_index value is initialized to 0, to ensure an invalid NOC txn
-                    // is not issued.
-                    uint64_t dispatch_addr = calculate_dispatch_addr(&mailboxes->go_messages[go_message_index]);
-                    mailboxes->go_messages[go_message_index].signal = RUN_MSG_DONE;
-                    // Notify dispatcher that this has been done
-                    DEBUG_SANITIZE_NOC_ADDR(noc_index, dispatch_addr, 4);
-                    notify_dispatch_core_done(dispatch_addr, noc_index);
-                }
+                };
+#if defined(ARCH_BLACKHOLE)
+                // Revoke the old boot/managed receipt before reset or replay
+                // can send. Control commands do not consume an execution GO.
+                if (niu_handoff_receiver.runUnmanagedControl(boot_io, unmanaged_control) ==
+                    tt::niu_handoff::Admission::Rejected)
+                    reject_niu_handoff();
+#else
+                unmanaged_control();
+#endif
             }
         }
 
+#if defined(ARCH_BLACKHOLE)
+        // Preload can enter this path before GO. Admission must observe the
+        // actual GO and its installed request before any source is released.
+        wait_for_go_message();
+#endif
         WAYPOINT("GD");
 
-        {
+        // Retain the original launch slot before its release.
+        const uint32_t launch_msg_rd_ptr = mailboxes->launch_msg_rd_ptr;
+        launch_msg_t* launch_msg_address = &(mailboxes->launch[launch_msg_rd_ptr]);
+        const auto dispatch_mode = launch_msg_address->kernel_config.mode;
+        const LaunchNotification notify{launch_msg_address, launch_msg_rd_ptr, dispatch_mode};
+#if defined(ARCH_BLACKHOLE)
+        NiuHandoffIO handoff_io{&notify};
+#endif
+        auto run_body = [&] {
             // Only include this iteration in the device profile if the launch message is valid. This is because all
             // workers get a go signal regardless of whether they're running a kernel or not. We don't want to profile
             // "invalid" iterations.
             DeviceZoneScopedMainN("BRISC-FW");
-            uint32_t launch_msg_rd_ptr = mailboxes->launch_msg_rd_ptr;
-            launch_msg_t* launch_msg_address = &(mailboxes->launch[launch_msg_rd_ptr]);
             DeviceValidateProfiler(launch_msg_address->kernel_config.enables);
             DeviceZoneSetCounter(launch_msg_address->kernel_config.host_assigned_id);
 
@@ -509,6 +686,17 @@ int main() {
             uint32_t reload_round = 0;
             do {
                 uint32_t enables = launch_msg_address->kernel_config.enables;
+#if defined(ARCH_BLACKHOLE)
+                // This receipt contract supports the shared two-producer counts.
+                // Reject unsupported sources before any subordinate is released.
+                if (niu_handoff_receiver.active() &&
+                    ((enables & ~TT_NIU_HANDOFF_PROCESSOR_MASK) != 0 ||
+                     (enables != 0 && launch_msg_address->kernel_config.brisc_noc_mode != DM_DYNAMIC_NOC)))
+                    reject_niu_handoff();
+                // Prove the previous boot/stage/control tail before any
+                // noc_local_state_init or dynamic bank reinitialization.
+                niu_handoff_receiver.prepareStage(handoff_io);
+#endif
                 // Empty dispatch wakeups own no worker stream state. For a
                 // populated launch, receive and snapshot the owner before any
                 // CB setup, NCRISC LOAD or issuer GO can have side effects.
@@ -535,7 +723,6 @@ int main() {
                 debug_checkpoint_init(enables);
 #endif
                 ArmPerfCounters();
-                run_triscs(enables);
 
                 noc_index = launch_msg_address->kernel_config.brisc_noc_id;
                 noc_mode = launch_msg_address->kernel_config.brisc_noc_mode;
@@ -546,11 +733,15 @@ int main() {
                 uint8_t cmd_buf;
                 if (noc_mode == DM_DEDICATED_NOC) {
                     if (prev_noc_mode != noc_mode) {
+#if defined(ARCH_BLACKHOLE)
+                        NiuHandoffIO::initializeCommands();
+#else
                         noc_init(MEM_NOC_ATOMIC_RET_VAL_ADDR);
+#endif
                     }
 #ifdef ARCH_BLACKHOLE
                     // Need to add this to allow adding barrier after setup_remote_cb_interfaces
-                    noc_local_state_init(noc_index);
+                    initialize_control_counters(noc_index);
 #endif
                     cmd_buf = BRISC_AT_CMD_BUF;
                 } else {
@@ -562,8 +753,16 @@ int main() {
                 }
                 prev_noc_mode = noc_mode;
 
+#if defined(ARCH_BLACKHOLE)
+                niu_handoff_receiver.beginStage(
+                    handoff_io, enables != 0 ? tt::niu_handoff::Source::BlackholeDynamic : tt::niu_handoff::Source::None,
+                    enables);
+#endif
+
                 uint32_t tt_l1_ptr* cb_l1_base =
                     (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg_address->kernel_config.local_cb_offset);
+                // Every actual kernel release follows the source baseline.
+                run_triscs(enables);
                 start_ncrisc_kernel_run_early(enables);
 
                 // Run the BRISC kernel
@@ -614,7 +813,7 @@ int main() {
                     // This was not initialized in the kernel
                     // Currently FW does not issue a barrier except when using profiler
                     if (noc_mode == DM_DEDICATED_NOC) {
-                        noc_local_state_init(noc_index);
+                        initialize_control_counters(noc_index);
                     }
 #endif
                     // Brisc is responsible for issuing any noc cmds needed when initializing remote cbs
@@ -637,61 +836,56 @@ int main() {
 
                 wait_ncrisc_trisc();
 
-                // BRISC reads perf counters after TRISCs finish (BRISC has NOC access for DRAM push).
-                ReadPerfCounters();
-
-                if constexpr (ASSERT_ENABLED) {
-                    if (noc_mode == DM_DYNAMIC_NOC) {
-                        WAYPOINT("NKFW");
-                        // Assert that no noc transactions are outstanding, to ensure that all reads and writes have
-                        // landed and the NOC interface is in a known idle state for the next kernel.
-                        invalidate_l1_cache();
-                        for (int noc = 0; noc < NUM_NOCS; noc++) {
-                            ASSERT(ncrisc_dynamic_noc_reads_flushed(noc));
-                            ASSERT(ncrisc_dynamic_noc_nonposted_writes_sent(noc));
-                            ASSERT(ncrisc_dynamic_noc_nonposted_writes_flushed(noc));
-                            ASSERT(ncrisc_dynamic_noc_nonposted_atomics_flushed(noc));
-                            ASSERT(ncrisc_dynamic_noc_posted_writes_sent(noc));
-                            ASSERT(ncrisc_noc_packet_tags_cleared(noc), DebugAssertNCriscNOCPacketTagClearedTripped);
+                auto close_stage_control = [&] {
+                    if constexpr (ASSERT_ENABLED) {
+                        if (noc_mode == DM_DYNAMIC_NOC) {
+                            WAYPOINT("NKFW");
+                            // Assert that no noc transactions are outstanding, to ensure that all reads and writes have
+                            // landed and the NOC interface is in a known idle state for the next kernel.
+                            invalidate_l1_cache();
+                            for (int noc = 0; noc < NUM_NOCS; noc++) {
+                                ASSERT(ncrisc_dynamic_noc_reads_flushed(noc));
+                                ASSERT(ncrisc_dynamic_noc_nonposted_writes_sent(noc));
+                                ASSERT(ncrisc_dynamic_noc_nonposted_writes_flushed(noc));
+                                ASSERT(ncrisc_dynamic_noc_nonposted_atomics_flushed(noc));
+                                ASSERT(ncrisc_dynamic_noc_posted_writes_sent(noc));
+                                ASSERT(ncrisc_noc_packet_tags_cleared(noc), DebugAssertNCriscNOCPacketTagClearedTripped);
+                            }
+                            WAYPOINT("NKFD");
                         }
-                        WAYPOINT("NKFD");
                     }
-                }
 
-                // Cleanup belongs to the completed launch, not a later slot.
-                // Wait for it before stage reload, DONE, dispatch notification
-                // or ring-slot release. Program-owned counters are untouched.
-                complete_worker_stream_reset(stream_state);
-
+                    // These profiler quick-push sends use BRISC dedicated counts.
+                    // Run only after the actual dynamic source has closed.
+                    ReadPerfCounters();
+                    // Stream cleanup completes before reload or slot release.
+                    complete_worker_stream_reset(stream_state);
 #if defined(PROFILE_KERNEL)
-                if (noc_mode == DM_DYNAMIC_NOC) {
-                    // re-init for profiler to able to run barrier in dedicated noc mode
-                    noc_local_state_init(noc_index);
-                }
+                    if (noc_mode == DM_DYNAMIC_NOC
+#if defined(ARCH_BLACKHOLE)
+                        && !niu_handoff_receiver.active()
+#endif
+                    ) {
+                        initialize_control_counters(noc_index);
+                    }
+#endif
+                };
+#if defined(ARCH_BLACKHOLE)
+                niu_handoff_receiver.closeStage(handoff_io, close_stage_control);
+#else
+                close_stage_control();
 #endif
 
             } while (reload_next_stage(launch_msg_address, reload_stage, reload_round));
 
-            uint32_t go_message_index = mailboxes->go_message_index;
-            mailboxes->go_messages[go_message_index].signal = RUN_MSG_DONE;
-            DEVICE_PRINT_KERNEL_FINISHED();
-
-            // Notify dispatcher core that tensix has completed running kernels, if the launch_msg was populated
-            if (launch_msg_address->kernel_config.mode == DISPATCH_MODE_DEV) {
-                // Set launch message to invalid, so that the next time this slot is encountered, kernels are only run
-                // if a valid launch message is sent.
-                launch_msg_address->kernel_config.enables = 0;
-                launch_msg_address->kernel_config.preload = 0;
-                uint64_t dispatch_addr = calculate_dispatch_addr(&mailboxes->go_messages[go_message_index]);
-                DEBUG_SANITIZE_NOC_ADDR(noc_index, dispatch_addr, 4);
-                // Only executed if watcher is enabled. Ensures that we don't report stale data due to invalid launch
-                // messages in the ring buffer. Must be executed before the atomic increment, as after that the launch
-                // message is no longer owned by us.
-                CLEAR_PREVIOUS_LAUNCH_MESSAGE_ENTRY_FOR_WATCHER();
-                notify_dispatch_core_done(dispatch_addr, noc_index);
-                mailboxes->launch_msg_rd_ptr = (launch_msg_rd_ptr + 1) & (launch_msg_buffer_num_entries - 1);
-            }
-        }
+        };
+#if defined(ARCH_BLACKHOLE)
+        if (niu_handoff_receiver.runGo(handoff_io, run_body) == tt::niu_handoff::Admission::Rejected)
+            reject_niu_handoff();
+#else
+        run_body();
+        notify();
+#endif
     }
 
     return 0;

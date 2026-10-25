@@ -75,8 +75,51 @@ typedef struct tt_native_image_record {
     uint8_t reserved;
 } tt_native_image_record;
 
+// Independent algorithm qualification, emitted only after the compiler has
+// verified the actual role program. Reusable startup/observation support must
+// not emit it. The complete linked ELF retains it outside every PT_LOAD.
+#define TT_NATIVE_NOC_SECTION ".tt_native_noc"
+#define TT_NATIVE_NOC_MAGIC UINT32_C(0x434f4e54)
+#define TT_NATIVE_NOC_ABI_VERSION UINT16_C(1)
+#define TT_NATIVE_NOC_HEADER_BYTES UINT16_C(28)
+// Blackhole noc_parameters.h defines NOC_ADDR_NODE_ID_BITS as six. Keep
+// device-only register macros out of the host image-loading ABI.
+#define TT_NATIVE_NOC_COORDINATE_LIMIT UINT16_C(64)
+#define TT_NATIVE_NOC_COUNT UINT16_C(2)
+#define TT_NATIVE_NOC_MAX_ENDPOINTS UINT16_C(8192)
+typedef struct tt_native_noc_endpoint {
+    uint8_t noc;
+    uint8_t x;
+    uint8_t y;
+    uint8_t reserved;
+} tt_native_noc_endpoint;
+
+typedef struct tt_native_noc_record {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t record_bytes;
+    uint8_t role;
+    uint8_t architecture;
+    uint16_t reserved;
+    uint32_t traffic_contract;
+    // Conservative half-open envelope of every algorithm L1 memory access.
+    // Zero/zero means no accesses. The live SDK must exclude its actual
+    // configured firmware/kernel loading region before managed admission.
+    uint32_t l1_begin;
+    uint32_t l1_end;
+    // record_bytes includes this header and the complete endpoint table.
+    // Entries follow in strictly increasing (noc, x, y) order. These are
+    // encoded remote destinations/sources, not proof of live ownership.
+    uint16_t endpoint_count;
+    uint16_t reserved2;
+} tt_native_noc_record;
+
 #if defined(__cplusplus)
 static_assert(sizeof(tt_native_image_record) == 16, "native image ABI size changed");
+static_assert(sizeof(tt_native_noc_record) == TT_NATIVE_NOC_HEADER_BYTES, "native NoC ABI size changed");
+static_assert(sizeof(tt_native_noc_endpoint) == 4, "native NoC endpoint ABI size changed");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(tt_native_image_record) == 16, "native image ABI size changed");
+_Static_assert(sizeof(tt_native_noc_record) == TT_NATIVE_NOC_HEADER_BYTES, "native NoC ABI size changed");
+_Static_assert(sizeof(tt_native_noc_endpoint) == 4, "native NoC endpoint ABI size changed");
 #endif

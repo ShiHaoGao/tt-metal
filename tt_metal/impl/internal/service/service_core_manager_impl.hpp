@@ -5,6 +5,7 @@
 #pragma once
 
 #include <memory>
+#include <map>
 #include <optional>
 #include <stddef.h>
 #include <unordered_map>
@@ -15,6 +16,7 @@
 #include <umd/device/types/cluster_descriptor_types.hpp>
 
 #include "impl/allocator/algorithms/free_list_opt.hpp"
+#include "impl/context/niu_admission.hpp"
 
 namespace tt::tt_metal {
 class IDevice;
@@ -77,27 +79,37 @@ public:
     // True if `core` is claimed as a service core on `device_id`. Used at enqueue time to route
     // programs to the SD path and to device-scope placement/CB validation.
     bool is_service_core(ChipId device_id, CoreCoord core) const;
-    // Enforces launch-once: marks a claimed service core as launched, TT_FATALing if it
-    // already was. A claimed core accepts a single service-workload enqueue until release()
-    // clears the claim. No-op for cores not claimed on device_id (e.g. worker cores).
-    void mark_launched(ChipId device_id, CoreCoord core);
+    // Check launch-once admission without claiming a device submission. The
+    // actual ProgramExecution receiver commits this state under the same lock
+    // as NIU issue. No-op for cores not claimed on device_id.
+    void validate_launch(ChipId device_id, CoreCoord core);
 
     ServiceCoreManagerImpl(const ServiceCoreManagerImpl&) = delete;
     ServiceCoreManagerImpl& operator=(const ServiceCoreManagerImpl&) = delete;
 
 private:
+    struct CoreState;
+    friend class ::tt::tt_metal::dispatch_core_manager;
+    friend class ::tt::tt_metal::detail::ProgramExecution;
+    std::vector<CoreState*> prepare_launch_locked(
+        const NiuAdmission::Guard& guard, const detail::ProgramExecution& execution);
+    static void commit_launch_locked(const std::vector<CoreState*>& claims) noexcept;
+    std::unordered_set<CoreCoord> claimed_cores_locked(const NiuAdmission::Guard& guard, ChipId device_id) const;
+    void validate_device(const IDevice* device) const;
+    void retire_claim_locked(const NiuAdmission::Guard& guard, CoreState& core);
     struct CoreState {
         std::unique_ptr<allocator::FreeListOpt> alloc;
+        NiuAdmission::Token reservation;
         bool launched = false;  // a service workload has been enqueued on this core (launch-once)
     };
     struct DeviceServiceState {
-        std::unordered_map<CoreCoord, CoreState> cores;
+        std::map<CoreCoord, CoreState> cores;
         CoreCoord fd_compute_grid;
     };
 
     MetalEnvImpl& env_;
     MetalContext& ctx_;
-    std::unordered_map<ChipId, DeviceServiceState> devices_;
+    std::map<ChipId, DeviceServiceState> devices_;
 };
 
 }  // namespace tt::tt_metal::internal

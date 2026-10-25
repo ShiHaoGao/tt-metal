@@ -17,6 +17,7 @@
 #include "tt_metal/impl/buffers/dispatch.hpp"
 #include "tt_metal/impl/dispatch/ringbuffer_cache.hpp"
 #include "tt_metal/impl/program/dispatch.hpp"
+#include "tt_metal/impl/program/program_execution.hpp"
 
 // Forward declaration of the FDMeshCQTestAccessor class
 // This is used to access the system memory manager from cq test fixtures
@@ -29,6 +30,7 @@ class FDMeshCQTestAccessor;
 namespace tt::tt_metal::distributed {
 
 class SubDeviceSetupCacheTestAccessor;
+class MeshEventCompletion;
 
 struct MeshReadEventDescriptor;
 struct MeshBufferReadDescriptor;
@@ -43,8 +45,22 @@ private:
     // This is used to access the system memory manager from cq test fixtures
     friend class tt_dispatch_tests::Common::FDMeshCQTestAccessor;
     friend class SubDeviceSetupCacheTestAccessor;
+    friend class MeshEventCompletion;
 
+    enum class EventRecord { Normal, Drain, Reset };
     void populate_read_descriptor_queue();
+    std::shared_ptr<MeshEventCompletion> capture_event_completion(
+        const MeshEvent& event, ttsl::Span<const SubDeviceId> completed, bool reset_event_id = false);
+    bool receive_event_completion(MeshEventCompletion& completion);
+    void validate_event_completion(const MeshEventCompletion& completion) const;
+    void finish_prefix_nolock(ttsl::Span<const SubDeviceId> sub_device_ids, EventRecord record);
+    bool wait_for_completion_nolock(bool reset_launch_msg_state) override;
+    void finish_and_reset_in_use_nolock() override;
+    void synchronize_quiescence() override;
+    MeshEvent enqueue_record_event_to_host_nolock(
+        ttsl::Span<const SubDeviceId> sub_device_ids,
+        const std::optional<MeshCoordinateRange>& device_range,
+        EventRecord record);
     void populate_virtual_program_dispatch_core();
     CoreCoord virtual_program_dispatch_core() const;
     CoreType dispatch_core_type() const;
@@ -53,7 +69,8 @@ private:
     MeshEvent enqueue_record_event_helper(
         ttsl::Span<const SubDeviceId> sub_device_ids,
         bool notify_host,
-        const std::optional<MeshCoordinateRange>& device_range = std::nullopt);
+        const std::optional<MeshCoordinateRange>& device_range = std::nullopt,
+        EventRecord record = EventRecord::Normal);
     void write_program_commands_to_devices(
         const std::vector<IDevice*>& devices,
         ProgramCommandSequence& program_cmd_seq,
@@ -128,6 +145,31 @@ private:
     std::optional<MeshTraceId> trace_id_;
     std::shared_ptr<MeshTraceDescriptor> trace_ctx_;
     std::vector<MeshTraceNode> trace_nodes_;
+    struct NiuExecution {
+        enum class CompletionScope { Subdevices, QueuePrefix };
+        std::vector<SubDeviceId> subdevices;
+        std::shared_ptr<::tt::tt_metal::detail::ProgramExecution> execution;
+        CompletionScope completion_scope = CompletionScope::Subdevices;
+        std::optional<::tt::tt_metal::detail::ProgramExecution::GroupKey> managed_group;
+    };
+    std::vector<std::shared_ptr<NiuExecution>> niu_executions_;
+    struct EventEpoch {};
+    struct EventOwner {
+        explicit EventOwner(FDMeshCommandQueue* queue) : queue(queue) {}
+        std::mutex mutex;
+        FDMeshCommandQueue* queue;
+        struct Receipt {
+            std::shared_ptr<const EventEpoch> epoch;
+            uint32_t event_id;
+        };
+        // Written only after the actual completion reader validates a device
+        // response. Never take the queue API/lifetime locks from that reader.
+        std::mutex receipt_mutex;
+        std::unordered_map<IDevice*, Receipt> receipts;
+    };
+    std::shared_ptr<EventOwner> event_owner_ = std::make_shared<EventOwner>(this);
+    std::shared_ptr<const EventEpoch> event_epoch_ = std::make_shared<EventEpoch>();
+    uint32_t last_recorded_event_id_ = 0;
 
     CoreCoord dispatch_core_;
     const CoreType dispatch_core_type_;
@@ -298,8 +340,6 @@ public:
     void reset_prefetcher_cache_manager();
     int get_prefetcher_cache_sizeB() const;
 
-    void wait_for_completion(bool reset_launch_msg_state) override;
-    void finish_and_reset_in_use() override;
     bool in_use() override { return in_use_.load(); }
 };
 

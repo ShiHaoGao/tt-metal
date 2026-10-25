@@ -8,6 +8,10 @@
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
 
+namespace tt::tt_metal::detail {
+class ProgramExecution;
+}
+
 namespace tt::tt_metal::distributed {
 
 class MeshWorkload;
@@ -46,9 +50,12 @@ public:
     MeshWorkloadImpl& impl() { return *pimpl_; }
 
 private:
-    std::unique_ptr<MeshWorkloadImpl> pimpl_;
+    // A managed invocation retains the actual workload and its device resources
+    // even when the move-only public wrapper is moved or destroyed.
+    std::shared_ptr<MeshWorkloadImpl> pimpl_;
 
     friend void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload, bool blocking);
     friend FDMeshCommandQueue;
+    friend class ::tt::tt_metal::detail::ProgramExecution;
 };
 }  // namespace tt::tt_metal::distributed

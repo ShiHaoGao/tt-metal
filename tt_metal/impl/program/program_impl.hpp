@@ -149,6 +149,7 @@ enum class ProgramBinaryStatus : uint8_t {
 };
 
 namespace detail {
+class ProgramExecution;
 
 struct ProgramOffsetsState {
     // Base offset for Program Configs across all core types, wrt kernel config slot start address
@@ -664,6 +665,11 @@ public:
 
 private:
     HWCommandQueue* last_used_command_queue_for_testing = nullptr;
+    friend class ProgramExecution;
+    // Only ProgramExecution can seal a member into an invocation. Expiration
+    // remains a managed binding; it must never silently fall back to ordinary.
+    bool managed_niu_bound_ = false;
+    std::weak_ptr<ProgramExecution> managed_niu_invocation_;
 
     // Buffers temporarily owned by the program
     std::vector<std::shared_ptr<Buffer>> owned_buffer_pool;

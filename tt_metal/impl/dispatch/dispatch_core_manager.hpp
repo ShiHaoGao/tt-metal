@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <functional>
 #include <list>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,7 @@
 #include <umd/device/types/cluster_descriptor_types.hpp>
 #include <tt-metalium/experimental/context/metal_env.hpp>
 #include <hostdevcommon/common_values.hpp>
+#include "impl/context/niu_admission.hpp"
 
 namespace tt::tt_metal {
 
@@ -171,6 +173,10 @@ public:
     std::optional<tt_cxy_pair> get_reserved_realtime_profiler_core(ChipId device_id);
 
 private:
+    friend class internal::ServiceCoreManagerImpl;
+    std::vector<CoreCoord> get_available_dispatch_cores_locked(const NiuAdmission::Guard& guard, ChipId device_id);
+    void reserve_worker_core_locked(const NiuAdmission::Guard& guard, const tt_cxy_pair& core);
+    void validate_worker_core_locked(const NiuAdmission::Guard& guard, const tt_cxy_pair& core);
     /// @brief reset_dispatch_core_manager initializes vector of cores per device for dispatch kernels
     /// @param dispatch_core_config specifies the core type for dispatch kernels
     void reset_dispatch_core_manager(
@@ -180,16 +186,18 @@ private:
     /// @param device_id
     /// @return
     /// @note This method is not thread safe, it should be called with the dispatch_core_assignments_mutex held
-    CoreCoord get_next_available_dispatch_core(ChipId device_id);
+    CoreCoord get_next_available_dispatch_core(const NiuAdmission::Guard& guard, ChipId device_id);
 
     /// @brief Internal version of dispatcher_core that assumes the caller already holds dispatch_core_assignments_mutex
     /// @note This method is not thread safe, it should be called with the dispatch_core_assignments_mutex held
-    const tt_cxy_pair& dispatcher_core_locked(ChipId device_id, uint16_t channel, uint8_t cq_id);
+    const tt_cxy_pair& dispatcher_core_locked(
+        const NiuAdmission::Guard& guard, ChipId device_id, uint16_t channel, uint8_t cq_id);
 
     /// @brief Internal version of dispatcher_d_core that assumes the caller already holds
     /// dispatch_core_assignments_mutex
     /// @note This method is not thread safe, it should be called with the dispatch_core_assignments_mutex held
-    const tt_cxy_pair& dispatcher_d_core_locked(ChipId device_id, uint16_t channel, uint8_t cq_id);
+    const tt_cxy_pair& dispatcher_d_core_locked(
+        const NiuAdmission::Guard& guard, ChipId device_id, uint16_t channel, uint8_t cq_id);
 
     /// @brief Internal version of add_dispatch_core_to_device that assumes the caller already holds
     /// dispatch_core_assignments_mutex
@@ -214,6 +222,9 @@ private:
     // Tensix reserved at construction time for the real-time profiler kernel.
     // Removed from available_dispatch_cores_by_device so dispatch cannot reach it.
     std::unordered_map<ChipId, tt_cxy_pair> reserved_realtime_profiler_core_by_device_;
+    // One physical worker reservation is shared by aliased dispatch roles.
+    // Manager destruction is not a device-stop or NIU-clean proof.
+    std::map<ChipId, std::map<CoreCoord, NiuAdmission::Token>> worker_reservations_;
     DispatchCoreConfig dispatch_core_config_;
     uint8_t num_hw_cqs{};
     MetalEnvImpl& env_;

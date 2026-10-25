@@ -54,8 +54,12 @@ public:
     // Get the contents of a named section. Returns empty span if not found.
     std::span<std::byte> GetSectionContents(std::string_view section_name, uint64_t& virtual_address) const;
 
+    enum class MetadataSize { AllowEmpty, Nonempty };
     // Unique host metadata only; reject duplicate names and loaded sections.
-    std::span<const std::byte> GetMetadataSection(std::string_view name) const;
+    // Linker scripts may retain empty optional sections. Declaration readers
+    // select Nonempty so an empty result can only mean the section is absent.
+    std::span<const std::byte> GetMetadataSection(
+        std::string_view name, MetadataSize size = MetadataSize::AllowEmpty) const;
     std::span<const std::byte> GetImageContents() const { return contents_; }
 
     // Release the implementation data, leaving the segments and

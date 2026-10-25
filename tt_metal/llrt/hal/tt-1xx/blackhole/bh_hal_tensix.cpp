@@ -6,6 +6,7 @@
 #include "hostdev/dev_msgs.h"
 #include "hostdev/fabric_telemetry_msgs.h"
 #include "hostdev/realtime_profiler_msgs.h"
+#include "hostdev/niu_handoff_contract.h"
 using namespace tt::tt_metal::blackhole::tensix;
 
 #include <cstdint>
@@ -51,6 +52,8 @@ HalCoreInfoType create_tensix_mem_map() {
     mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::DPRINT_BUFFERS)] = GET_MAILBOX_ADDRESS_HOST(dprint_buf);
     mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::PROFILER)] = GET_MAILBOX_ADDRESS_HOST(profiler);
     mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::KERNEL_CONFIG)] = MEM_MAP_END;
+    mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::NIU_HANDOFF)] = MEM_NIU_HANDOFF_BASE;
+    mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::NOC_DYNAMIC_COUNTERS)] = MEM_NOC_COUNTER_BASE;
     mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::CORE_INFO)] = GET_MAILBOX_ADDRESS_HOST(core_info);
     mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::GO_MSG)] = GET_MAILBOX_ADDRESS_HOST(go_messages);
     mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::GO_MSG_INDEX)] =
@@ -73,6 +76,12 @@ HalCoreInfoType create_tensix_mem_map() {
     mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::BASE)] = MEM_L1_SIZE;
     mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::BARRIER)] = sizeof(uint32_t);
     mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::MAILBOX)] = MEM_MAILBOX_SIZE;
+    mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::NIU_HANDOFF)] = MEM_NIU_HANDOFF_SIZE;
+    mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::NOC_DYNAMIC_COUNTERS)] = MEM_NOC_COUNTER_L1_SIZE;
+    static_assert(MEM_NIU_HANDOFF_BASE % TT_NIU_HANDOFF_ALIGNMENT == 0);
+    static_assert(MEM_NIU_HANDOFF_SIZE == sizeof(tt_niu_handoff_region));
+    static_assert(MEM_NOC_COUNTER_L1_SIZE == TT_NIU_HANDOFF_COUNTER_BYTES);
+    static_assert(MEM_NOC_COUNTER_BASE + MEM_NOC_COUNTER_L1_SIZE <= MEM_NIU_HANDOFF_BASE);
     mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::LAUNCH)] = sizeof(launch_msg_t);
     mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::WATCHER)] = sizeof(watcher_msg_t);
     mem_map_sizes[static_cast<std::size_t>(HalL1MemAddrType::DPRINT_BUFFERS)] = sizeof(DevicePrintMemoryLayout);

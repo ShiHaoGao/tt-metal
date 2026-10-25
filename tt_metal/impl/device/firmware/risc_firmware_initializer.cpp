@@ -17,6 +17,7 @@
 #include <tt_stl/assert.hpp>
 
 #include "context/metal_context.hpp"
+#include "context/niu_admission.hpp"
 #include "impl/context/context_descriptor.hpp"
 #include "core_coord.hpp"
 #include "hal.hpp"
@@ -125,9 +126,11 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
         // This branch never creates a source/JIT build environment.
         admitted_images.reserve(device_ids.size());
         const auto context_id = descriptor_->metal_context().get_context_id();
-        for (const auto device_id : device_ids)
-            admitted_images.try_emplace(
+        for (const auto device_id : device_ids) {
+            auto [image, inserted] = admitted_images.try_emplace(
                 device_id, *published, create_jit_device_config(device_id, num_hw_cqs_, context_id), rtoptions_);
+            experimental::native_detail::NativeImageAccess::validate_niu_handoff(image->second.tensix(), hal_);
+        }
     }
 
     // Reserve tables per device ID (single-threaded)
@@ -173,15 +176,6 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
     for (auto refs : table_refs) {
         futures.emplace_back(detail::async([this, refs]() {
             tt::ChipId device_id = refs.device_id;
-            // Clear L1/DRAM if requested - skip for mock devices (no memory), but do for emulated (memory-backed)
-            if (cluster_.get_target_device_type() != tt::TargetDevice::Mock) {
-                if (rtoptions_.get_clear_l1()) {
-                    clear_l1_state(device_id);
-                }
-                if (rtoptions_.get_clear_dram()) {
-                    clear_dram_state(device_id);
-                }
-            }
             [[maybe_unused]] int ai_clk = cluster_.get_device_aiclk(device_id);
             log_debug(tt::LogMetal, "AI CLK for device {} is:   {} MHz", device_id, ai_clk);
             generate_device_bank_to_noc_tables(
@@ -208,20 +202,35 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
                 if (!skip_fw_build)
                     BuildEnvManager::get_instance(ctx_id).build_firmware(device_id);
             }
-            if (!cluster_.is_mock_or_emulated()) {
-                // Clear the entire launch message ring buffer on ethernet cores before application firmware is
-                // activated. This is required since ethernet cores context switch between application and routing
-                // firmware. If ERISC application firmware is activated before the launch messages are cleared, it
-                // can enter an undefined state by reading a corrupted launch message. Routing firmware will never
-                // run in this case, causing UMD issued transactions to hang.
-                clear_launch_messages_on_eth_cores(device_id);
-            }
         }));
     }
 
     for (auto& fut : futures) {
         fut.get();
     }
+    // All source builds and every chip's immutable image admission must finish
+    // before the first L1/DRAM/launch write. A late bad image cannot partially
+    // reset or prepare an earlier chip in this batch.
+    if (!published) {
+        for (const auto device_id : device_ids)
+            if (const auto* native = native_firmware_bundle(device_id))
+                experimental::native_detail::NativeImageAccess::validate_niu_handoff(*native, hal_);
+    }
+    futures.clear();
+    for (const auto device_id : device_ids) {
+        futures.emplace_back(detail::async([this, device_id]() {
+            // Emule has memory; Mock does not. Preserve the existing clearing
+            // policy after the complete, side-effect-free firmware admission.
+            if (cluster_.get_target_device_type() != tt::TargetDevice::Mock) {
+                if (rtoptions_.get_clear_l1()) clear_l1_state(device_id);
+                if (rtoptions_.get_clear_dram()) clear_dram_state(device_id);
+            }
+            // Ethernet may context-switch into its application after launch;
+            // clear the whole ring before any firmware is activated.
+            if (!cluster_.is_mock_or_emulated()) clear_launch_messages_on_eth_cores(device_id);
+        }));
+    }
+    for (auto& fut : futures) fut.get();
     // Publish the entire prepared set only after admission and preparation
     // succeed. A failed rebuild cannot leave a partially admitted launch set.
     firmware_images_ = std::move(admitted_images);
@@ -241,32 +250,45 @@ void RiscFirmwareInitializer::run_launch_phase(const std::set<tt::ChipId>& devic
                      "Published firmware was not admitted for device {}", device_id);
         }
     }
-    // Launch FW on each device sequentially, since a multithreaded launch leads to initialization hangs.
-    // See https://github.com/tenstorrent/tt-metal/issues/35701
-    ZoneScopedN("Resets and FW Launch");
-    if (!cluster_.is_mock_or_emulated()) {
-        terminate_active_ethernet_cores_on_all_chips();
+    for (const auto device_id : device_ids)
+        if (const auto* native = native_firmware_bundle(device_id))
+            experimental::native_detail::NativeImageAccess::validate_niu_handoff(*native, hal_);
+    try {
+        // Launch FW on each device sequentially, since a multithreaded launch leads to initialization hangs.
+        // See https://github.com/tenstorrent/tt-metal/issues/35701
+        ZoneScopedN("Resets and FW Launch");
+        if (!cluster_.is_mock_or_emulated()) {
+            terminate_active_ethernet_cores_on_all_chips();
 
-        for (tt::ChipId device_id : device_ids) {
-            ClearNocData(descriptor_->env_impl(), device_id);
-            // Wait for base FW to finish its eth_init() on all idle ETH cores before
-            // asserting reset (otherwise we could kill it mid-init)
-            for (const auto& eth_core : this->get_control_plane_().get_inactive_ethernet_cores(device_id)) {
-                CoreCoord virtual_core =
-                    cluster_.get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
-                if (!wait_for_eth_fw_ready(device_id, virtual_core)) {
-                    TT_THROW(
-                        "Device {}: eth base firmware not ready on core ({},{}), cannot proceed with reset",
-                        device_id,
-                        virtual_core.x,
-                        virtual_core.y);
+            for (tt::ChipId device_id : device_ids) {
+                ClearNocData(descriptor_->env_impl(), device_id);
+                // Wait for base FW to finish its eth_init() on all idle ETH cores before
+                // asserting reset (otherwise we could kill it mid-init)
+                for (const auto& eth_core : this->get_control_plane_().get_inactive_ethernet_cores(device_id)) {
+                    CoreCoord virtual_core =
+                        cluster_.get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
+                    if (!wait_for_eth_fw_ready(device_id, virtual_core)) {
+                        TT_THROW(
+                            "Device {}: eth base firmware not ready on core ({},{}), cannot proceed with reset",
+                            device_id,
+                            virtual_core.x,
+                            virtual_core.y);
+                    }
                 }
+                reset_cores(device_id);
+                initialize_and_launch_firmware(device_id);
             }
-            reset_cores(device_id);
-            initialize_and_launch_firmware(device_id);
         }
+        auto& admission = descriptor_->metal_context().niu_admission();
+        std::lock_guard lock(admission.mutex_);
+        admission.publish_boots_locked(native_firmware_, native_niu_ledgers_);
+        initialized_ = true;
+    } catch (...) {
+        // A later chip or publication failure revokes every tentative boot;
+        // no partial set can become an admission provider.
+        withdraw_worker_stream_state();
+        throw;
     }
-    initialized_ = true;
 }
 
 void RiscFirmwareInitializer::configure() {}
@@ -330,9 +352,19 @@ void RiscFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& /*ini
 bool RiscFirmwareInitializer::is_initialized() const { return initialized_; }
 
 void RiscFirmwareInitializer::withdraw_worker_stream_state() {
-    initialized_ = false;
-    for (const auto& [device, firmware] : native_firmware_) firmware->withdraw();
-    native_firmware_.clear();
+    NiuAdmission::Retirement retired;
+    {
+        auto& admission = descriptor_->metal_context().niu_admission();
+        std::lock_guard lock(admission.mutex_);
+        initialized_ = false;
+        for (const auto& [device, firmware] : native_firmware_) firmware->withdraw();
+        retired = admission.withdraw_boots_locked(native_firmware_);
+        // This also closes ledgers from a launch phase which failed before
+        // publication and therefore never entered the coordinator.
+        for (const auto& [device, ledger] : native_niu_ledgers_) ledger->withdraw();
+        native_firmware_.clear();
+        native_niu_ledgers_.clear();
+    }
     native_loaded_roles_.clear();
     worker_providers_.clear();
     worker_images_.clear();
@@ -1244,6 +1276,15 @@ void RiscFirmwareInitializer::initialize_firmware(
     switch (core_type) {
         case HalProgrammableCoreType::TENSIX: {
             const auto* native = native_firmware_bundle(device_id);
+            const auto handoff_size = hal_.get_dev_size(core_type, HalL1MemAddrType::NIU_HANDOFF);
+            if (handoff_size) {
+                // Clear this boot's request and receipt before releasing any
+                // processor. No retained request may authorize a new boot.
+                const std::vector<std::byte> empty_handoff(handoff_size);
+                cluster_.noc_multicast_write(
+                    empty_handoff.data(), empty_handoff.size(), device_id, start_core, end_core.value(),
+                    hal_.get_dev_addr(core_type, HalL1MemAddrType::NIU_HANDOFF));
+            }
             for (uint32_t processor_class = 0; processor_class < processor_class_count; processor_class++) {
                 const auto num_build_states = hal_.get_processor_class_num_fw_binaries(core_type_idx, processor_class);
                 for (uint32_t riscv_id = 0; riscv_id < num_build_states; riscv_id++) {
@@ -1471,6 +1512,9 @@ void RiscFirmwareInitializer::initialize_firmware(
 
 void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_id) {
     ZoneScoped;
+
+    if (const auto* native = native_firmware_bundle(device_id))
+        experimental::native_detail::NativeImageAccess::validate_niu_handoff(*native, hal_);
 
     log_debug(tt::LogMetal, "Initializing worker cores");
     std::unordered_set<CoreCoord> not_done_cores;
@@ -1704,16 +1748,11 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
     if (native_loaded_roles_[device_id] == (1u << TT_NATIVE_ROLE_COUNT) - 1) {
         const auto* native = native_firmware_bundle(device_id);
         TT_FATAL(native, "Loaded native firmware snapshot disappeared");
+        auto ledger = std::make_shared<detail::NiuLedger>();
+        native_niu_ledgers_.emplace(device_id, ledger);
         native_firmware_[device_id] = std::shared_ptr<const experimental::native_detail::LoadedFirmware>(
-            new experimental::native_detail::LoadedFirmware(*native));
+            new experimental::native_detail::LoadedFirmware(*native, std::move(ledger)));
     }
-}
-
-std::shared_ptr<const experimental::native_detail::LoadedFirmware>
-RiscFirmwareInitializer::native_firmware(tt::ChipId device_id) const {
-    if (!initialized_) return {};
-    auto found = native_firmware_.find(device_id);
-    return found == native_firmware_.end() ? nullptr : found->second;
 }
 
 std::shared_ptr<const WorkerStreamStateProvider>

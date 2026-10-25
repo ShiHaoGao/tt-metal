@@ -11,7 +11,8 @@ add_executable(native_deployment_publish
     BundlePublication.cpp SourceArchive.cpp)
 target_compile_features(native_deployment_publish PRIVATE cxx_std_20)
 target_compile_definitions(native_deployment_publish PRIVATE
-    TT_NATIVE_FIRMWARE_SDK_ROOT="${PROJECT_SOURCE_DIR}")
+    TT_NATIVE_FIRMWARE_SDK_ROOT="${PROJECT_SOURCE_DIR}"
+    TT_NATIVE_FIRMWARE_RUNTIME_ROOT="${TT_METAL_RUNTIME_ROOT}")
 target_include_directories(native_deployment_publish PRIVATE
     ${PROJECT_SOURCE_DIR}/tt_metal
     ${PROJECT_SOURCE_DIR}/tt_metal/impl)
@@ -22,7 +23,8 @@ set_target_properties(native_deployment_publish PROPERTIES
 add_executable(native_firmware_bundle NativeFirmwareBundle.cpp BundlePublication.cpp SourceArchive.cpp)
 target_compile_features(native_firmware_bundle PRIVATE cxx_std_20)
 target_compile_definitions(native_firmware_bundle PRIVATE
-    TT_NATIVE_FIRMWARE_SDK_ROOT="${PROJECT_SOURCE_DIR}")
+    TT_NATIVE_FIRMWARE_SDK_ROOT="${PROJECT_SOURCE_DIR}"
+    TT_NATIVE_FIRMWARE_RUNTIME_ROOT="${TT_METAL_RUNTIME_ROOT}")
 target_include_directories(native_firmware_bundle PRIVATE
     ${PROJECT_SOURCE_DIR}/tt_metal
     ${PROJECT_SOURCE_DIR}/tt_metal/impl)

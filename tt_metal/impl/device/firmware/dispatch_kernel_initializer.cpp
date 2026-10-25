@@ -13,6 +13,8 @@
 #include "impl/context/context_descriptor.hpp"
 #include "impl/dispatch/dispatch_core_manager.hpp"
 #include "device/device_impl.hpp"
+#include "impl/program/program_execution.hpp"
+#include "impl/program/program_impl.hpp"
 
 #include "dispatch/topology.hpp"
 
@@ -237,6 +239,25 @@ void DispatchKernelInitializer::wait_for_dispatch_cores() const {
         // This allows the device handles to be properly released, enabling subsequent
         // device opens and tt-smi resets to succeed.
         try {
+            auto* device = dynamic_cast<Device*>(dev);
+            TT_FATAL(device, "Dispatch completion requires its actual Device");
+            auto& context = descriptor_->metal_context();
+            std::set<CoreCoord> waited_workers;
+            for (auto& program : device->command_queue_programs_) {
+                const auto logical = program->impl().logical_cores();
+                for (size_t index = 0; index != logical.size(); ++index) {
+                    if (context.hal().get_core_type(index) != CoreType::WORKER) continue;
+                    for (auto core : logical[index]) {
+                        const auto virtual_core = dev->virtual_core_from_logical_core(core, CoreType::WORKER);
+                        if (dispatch_cores.contains(virtual_core))
+                            waited_workers.insert(context.get_cluster().get_soc_desc(dev->id())
+                                                      .get_physical_tensix_core_from_logical(core));
+                    }
+                }
+            }
+            // Routing cores receive their termination signals later. This wait
+            // cannot prove their stop even when they share the CQ Program.
+            auto completion = detail::ProgramExecution::observe_cores(context, dev->id(), std::move(waited_workers));
             const auto teardown_timeout_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(rtoptions_.get_timeout_duration_for_operations())
                     .count();
@@ -246,6 +267,7 @@ void DispatchKernelInitializer::wait_for_dispatch_cores() const {
                 dev_msgs::RUN_MSG_GO,
                 dispatch_cores,
                 static_cast<int>(teardown_timeout_ms));
+            completion.receive();
         } catch (const std::exception& e) {
             log_warning(
                 LogMetal,

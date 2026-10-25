@@ -136,6 +136,7 @@ add_custom_target(
         unit_tests_inspector
         unit_tests_device
         unit_tests_context
+        unit_tests_niu_admission
         unit_tests_dispatch
         unit_tests_eth
         unit_tests_integration

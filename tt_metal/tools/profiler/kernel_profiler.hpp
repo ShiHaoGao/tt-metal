@@ -253,7 +253,14 @@ inline __attribute__((always_inline)) WallClockSample read_profiler_wall_clock()
 #endif
 }
 
-inline __attribute__((always_inline)) void mark_time_at_index_inlined(uint32_t index, uint32_t timer_id) {
+// Firmware has several timer IDs with the same clock/marker operation. Keep
+// one body on BRISC while retaining the inline kernel instrumentation path.
+#if defined(COMPILE_FOR_BRISC) && !defined(KERNEL_BUILD)
+__attribute__((noinline, noclone))
+#else
+inline __attribute__((always_inline))
+#endif
+void mark_time_at_index(uint32_t index, uint32_t timer_id) {
 #if defined(ARCH_QUASAR)
     uint64_t wall_clock = quasar_read_wall_clock_64();
     uint32_t time_low = static_cast<uint32_t>(wall_clock);
@@ -271,7 +278,7 @@ inline __attribute__((always_inline)) void mark_time_at_index_inlined(uint32_t i
 #endif
 }
 
-// Like mark_time_at_index_inlined but writes a pre-captured timestamp (time_h/time_l) instead of sampling now.
+// Like mark_time_at_index but writes a pre-captured timestamp (time_h/time_l) instead of sampling now.
 inline __attribute__((always_inline)) void mark_time_at_index_with_stamp(
     uint32_t index, uint32_t timer_id, uint32_t time_h, uint32_t time_l) {
     profiler_data_buffer[myRiscID].data[index] = 0x80000000 | ((timer_id & 0x7FFFF) << 12) | (time_h & 0xFFF);
@@ -647,7 +654,7 @@ __attribute__((noinline)) void quick_push() {
     }
 
     SrcLocNameToHash("PROFILER-NOC-QUICK-PUSH");
-    mark_time_at_index_inlined(wIndex, hash);
+    mark_time_at_index(wIndex, hash);
     wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
 
     uint32_t core_flat_id = profiler_control_buffer[FLAT_ID];
@@ -657,7 +664,7 @@ __attribute__((noinline)) void quick_push() {
         (profiler_data_buffer[myRiscID].data[ID_LH] & PROFILER_ID_TRACE_FIELD_MASK) |
         (((core_flat_id & PROFILER_ID_FLAT_MASK) << PROFILER_ID_FLAT_SHIFT) | (myRiscID & PROFILER_ID_RISC_MASK));
 
-    mark_time_at_index_inlined(wIndex, get_const_id(hash, ZONE_END));
+    mark_time_at_index(wIndex, get_const_id(hash, ZONE_END));
     wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
 
     uint32_t currEndIndex = profiler_control_buffer[HOST_BUFFER_END_INDEX] + wIndex;
@@ -727,38 +734,58 @@ void quick_push_if_linked(uint32_t cmd_buf, bool linked) {
 #endif
 }
 
+// The timer ID is data here so firmware scopes share admission and publication
+// code without changing the RAII lifetime or the caller's source-location ID.
+template <DoingDispatch dispatch>
+#if defined(COMPILE_FOR_BRISC) && !defined(KERNEL_BUILD)
+__attribute__((noinline, noclone))
+#else
+inline __attribute__((always_inline))
+#endif
+bool profile_scope_begin(uint32_t timer_id) {
+#if defined(ARCH_QUASAR)
+    // Reserve the start and end markers together on the L1-only target.
+    if (bufferHasRoom<dispatch>(2 * PROFILER_L1_MARKER_UINT32_SIZE - 1)) {
+#else
+    if (bufferHasRoom<dispatch>()) {
+#endif
+        stackSize += PROFILER_L1_MARKER_UINT32_SIZE;
+        mark_time_at_index(wIndex, timer_id);
+        wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
+        return true;
+    }
+    return false;
+}
+
+template <DoingDispatch dispatch>
+#if defined(COMPILE_FOR_BRISC) && !defined(KERNEL_BUILD)
+__attribute__((noinline, noclone))
+#else
+inline __attribute__((always_inline))
+#endif
+void profile_scope_end(uint32_t timer_id, bool start_marked) {
+    if (start_marked) {
+        mark_time_at_index(wIndex, get_id(timer_id, ZONE_END));
+        wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
+        stackSize -= PROFILER_L1_MARKER_UINT32_SIZE;
+        if constexpr (dispatch == DoingDispatch::DISPATCH) {
+            if (wIndex >= (PROFILER_L1_VECTOR_SIZE - DISPATCH_HEADROOM_SIZE)) {
+                quick_push();
+            }
+        }
+    }
+}
+
 template <uint32_t timer_id, DoingDispatch dispatch = DoingDispatch::NOT_DISPATCH>
 struct profileScope {
     bool start_marked = false;
     inline __attribute__((always_inline)) profileScope() {
-#if defined(ARCH_QUASAR)
-        // Quasar is L1-only for now, once the L1 buffer fills, markers are dropped.
-        // The ~profileScope() writes the ZONE_END unconditionally, so the constructor reserves room
-        // for both the zone's start and end markers. Request (2 * PROFILER_L1_MARKER_UINT32_SIZE - 1)
-        // "additional" words.
-        if (bufferHasRoom<dispatch>(2 * PROFILER_L1_MARKER_UINT32_SIZE - 1)) {
-#else
-        if (bufferHasRoom<dispatch>()) {
-#endif
-            stackSize += PROFILER_L1_MARKER_UINT32_SIZE;
-            start_marked = true;
-            mark_time_at_index_inlined(wIndex, timer_id);
-            wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
-        }
+        start_marked = profile_scope_begin<dispatch>(timer_id);
     }
 
     inline __attribute__((always_inline)) ~profileScope() {
-        if (start_marked) {
-            mark_time_at_index_inlined(wIndex, get_const_id(timer_id, ZONE_END));
-            wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
-            start_marked = false;
-            stackSize -= PROFILER_L1_MARKER_UINT32_SIZE;
-            if constexpr (dispatch == DoingDispatch::DISPATCH) {
-                if (wIndex >= (PROFILER_L1_VECTOR_SIZE - DISPATCH_HEADROOM_SIZE)) {
-                    quick_push();
-                }
-            }
-        }
+        profile_scope_end<dispatch>(timer_id, start_marked);
+        start_marked = false;
     }
 };
 
@@ -775,13 +802,13 @@ struct profileScopeGuaranteed {
             if constexpr (index == 0) {
 #if !defined(COMPILE_FOR_TRISC)
                 if (trace_replay_status & TRACE_MARK_FW_START) {
-                    mark_time_at_index_inlined(start_index, get_const_id(timer_id, ZONE_START));
+                    mark_time_at_index(start_index, get_const_id(timer_id, ZONE_START));
                     profiler_control_buffer[TRACE_REPLAY_STATUS] = TRACE_MARK_KERNEL_START;
                 }
 #endif
             } else {
                 if (trace_replay_status & TRACE_MARK_KERNEL_START) {
-                    mark_time_at_index_inlined(start_index, get_const_id(timer_id, ZONE_START));
+                    mark_time_at_index(start_index, get_const_id(timer_id, ZONE_START));
                     profiler_control_buffer[TRACE_REPLAY_STATUS] = TRACE_MARK_ALL_ENDS;
                 }
             }
@@ -789,13 +816,13 @@ struct profileScopeGuaranteed {
             if constexpr (index == 0) {
                 init_profiler();
             }
-            mark_time_at_index_inlined(start_index, get_const_id(timer_id, ZONE_START));
+            mark_time_at_index(start_index, get_const_id(timer_id, ZONE_START));
         }
     }
     inline __attribute__((always_inline)) ~profileScopeGuaranteed() {
         if constexpr (TRACE_ON_TENSIX) {
             if (profiler_control_buffer[TRACE_REPLAY_STATUS] == TRACE_MARK_ALL_ENDS) {
-                mark_time_at_index_inlined(end_index, get_const_id(timer_id, ZONE_END));
+                mark_time_at_index(end_index, get_const_id(timer_id, ZONE_END));
 #if defined(COMPILE_FOR_BRISC)
                 // Validate profiler_data_buffer in L1
                 profiler_data_buffer[myRiscID].data[ID_HH] = 0x0;
@@ -805,7 +832,7 @@ struct profileScopeGuaranteed {
                 profiler_control_buffer[DEVICE_BUFFER_END_INDEX_BR_ER] = wIndex;
             }
         } else {
-            mark_time_at_index_inlined(end_index, get_const_id(timer_id, ZONE_END));
+            mark_time_at_index(end_index, get_const_id(timer_id, ZONE_END));
             if constexpr (index == 0) {
                 finish_profiler();
             }
@@ -828,7 +855,7 @@ __attribute__((noinline)) bool main_accumulate_begin(uint32_t timer_id) {
         if constexpr (index == 0) {
             init_profiler();
         }
-        mark_time_at_index_inlined(start_index, get_id(timer_id, ZONE_START));
+        mark_time_at_index(start_index, get_id(timer_id, ZONE_START));
         return false;
     }
 #endif
@@ -846,7 +873,7 @@ __attribute__((noinline)) bool main_accumulate_begin(uint32_t timer_id) {
     }
     if (bufferHasRoom()) {
         stackSize += PROFILER_L1_MARKER_UINT32_SIZE;
-        mark_time_at_index_inlined(wIndex, get_id(timer_id, ZONE_START));
+        mark_time_at_index(wIndex, get_id(timer_id, ZONE_START));
         wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
         return true;
     }
@@ -859,7 +886,7 @@ __attribute__((noinline)) void main_accumulate_end(uint32_t timer_id, bool start
     if (profiler_control_buffer[PROFILER_DISPATCH_CORE] != 0) {
         constexpr uint32_t end_index = (2 * index * PROFILER_L1_MARKER_UINT32_SIZE) + GUARANTEED_MARKER_2_H;
         static_assert(end_index < CUSTOM_MARKERS);
-        mark_time_at_index_inlined(end_index, get_id(timer_id, ZONE_END));
+        mark_time_at_index(end_index, get_id(timer_id, ZONE_END));
         if constexpr (index == 0) {
             finish_profiler(/*do_accumulate=*/false);
         }
@@ -867,7 +894,7 @@ __attribute__((noinline)) void main_accumulate_end(uint32_t timer_id, bool start
     }
 #endif
     if (start_marked) {
-        mark_time_at_index_inlined(wIndex, get_id(timer_id, ZONE_END));
+        mark_time_at_index(wIndex, get_id(timer_id, ZONE_END));
         wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
         stackSize -= PROFILER_L1_MARKER_UINT32_SIZE;
     }
@@ -940,7 +967,7 @@ inline __attribute__((always_inline)) void timeStampedData(uint64_t data, Args..
     constexpr uint32_t words_written = PROFILER_L1_MARKER_UINT32_SIZE * (2 + sizeof...(trailers));
 
     if (bufferHasRoom<dispatch>(words_written - 1)) {
-        mark_time_at_index_inlined(wIndex, get_const_id(data_id, packet_type));
+        mark_time_at_index(wIndex, get_const_id(data_id, packet_type));
         wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
 
         profiler_data_buffer[myRiscID].data[wIndex++] = data >> 32;
@@ -955,7 +982,7 @@ inline __attribute__((always_inline)) void timeStampedData(uint64_t data, Args..
 template <DoingDispatch dispatch = DoingDispatch::NOT_DISPATCH>
 inline __attribute__((always_inline)) void recordEvent(uint16_t event_id) {
     if (bufferHasRoom<dispatch>()) {
-        mark_time_at_index_inlined(wIndex, get_id(event_id, TS_EVENT));
+        mark_time_at_index(wIndex, get_id(event_id, TS_EVENT));
         wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
     }
 }

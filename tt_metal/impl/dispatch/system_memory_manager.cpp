@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <optional>
 #include <thread>
+#include <limits>
 #include <string>
 #include <tuple>
 
@@ -287,14 +288,19 @@ bool SystemMemoryManager::is_mock_device() const {
 }
 
 uint32_t SystemMemoryManager::get_next_event(const uint8_t cq_id) {
-    if (is_mock_device()) {
-        return ++this->cq_to_event[cq_id];
-    }
-    cq_to_event_locks[cq_id].lock();
-    uint32_t next_event = ++this->cq_to_event[cq_id];  // Event ids start at 1
+    return allocate_event(cq_id, false);
+}
 
-    cq_to_event_locks[cq_id].unlock();
-    return next_event;
+uint32_t SystemMemoryManager::get_next_drain_event(const uint8_t cq_id) {
+    return allocate_event(cq_id, true);
+}
+
+uint32_t SystemMemoryManager::allocate_event(const uint8_t cq_id, bool drain) {
+    std::lock_guard lock(cq_to_event_locks[cq_id]);
+    const auto limit = std::numeric_limits<uint32_t>::max() - (drain ? 0u : 1u);
+    TT_FATAL(cq_to_event[cq_id] < limit,
+             "Event ID exhausted; an explicit quiescent command-queue reset is required");
+    return ++cq_to_event[cq_id];  // Event ids start at 1; zero belongs to explicit reset.
 }
 
 // Get last issued event to Command Queue
@@ -323,13 +329,11 @@ void SystemMemoryManager::reset_event_id(const uint8_t cq_id) {
 }
 
 void SystemMemoryManager::increment_event_id(const uint8_t cq_id, const uint32_t val) {
-    if (is_mock_device()) {
-        this->cq_to_event[cq_id] += val;
-        return;
-    }
-    cq_to_event_locks[cq_id].lock();
-    this->cq_to_event[cq_id] += val;
-    cq_to_event_locks[cq_id].unlock();
+    std::lock_guard lock(cq_to_event_locks[cq_id]);
+    constexpr auto limit = std::numeric_limits<uint32_t>::max() - 1;
+    TT_FATAL(cq_to_event[cq_id] <= limit && val <= limit - cq_to_event[cq_id],
+             "Event ID increment would overflow; an explicit quiescent command-queue reset is required");
+    cq_to_event[cq_id] += val;
 }
 
 void SystemMemoryManager::set_last_completed_event(const uint8_t cq_id, const uint32_t event_id) {

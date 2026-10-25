@@ -144,7 +144,9 @@ void MeshWorkloadImpl::compile(MeshDevice* mesh_device) {
     // programs are already compiled and laid out, so compile_program is a flag check per program;
     // handing those to the thread pool costs a worker wake-up and a join for no work. Only the
     // first compile of a multi-program workload does enough to be worth parallelizing.
-    if (programs_.size() == 1 || this->is_finalized()) {
+    if (managed_niu_bound_ || programs_.size() == 1 || this->is_finalized()) {
+        // Managed preparation is borrowed by one host thread for the complete
+        // workload, including native deployment and device allocation.
         // Compile from main thread for homogeneous workloads
         for (auto& [device_range, _] : programs_) {
             this->compile_program(device_range, mesh_device);
@@ -468,7 +470,7 @@ void MeshWorkloadImpl::finalize_offsets(MeshDevice* mesh_device) {
 
 // MeshWorkload PIMPL Implementation
 
-MeshWorkload::MeshWorkload() : pimpl_(std::make_unique<MeshWorkloadImpl>()) {}
+MeshWorkload::MeshWorkload() : pimpl_(std::make_shared<MeshWorkloadImpl>()) {}
 MeshWorkload::~MeshWorkload() = default;
 MeshWorkload::MeshWorkload(MeshWorkload&& other) noexcept = default;
 MeshWorkload& MeshWorkload::operator=(MeshWorkload&& other) noexcept = default;

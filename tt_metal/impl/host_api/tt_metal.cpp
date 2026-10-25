@@ -61,6 +61,8 @@
 #include <program.hpp>
 #include "program/dispatch.hpp"
 #include "program/program_impl.hpp"
+#include "program/program_execution.hpp"
+#include <array>
 #include "impl/dataflow_buffer/cross_node_dfb.hpp"
 #include "impl/buffers/semaphore.hpp"
 #include "tracy/Tracy.hpp"
@@ -426,6 +428,9 @@ namespace experimental {
 
 void ConfigureProgramWithoutLaunch(IDevice* device, Program& program) {
     program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    auto preparation = detail::ProgramExecution::reserve_direct(program, *device);
+    auto execution = preparation.execution();
+    auto niu_failure = execution->watch_failure();
     ZoneScoped;
     // Debug breadcrumbs, one per step: a hang in this path has no Python frame below it, and the
     // step name is what says where it stopped.
@@ -477,6 +482,9 @@ void ConfigureProgramWithoutLaunch(IDevice* device, Program& program) {
 
 void DispatchCompiledProgramToDevice(IDevice* device, Program& program) {
     program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    auto preparation = detail::ProgramExecution::reserve_direct(program, *device);
+    auto execution = preparation.execution();
+    auto niu_failure = execution->watch_failure();
     ZoneScoped;
 
     auto device_id = device->id();
@@ -524,6 +532,7 @@ void DispatchCompiledProgramToDevice(IDevice* device, Program& program) {
     metal_ctx.get_cluster().dram_barrier(device_id);
     metal_ctx.get_cluster().l1_barrier(device_id);
     const auto& hal = metal_ctx.hal();
+    auto submission = execution->issue(program, *device, &metal_ctx.get_service_core_manager().impl());
     for (uint32_t programmable_core_type_index = 0; programmable_core_type_index < logical_cores_used_in_program.size();
          programmable_core_type_index++) {
         CoreType core_type = hal.get_core_type(programmable_core_type_index);
@@ -545,6 +554,7 @@ void DispatchCompiledProgramToDevice(IDevice* device, Program& program) {
                 hal.get_dev_addr(programmable_core_type, HalL1MemAddrType::LAUNCH));
         }
     }
+    submission.commit();
 }
 
 struct CapturedKernelConfig::Impl {
@@ -1004,6 +1014,9 @@ bool program_targets_only_dram_cores(const Program& program, const Hal& hal) {
 
 void LaunchProgram(IDevice* device, Program& program, bool wait_until_cores_done, bool force_slow_dispatch) {
     program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    auto preparation = ProgramExecution::reserve_direct(program, *device);
+    auto execution = preparation.execution();
+    auto niu_failure = execution->watch_failure();
     {  // Profiler scope start
         ZoneScoped;
         MetalContext& metal_ctx = MetalContext::instance(extract_context_id(device));
@@ -1067,6 +1080,7 @@ void LaunchProgram(IDevice* device, Program& program, bool wait_until_cores_done
             std::vector<std::vector<CoreCoord>> logical_cores_used_in_program = program.impl().logical_cores();
             std::unordered_set<CoreCoord> not_done_cores;
             const auto& hal = metal_ctx.hal();
+            auto submission = execution->issue(program, *device, &metal_ctx.get_service_core_manager().impl());
             for (uint32_t programmable_core_type_index = 0;
                  programmable_core_type_index < logical_cores_used_in_program.size();
                  programmable_core_type_index++) {
@@ -1097,7 +1111,9 @@ void LaunchProgram(IDevice* device, Program& program, bool wait_until_cores_done
             if (wait_until_cores_done) {
                 // Wait for all cores to be done
                 llrt::internal_::wait_until_cores_done(metal_ctx, device_id, dev_msgs::RUN_MSG_GO, not_done_cores);
+                execution->stop(program, *device);
             }
+            submission.commit();
         }
     }  // Profiler scope end
     if (wait_until_cores_done) {
@@ -1109,7 +1125,9 @@ void WaitProgramDone(IDevice* device, Program& program, bool read_device_profile
     auto& metal_ctx = MetalContext::instance(extract_context_id(device));
     auto device_id = device->id();
     std::vector<std::vector<CoreCoord>> logical_cores_used_in_program = program.impl().logical_cores();
+    auto completion = ProgramExecution::observe_program(*device, program);
     llrt::internal_::wait_for_idle(metal_ctx, device_id, logical_cores_used_in_program);
+    completion.receive();
     if (read_device_profiler_results) {
         detail::ReadDeviceProfilerResults(device);
     }
@@ -1117,6 +1135,9 @@ void WaitProgramDone(IDevice* device, Program& program, bool read_device_profile
 
 bool ConfigureDeviceWithProgram(IDevice* device, Program& program, bool force_slow_dispatch) {
     program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    auto preparation = ProgramExecution::reserve_direct(program, *device);
+    auto execution = preparation.execution();
+    auto niu_failure = execution->watch_failure();
     ZoneScoped;
     bool pass = true;
     const MetalContext& metal_ctx = MetalContext::instance(extract_context_id(device));
@@ -1305,6 +1326,9 @@ bool ConfigureDeviceWithProgram(IDevice* device, Program& program, bool force_sl
 
 void WriteRuntimeArgsToDevice(IDevice* device, Program& program, bool force_slow_dispatch) {
     program.impl().validate_worker_stream_state_client(MetalContext::instance(extract_context_id(device)), device->id());
+    auto preparation = ProgramExecution::reserve_direct(program, *device);
+    auto execution = preparation.execution();
+    auto niu_failure = execution->watch_failure();
     ZoneScoped;
     auto device_id = device->id();
     // This function is shared between FD and SD.

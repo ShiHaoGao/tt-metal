@@ -9,6 +9,7 @@
 #include "impl/context/metal_context.hpp"
 #include "tt_metal/impl/threading/thread_pool.hpp"
 #include "tt_metal/impl/program/program_impl.hpp"
+#include "tt_metal/impl/program/program_execution.hpp"
 #include <mesh_device.hpp>
 #include <mesh_event.hpp>
 #include <tt-metalium/experimental/core_subset_write/buffer_write.hpp>
@@ -183,7 +184,9 @@ void SDMeshCommandQueue::wait_for_cores_idle() {
         // In emulated mode this map is always empty (LaunchProgram is synchronous),
         // so this block is effectively a no-op for emulated devices.
         for (const auto& [device_id, logical_cores] : logical_cores_for_previous_workload_) {
+            auto completion = ::tt::tt_metal::detail::ProgramExecution::observe_logical_cores(context, device_id, logical_cores);
             tt::llrt::internal_::wait_for_idle(context, device_id, logical_cores);
+            completion.receive();
         }
         logical_cores_for_previous_workload_.clear();
     }
@@ -223,7 +226,9 @@ void SDMeshCommandQueue::dispatch_program(const MeshCoordinateRange& coord_range
         }
 
         if (need_wait) {
+            auto completion = ::tt::tt_metal::detail::ProgramExecution::observe_logical_cores(context, device_id, cores_to_wait);
             tt::llrt::internal_::wait_for_idle(context, device_id, cores_to_wait);
+            completion.receive();
         }
 
         local_devices.push_back(device);
@@ -290,9 +295,22 @@ void SDMeshCommandQueue::dispatch_program(const MeshCoordinateRange& coord_range
 }
 
 void SDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool blocking) {
+    auto niu_preparation =
+        ::tt::tt_metal::detail::ProgramExecution::reserve_workload(*mesh_device_, mesh_workload);
     for (const auto& [range, program] : mesh_workload.get_programs())
         program.impl().validate_worker_stream_state_client(
             MetalContext::instance(mesh_device_->impl().get_context_id()));
+    std::vector<std::shared_ptr<::tt::tt_metal::detail::ProgramExecution>> reservations;
+    std::vector<::tt::tt_metal::detail::ProgramExecution::FailureScope> niu_failures;
+    auto managed = niu_preparation.execution();
+    if (managed) niu_failures.push_back(managed->watch_failure());
+    for (auto& [range, program] : mesh_workload.get_programs()) {
+        const auto local = mesh_device_->impl().get_local_devices(range);
+        if (!local.empty()) {
+            reservations.push_back(::tt::tt_metal::detail::ProgramExecution::reserve(program, local));
+            niu_failures.push_back(reservations.back()->watch_failure());
+        }
+    }
     if (this->get_target_device_type() == tt::TargetDevice::Mock) {
         return;  // Skip workload execution for mock devices
     }
@@ -346,7 +364,9 @@ void SDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
     }
 #endif
 
-    if (launch_thread_pool_) {
+    if (launch_thread_pool_ && !managed) {
+        // Ordinary programs may prepare in parallel. A managed invocation has
+        // one host preparation owner for the complete frozen batch.
         // Dispatch programs in parallel
         for (auto& [coord_range, program] : range_program_map) {
             // Find first local device for thread binding
@@ -369,8 +389,11 @@ void SDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
     } else {
         // Single device: sequential launch
         for (auto& [coord_range, program] : range_program_map) {
-            dispatch_program(coord_range, program, blocking);
+            dispatch_program(coord_range, program, managed ? false : blocking);
         }
+        // Cross-member sender/receiver programs must all receive GO before a
+        // blocking managed enqueue waits for any member's completion.
+        if (managed && blocking) wait_for_cores_idle();
     }
 }
 

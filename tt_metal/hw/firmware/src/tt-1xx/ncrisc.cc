@@ -91,7 +91,13 @@ inline __attribute__((always_inline)) void wait_for_brisc_notification() {
     }
 }
 
-inline __attribute__((always_inline)) void signal_ncrisc_completion() { *ncrisc_run = RUN_SYNC_MSG_DONE; }
+inline __attribute__((always_inline)) void signal_ncrisc_completion() {
+#if defined(ARCH_BLACKHOLE)
+    // Publish source accounting and profiler L1 writes before BRISC sees DONE.
+    asm volatile("fence iorw, iorw" ::: "memory");
+#endif
+    *ncrisc_run = RUN_SYNC_MSG_DONE;
+}
 
 #if defined(ARCH_WORMHOLE)
 #define MEM_MOVER_VIEW_IRAM_BASE_ADDR (0x4 << 12)
@@ -127,78 +133,81 @@ int main(int argc, char* argv[]) {
     while (1) {
         WAYPOINT("W");
         wait_for_brisc_notification();
-        DeviceZoneScopedMainN("NCRISC-FW");
+        {
+            DeviceZoneScopedMainN("NCRISC-FW");
 
-        uint32_t launch_msg_rd_ptr = mailboxes->launch_msg_rd_ptr;
-        launch_msg_t* launch_msg = &(mailboxes->launch[launch_msg_rd_ptr]);
+            uint32_t launch_msg_rd_ptr = mailboxes->launch_msg_rd_ptr;
+            launch_msg_t* launch_msg = &(mailboxes->launch[launch_msg_rd_ptr]);
 
-        uint32_t kernel_config_base =
-            firmware_config_init(mailboxes, ProgrammableCoreType::TENSIX, internal_::get_hw_thread_idx());
-        int index = static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1);
+            uint32_t kernel_config_base =
+                firmware_config_init(mailboxes, ProgrammableCoreType::TENSIX, internal_::get_hw_thread_idx());
+            int index = static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1);
 
-        uint32_t kernel_lma = kernel_config_base + launch_msg->kernel_config.kernel_text_offset[index];
+            uint32_t kernel_lma = kernel_config_base + launch_msg->kernel_config.kernel_text_offset[index];
 #if defined(ARCH_WORMHOLE)
-        static_assert(MEM_NCRISC_KERNEL_BASE == MEM_NCRISC_IRAM_BASE, "NCRISC kernel vma mismatch");
-        l1_to_ncrisc_iram_copy(kernel_lma >> 4, launch_msg->kernel_config.ncrisc_kernel_size16, 0);
+            static_assert(MEM_NCRISC_KERNEL_BASE == MEM_NCRISC_IRAM_BASE, "NCRISC kernel vma mismatch");
+            l1_to_ncrisc_iram_copy(kernel_lma >> 4, launch_msg->kernel_config.ncrisc_kernel_size16, 0);
 #endif
-        uint32_t tt_l1_ptr* cb_l1_base =
-            (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.local_cb_offset);
-        // Split 64-bit CB mask into 32-bit halves for efficient RISC-V processing
-        // Wormhole: lower half only (TRISC memory constraint), Blackhole: both halves
+            uint32_t tt_l1_ptr* cb_l1_base =
+                (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.local_cb_offset);
+            // Split 64-bit CB mask into 32-bit halves for efficient RISC-V processing
+            // Wormhole: lower half only (TRISC memory constraint), Blackhole: both halves
 
 #if defined(WATCHER_ENABLED) && !defined(WATCHER_DISABLE_CB_SANITIZE)
-        // Zero all CB interfaces so stale entries from previous programs
-        // don't cause false positives in the CB sanitize check.
-        for (uint32_t i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
-            get_local_cb_interface(i).fifo_size = 0;
-        }
-#endif
-        uint64_t local_cb_mask = launch_msg->kernel_config.local_cb_mask;
-        uint32_t local_cb_mask_low = static_cast<uint32_t>(local_cb_mask & 0xFFFFFFFFULL);
-        if (local_cb_mask != 0) {
-            DeviceZoneScopedN("CBP_FW_LOCAL_CB_INIT");
-            if (local_cb_mask_low != 0) {
-                setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
+            // Zero all CB interfaces so stale entries from previous programs
+            // don't cause false positives in the CB sanitize check.
+            for (uint32_t i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
+                get_local_cb_interface(i).fifo_size = 0;
             }
+#endif
+            uint64_t local_cb_mask = launch_msg->kernel_config.local_cb_mask;
+            uint32_t local_cb_mask_low = static_cast<uint32_t>(local_cb_mask & 0xFFFFFFFFULL);
+            if (local_cb_mask != 0) {
+                DeviceZoneScopedN("CBP_FW_LOCAL_CB_INIT");
+                if (local_cb_mask_low != 0) {
+                    setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
+                }
 #ifdef ARCH_BLACKHOLE
-            uint32_t local_cb_mask_upper = static_cast<uint32_t>(local_cb_mask >> 32);
-            if (local_cb_mask_upper != 0) {
-                setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 32, local_cb_mask_upper);
+                uint32_t local_cb_mask_upper = static_cast<uint32_t>(local_cb_mask >> 32);
+                if (local_cb_mask_upper != 0) {
+                    setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 32, local_cb_mask_upper);
+                }
+#endif
             }
-#endif
-        }
 
 #if defined(ARCH_WORMHOLE)
-        l1_to_ncrisc_iram_copy_wait();
+            l1_to_ncrisc_iram_copy_wait();
 #endif
 
-        cb_l1_base = (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.remote_cb_offset);
-        uint32_t end_cb_index = launch_msg->kernel_config.min_remote_cb_start_index;
-        // NOC argument is unused
-        if (end_cb_index < NUM_CIRCULAR_BUFFERS) {
-            DeviceZoneScopedN("CBP_FW_REMOTE_CB_INIT");
-            experimental::setup_remote_cb_interfaces<false>(cb_l1_base, end_cb_index, 0, 0, 0, 0);
-        }
-        my_relative_x_ = my_logical_x_ - launch_msg->kernel_config.sub_device_origin_x;
-        my_relative_y_ = my_logical_y_ - launch_msg->kernel_config.sub_device_origin_y;
+            cb_l1_base = (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.remote_cb_offset);
+            uint32_t end_cb_index = launch_msg->kernel_config.min_remote_cb_start_index;
+            // NOC argument is unused
+            if (end_cb_index < NUM_CIRCULAR_BUFFERS) {
+                DeviceZoneScopedN("CBP_FW_REMOTE_CB_INIT");
+                experimental::setup_remote_cb_interfaces<false>(cb_l1_base, end_cb_index, 0, 0, 0, 0);
+            }
+            my_relative_x_ = my_logical_x_ - launch_msg->kernel_config.sub_device_origin_x;
+            my_relative_y_ = my_logical_y_ - launch_msg->kernel_config.sub_device_origin_y;
 
-        WAYPOINT("R");
+            WAYPOINT("R");
 
 #if defined(ARCH_WORMHOLE)
-        // Jumping to IRAM causes bizarre behavior, so signal the
-        // brisc to reset the ncrisc to the IRAM address
-        uint32_t kernel_vma = MEM_NCRISC_KERNEL_BASE;
-        mailboxes->ncrisc_halt.resume_addr = kernel_vma;
-        auto stack_free = wh_iram_trampoline(RUN_SYNC_MSG_WAITING_FOR_RESET, kernel_lma - kernel_vma);
+            // Jumping to IRAM causes bizarre behavior, so signal the
+            // brisc to reset the ncrisc to the IRAM address
+            uint32_t kernel_vma = MEM_NCRISC_KERNEL_BASE;
+            mailboxes->ncrisc_halt.resume_addr = kernel_vma;
+            auto stack_free = wh_iram_trampoline(RUN_SYNC_MSG_WAITING_FOR_RESET, kernel_lma - kernel_vma);
 #else
-        while (*ncrisc_run != RUN_SYNC_MSG_GO) {
-            invalidate_l1_cache();
-        }
-        auto stack_free = reinterpret_cast<uint32_t (*)()>(kernel_lma)();
+            while (*ncrisc_run != RUN_SYNC_MSG_GO) {
+                invalidate_l1_cache();
+            }
+            auto stack_free = reinterpret_cast<uint32_t (*)()>(kernel_lma)();
 #endif
-        record_stack_usage(stack_free);
-        WAYPOINT("D");
-        DEVICE_PRINT_KERNEL_FINISHED();
+            record_stack_usage(stack_free);
+            WAYPOINT("D");
+            DEVICE_PRINT_KERNEL_FINISHED();
+
+        }  // Profiler and device-print tails finish before subordinate DONE.
 
         signal_ncrisc_completion();
 #if defined(ARCH_WORMHOLE)

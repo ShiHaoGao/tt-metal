@@ -1,6 +1,23 @@
 # Include source file lists (module owners maintain sources.cmake)
 include(sources.cmake)
 
+# CPU allocation/lifetime coverage uses the production Metalium algorithm.
+# It does not construct a firmware boot or activate device admission.
+add_executable(unit_tests_niu_admission
+    test_niu_admission.cpp test_niu_infrastructure.cpp)
+target_compile_features(unit_tests_niu_admission PRIVATE cxx_std_20)
+target_include_directories(unit_tests_niu_admission BEFORE PRIVATE
+    "$<TARGET_PROPERTY:Metalium::Metal,INCLUDE_DIRECTORIES>"
+    ${PROJECT_SOURCE_DIR}/tt_metal/impl
+    ${PROJECT_SOURCE_DIR}/tt_metal/api/tt-metalium)
+target_link_libraries(unit_tests_niu_admission PRIVATE test_metal_common_libs)
+set_target_properties(unit_tests_niu_admission PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/test/tt_metal)
+gtest_discover_tests(unit_tests_niu_admission
+    TEST_PREFIX "unit_tests_niu_admission."
+    PROPERTIES ENVIRONMENT "TT_METAL_RUNTIME_ROOT=${PROJECT_SOURCE_DIR}"
+    DISCOVERY_TIMEOUT 60)
+
 # Worker-state admission belongs to Metalium and needs no TTNN algorithm build.
 add_executable(unit_tests_worker_stream_state ${UNIT_TESTS_WORKER_STREAM_STATE_SOURCES})
 target_include_directories(unit_tests_worker_stream_state BEFORE PRIVATE

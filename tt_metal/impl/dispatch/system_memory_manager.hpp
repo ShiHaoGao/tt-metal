@@ -23,6 +23,9 @@ namespace tt::tt_metal {
 
 class Buffer;
 class MetalContext;
+namespace distributed {
+class FDMeshCommandQueue;
+}
 
 // True when the host can't pin D2H memory (no 64-bit PCIe addressing and no IOMMU).
 bool d2h_uses_hugepage_fallback(const MetalContext& ctx);
@@ -120,6 +123,10 @@ public:
     const SystemMemoryQueuePlan& queue_plan() const;
 
 private:
+    friend class distributed::FDMeshCommandQueue;
+    // Only actual queue quiescence/teardown can allocate the last event ID.
+    uint32_t get_next_drain_event(uint8_t cq_id);
+    uint32_t allocate_event(uint8_t cq_id, bool drain);
     std::optional<SystemMemoryQueueInputs> queue_inputs_;
     std::optional<SystemMemoryQueuePlan> queue_plan_;
     bool is_mock_device() const;

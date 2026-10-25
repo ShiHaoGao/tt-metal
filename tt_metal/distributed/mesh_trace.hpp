@@ -7,6 +7,7 @@
 #include <tt-metalium/mesh_buffer.hpp>
 #include <tt-metalium/mesh_trace_id.hpp>
 #include "trace/trace_buffer.hpp"
+#include "impl/program/program_execution.hpp"
 
 namespace tt::tt_metal::distributed {
 
@@ -27,6 +28,9 @@ struct MeshTraceData {
 // (including the dispatch commands across devices, the SubDevices the trace runs on
 // the size of the trace and the number of workers in the trace) on host
 class MeshTraceDescriptor {
+private:
+    friend class FDMeshCommandQueue;
+    std::vector<std::shared_ptr<const ::tt::tt_metal::detail::ProgramExecution::DispatchFootprint>> niu_footprints_;
 public:
     // Mapping of sub_device_id to descriptor
     std::unordered_map<SubDeviceId, TraceWorkerDescriptor> descriptors;

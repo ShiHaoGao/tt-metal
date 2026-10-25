@@ -83,6 +83,23 @@ Publication::~Publication() {
     fs::remove_all(staging_, ignored);
 }
 
+fs::path Publication::create_build_root(const fs::path& source, const fs::path& runtime) {
+    const auto source_root = fs::canonical(source);
+    const auto runtime_root = fs::canonical(runtime);
+    if (!fs::is_directory(source_root / "tt_metal") || !fs::is_directory(runtime_root / "hw"))
+        throw std::invalid_argument("supplier build requires source and generated Hardware roots");
+    const auto root = staging_ / "build-root";
+    if (committed_ || !fs::create_directory(root))
+        throw std::runtime_error("supplier build root already exists or publication is committed");
+    for (const auto& entry : fs::directory_iterator(source_root)) {
+        const auto name = entry.path().filename();
+        if (name == "runtime" || name == ".git") continue;
+        fs::create_symlink(entry.path(), root / name);
+    }
+    fs::create_directory_symlink(runtime_root, root / "runtime");
+    return root;
+}
+
 void Publication::copy(const fs::path& source, const fs::path& relative) {
     if (committed_) {
         throw std::runtime_error("firmware bundle is already published");

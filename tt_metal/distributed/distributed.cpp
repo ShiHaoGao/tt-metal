@@ -6,6 +6,7 @@
 #include <tt_stl/fmt.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <utility>
+#include <thread>
 
 #include "device.hpp"
 #include "mesh_device.hpp"
@@ -17,6 +18,7 @@
 #include <internal/service/service_core_manager.hpp>
 #include "impl/internal/service/service_core_manager_impl.hpp"
 #include "impl/context/metal_context.hpp"
+#include "impl/program/program_execution.hpp"
 #include "impl/context/metal_env_impl.hpp"
 #include <tt-metalium/tt_metal.hpp>
 #include "llrt/tt_cluster.hpp"
@@ -24,6 +26,11 @@
 namespace tt::tt_metal::distributed {
 
 void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload, bool blocking) {
+    auto niu_preparation =
+        ::tt::tt_metal::detail::ProgramExecution::reserve_workload(*mesh_cq.device(), mesh_workload);
+    std::vector<std::shared_ptr<::tt::tt_metal::detail::ProgramExecution>> reservations;
+    std::vector<::tt::tt_metal::detail::ProgramExecution::FailureScope> niu_failures;
+    if (auto managed = niu_preparation.execution()) niu_failures.push_back(managed->watch_failure());
     // Also covers the service-workload branch before it bypasses queue leaves.
     for (const auto& [range, program] : mesh_workload.get_programs())
         program.impl().validate_worker_stream_state_client(
@@ -40,6 +47,13 @@ void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload,
     // No-mixing contract: a workload is entirely a service workload (every program on claimed service
     // cores) or entirely a normal one.
     auto& mesh_impl = mesh_cq.device()->impl();
+    for (auto& [range, program] : mesh_workload.get_programs()) {
+        const auto local = mesh_impl.get_local_devices(range);
+        if (!local.empty()) {
+            reservations.push_back(::tt::tt_metal::detail::ProgramExecution::reserve(program, local));
+            niu_failures.push_back(reservations.back()->watch_failure());
+        }
+    }
     auto& svc = mesh_impl.metal_context().get_service_core_manager();
     auto& programs = mesh_workload.impl().get_programs();
     if (svc.impl().has_any_claims()) {
@@ -109,7 +123,7 @@ void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload,
                                 "claimed service core (released since a prior enqueue?).",
                                 core,
                                 device->id());
-                            svc.impl().mark_launched(device->id(), core);  // launch-once
+                            svc.impl().validate_launch(device->id(), core);
                         }
                     }
                     tt::tt_metal::detail::LaunchProgram(device, program, false, true);
@@ -121,6 +135,9 @@ void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload,
 
     auto& env = mesh_impl.metal_env();
     if (env.get_rtoptions().get_fast_dispatch()) {
+        const auto& ids = mesh_workload.impl().determine_sub_device_ids(mesh_cq.device());
+        const std::vector<SubDeviceId> subdevices(ids.begin(), ids.end());
+        reservations.push_back(::tt::tt_metal::detail::ProgramExecution::reserve_dispatch(*mesh_cq.device(), subdevices, mesh_workload));
         mesh_workload.impl().compile(mesh_cq.device());
         mesh_workload.impl().load_binaries(mesh_cq);
         mesh_workload.impl().generate_dispatch_commands(mesh_cq);
@@ -135,6 +152,13 @@ void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload,
 }
 
 void EventSynchronize(const MeshEvent& event) {
+    if (auto completed = event.impl().query_completion()) {
+        while (!*completed) {
+            std::this_thread::yield();
+            completed = event.impl().query_completion();
+        }
+        return;
+    }
     if (!event.device()->impl().metal_env().get_rtoptions().get_fast_dispatch()) {
         return;
     }
@@ -148,6 +172,7 @@ void EventSynchronize(const MeshEvent& event) {
 }
 
 bool EventQuery(const MeshEvent& event) {
+    if (auto completed = event.impl().query_completion()) return *completed;
     if (!event.device()->impl().metal_env().get_rtoptions().get_fast_dispatch()) {
         return true;
     }

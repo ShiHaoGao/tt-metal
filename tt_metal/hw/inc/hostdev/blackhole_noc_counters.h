@@ -6,6 +6,19 @@
 #include <cstdint>
 #include "hostdev/dev_msgs.h"
 
+// Dynamic NoC assigns disjoint command buffers to the two data-movement
+// processors. Keep these existing device names global so firmware, kernels,
+// and host-side native support publication consume the same ownership map.
+constexpr uint32_t DYNAMIC_NOC_NCRISC_WR_CMD_BUF = 2;
+constexpr uint32_t DYNAMIC_NOC_NCRISC_WR_REG_CMD_BUF = 2;
+constexpr uint32_t DYNAMIC_NOC_NCRISC_AT_CMD_BUF = 3;
+constexpr uint32_t DYNAMIC_NOC_NCRISC_RD_CMD_BUF = 3;
+
+constexpr uint32_t DYNAMIC_NOC_BRISC_WR_CMD_BUF = 0;
+constexpr uint32_t DYNAMIC_NOC_BRISC_WR_REG_CMD_BUF = 0;
+constexpr uint32_t DYNAMIC_NOC_BRISC_AT_CMD_BUF = 1;
+constexpr uint32_t DYNAMIC_NOC_BRISC_RD_CMD_BUF = 1;
+
 // The same physical counter layout is consumed by firmware and by host-side
 // native support publication. Do not pull device operations or RVTT pointers
 // into host layout projection.

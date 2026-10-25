@@ -78,6 +78,28 @@ TEST_F(NativeFirmwareBundlePublication, FailureLeavesNoPartialBundleOrStaging) {
     EXPECT_FALSE(fs::exists(stage));
 }
 
+TEST_F(NativeFirmwareBundlePublication, BuildRootCombinesExplicitInputsWithoutChangingSource) {
+    const auto source = root / "source";
+    const auto runtime = root / "generated";
+    fs::create_directories(source / "tt_metal");
+    fs::create_directories(runtime / "hw");
+    std::ofstream(source / "tt_metal" / "input.cc") << "source";
+    std::ofstream(runtime / "hw" / "firmware.ld") << "generated";
+    fs::path build_root;
+    {
+        Publication publication(root / "bundle");
+        build_root = publication.create_build_root(source, runtime);
+        EXPECT_EQ(fs::canonical(build_root / "tt_metal" / "input.cc"), source / "tt_metal" / "input.cc");
+        EXPECT_EQ(fs::canonical(build_root / "runtime" / "hw" / "firmware.ld"), runtime / "hw" / "firmware.ld");
+        EXPECT_FALSE(fs::exists(source / "runtime"));
+        EXPECT_TRUE(fs::is_empty(publication.cache()));
+        EXPECT_THROW(publication.create_build_root(source, runtime), std::runtime_error);
+    }
+    EXPECT_FALSE(fs::exists(build_root));
+    EXPECT_TRUE(fs::exists(runtime / "hw" / "firmware.ld"));
+    EXPECT_TRUE(fs::exists(source / "tt_metal" / "input.cc"));
+}
+
 TEST_F(NativeFirmwareBundlePublication, PublishesCompleteAndWeakBytesTogether) {
     const auto output = root / "bundle";
     Publication publication(output);

@@ -154,6 +154,14 @@ SECTIONS
     KEEP(*(.tt_native_image))
   } :NONE
 #endif
+  /* Algorithm qualification comes from the verified algorithm object. Keep
+     it host-only even when LLVM represents the input constant as ALLOC. */
+#if defined(TYPE_KERNEL)
+  .tt_native_noc 0x6a00000 (INFO) :
+  {
+    KEEP(*(.tt_native_noc))
+  } :NONE
+#endif
   /* DEVICE_PRINT string table – file-only section, VMA = 0x6400000 */
   .device_print_strings 0x6400000 (INFO) :
   {

@@ -95,7 +95,7 @@ public:
     virtual void XIPify() = 0;
 
     virtual std::span<std::byte> GetSectionContents(std::string_view name, uint64_t& virtual_address) const = 0;
-    virtual std::span<const std::byte> GetMetadataSection(std::string_view name) const = 0;
+    virtual std::span<const std::byte> GetMetadataSection(std::string_view name, MetadataSize size) const = 0;
 
 private:
     [[nodiscard]] auto GetSegments() const -> std::vector<Segment>& { return owner_->segments_; }
@@ -143,13 +143,15 @@ public:
         return {};
     }
 
-    std::span<const std::byte> GetMetadataSection(std::string_view name) const override {
+    std::span<const std::byte> GetMetadataSection(std::string_view name, MetadataSize size) const override {
         std::span<const std::byte> result;
         bool found = false;
         for (const auto& shdr : GetShdrs()) {
             if (name != GetName(shdr)) continue;
             if (found || (shdr.sh_flags & SHF_ALLOC) || shdr.sh_type != SHT_PROGBITS)
-                TT_THROW("{}: metadata section must be unique, non-ALLOC PROGBITS", path_);
+                TT_THROW("{}: metadata section {} must be unique, non-ALLOC PROGBITS", path_, name);
+            if (!shdr.sh_size && size == MetadataSize::Nonempty)
+                TT_THROW("{}: metadata declaration {} must be nonempty", path_, name);
             found = true;
             result = GetContents(shdr);
             for (const auto& phdr : GetPhdrs()) {
@@ -332,8 +334,8 @@ std::span<std::byte> ElfFile::GetSectionContents(std::string_view section_name, 
     return pimpl_->GetSectionContents(section_name, virtual_address);
 }
 
-std::span<const std::byte> ElfFile::GetMetadataSection(std::string_view name) const {
-    return pimpl_ ? pimpl_->GetMetadataSection(name) : std::span<const std::byte>{};
+std::span<const std::byte> ElfFile::GetMetadataSection(std::string_view name, MetadataSize size) const {
+    return pimpl_ ? pimpl_->GetMetadataSection(name, size) : std::span<const std::byte>{};
 }
 
 void ElfFile::ReleaseImpl() {
