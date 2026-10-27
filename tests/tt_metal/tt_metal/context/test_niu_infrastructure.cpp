@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 #include "impl/context/niu_admission.hpp"
+#include "impl/context/niu_handoff_receiver.hpp"
 
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -38,6 +39,7 @@
 #include "impl/context/metal_env_accessor.hpp"
 #include "impl/context/metal_env_impl.hpp"
 #include "impl/device/device_impl.hpp"
+#include "impl/experimental/native_kernel/native_image.hpp"
 #include "impl/dispatch/dispatch_core_manager.hpp"
 #include "impl/dispatch/system_memory_manager.hpp"
 #include "impl/internal/service/service_core_manager_impl.hpp"
@@ -46,6 +48,20 @@
 #include "impl/program/program_execution.hpp"
 #include "impl/threading/thread_pool.hpp"
 #include "llrt/tt_cluster.hpp"
+
+namespace {
+thread_local size_t unexpected_handoff_reads = 0;
+}
+
+namespace tt::tt_metal::detail {
+// The real Mock fixtures cannot create a successful firmware boot. Reject any
+// attempt to reach mailbox transport rather than manufacture observation bytes.
+__attribute__((visibility("default")))
+NiuHandoffReadResult NiuHandoffReceiver::read(const Cluster&, const Hal&, ChipId, CoreCoord) {
+    ++unexpected_handoff_reads;
+    throw std::runtime_error("Unexpected mailbox transport without an actual managed boot");
+}
+}
 
 namespace tt::tt_metal {
 namespace {
@@ -68,6 +84,131 @@ TEST(NiuManagedInvocationContractTest, AllocationProjectionCannotBeForgedOrMutat
     EXPECT_FALSE(std::is_move_assignable_v<NiuAdmission::Allocation>);
     using SelectionView = decltype(std::declval<const NiuAdmission::Allocation&>().selections());
     EXPECT_TRUE((std::is_same_v<SelectionView, std::span<const detail::NiuSelection>>));
+}
+
+template <class Binding>
+concept exposes_completion_transaction_identity = requires(const Binding& binding) {
+    binding.niuId;
+    binding.trid;
+};
+
+TEST(NiuManagedInvocationContractTest, CompletionBindingCarriesOnlyActualAllocationAndBootCorrelation) {
+    using Binding = detail::ProgramExecution::ManagedInvocation::CompletionBinding;
+    EXPECT_FALSE(exposes_completion_transaction_identity<Binding>);
+    EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Binding&>().niu), detail::NiuKey>));
+    EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Binding&>().selectors), detail::NiuSelectorMask>));
+    EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Binding&>().boot_cookie), uint64_t>));
+    EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Binding&>().invocation_id), uint64_t>));
+    // The SDK deliberately has no transaction-ID provider or per-item
+    // completion observation yet. A runtime adapter must therefore reject a
+    // nonempty package inventory instead of deriving NIU/TRID from a scope or
+    // address. Aggregate mailbox observations remain separately typed.
+    using Observation = detail::ProgramExecution::ManagedInvocation::CompletionObservation;
+    EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().binding), Binding>));
+    EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().handoff),
+                                detail::ProgramExecution::HandoffObservation>));
+}
+
+template <class Allocation>
+concept exposes_selector_sublease = requires(const Allocation& allocation, const detail::NiuKey& key) {
+    allocation.acquire_selector(key);
+};
+
+template <class Invocation>
+concept exposes_selector_observation = requires(
+    const Invocation& invocation, const typename Invocation::SelectorLease& selector) {
+    typename Invocation::SelectorObservation;
+    invocation.observe_selector(selector);
+    invocation.retire_selectors();
+};
+
+template <class Invocation>
+void check_selector_observation_contract() {
+    if constexpr (!exposes_selector_observation<Invocation>) {
+        ADD_FAILURE() << "Managed invocation has no original-owner selector observation";
+    } else {
+        using Observation = typename Invocation::SelectorObservation;
+        EXPECT_FALSE(std::is_default_constructible_v<Observation>);
+        EXPECT_FALSE(std::is_aggregate_v<Observation>);
+        EXPECT_TRUE((std::is_same_v<
+            decltype(std::declval<const Invocation&>().observe_selector(
+                std::declval<const typename Invocation::SelectorLease&>())),
+            std::optional<Observation>>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().niu()), detail::NiuKey>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().selector()), uint8_t>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().boot_cookie()), uint64_t>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().invocation_id()), uint64_t>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Invocation&>().retire_selectors()), bool>));
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, SelectorObservationCannotBeMintedByTheRuntimeAdapter) {
+    check_selector_observation_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+concept exposes_item_witness_owner = requires(
+    const Invocation& invocation, const typename Invocation::SelectorLease& selector,
+    const typename Invocation::ItemWitnessLease& lease,
+    const typename Invocation::ItemWitnessRequirement& requirement) {
+    typename Invocation::ItemWitnessObservation;
+    invocation.acquire_item_witness(selector, requirement);
+    invocation.observe_item(lease);
+};
+
+template <class Invocation>
+void check_item_witness_owner_contract() {
+    if constexpr (!exposes_item_witness_owner<Invocation>) {
+        ADD_FAILURE() << "Managed invocation has no owned item witness allocation/observer";
+    } else {
+        using Lease = typename Invocation::ItemWitnessLease;
+        using Observation = typename Invocation::ItemWitnessObservation;
+        EXPECT_FALSE(std::is_default_constructible_v<Lease>);
+        EXPECT_FALSE(std::is_aggregate_v<Lease>);
+        EXPECT_FALSE(std::is_copy_constructible_v<Lease>);
+        EXPECT_TRUE(std::is_move_constructible_v<Lease>);
+        EXPECT_FALSE(std::is_default_constructible_v<Observation>);
+        EXPECT_FALSE(std::is_aggregate_v<Observation>);
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Lease&>().address()), uint32_t>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Lease&>().request()),
+                                   const tt_niu_item_witness_request&>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().request()),
+                                   const tt_niu_item_witness_request&>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Invocation&>().observe_item(
+                                       std::declval<const Lease&>())), std::optional<Observation>>));
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ItemWitnessCanOnlyComeFromOriginalSdkAllocationAndObserver) {
+    check_item_witness_owner_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+concept exposes_invocation_selector_sublease = requires(const Invocation& invocation, const detail::NiuKey& key) {
+    invocation.acquire_selector(key);
+};
+
+template <class Allocation>
+void check_selector_sublease_contract() {
+    EXPECT_TRUE(exposes_selector_sublease<Allocation>);
+    if constexpr (exposes_selector_sublease<Allocation>) {
+        using Lease = typename decltype(std::declval<const Allocation&>().acquire_selector(
+            std::declval<const detail::NiuKey&>()))::value_type;
+        EXPECT_FALSE(std::is_copy_constructible_v<Lease>);
+        EXPECT_TRUE(std::is_move_constructible_v<Lease>);
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Lease&>().niu()), detail::NiuKey>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Lease&>().selector()), uint8_t>));
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ManagedInvocationIsTheOnlyPublicSelectorLeaseOwner) {
+    // A retained allocation is an immutable inspection view. Only the live
+    // invocation may mint a selector, after checking Reserved, cancellation,
+    // the admission token, and the original firmware boot. An Allocation copy
+    // must not bypass those checks after issue or retirement.
+    EXPECT_FALSE(exposes_selector_sublease<NiuAdmission::Allocation>);
+    check_selector_sublease_contract<detail::ProgramExecution::ManagedInvocation>();
+    EXPECT_TRUE(exposes_invocation_selector_sublease<detail::ProgramExecution::ManagedInvocation>);
 }
 
 TEST(NiuManagedInvocationContractTest, PreparationHasOneHostOwnerAndSupportsNestedBorrowing) {
@@ -109,6 +250,35 @@ TEST(NiuManagedInvocationContractTest, PreparationCancellationWaitsForLastBorrow
     EXPECT_FALSE(preparation.acquire());
 }
 
+TEST(NiuManagedInvocationContractTest, HandoffCorrelationIdentitiesNeverWrapOrRepeat) {
+    using experimental::native_detail::next_handoff_identity;
+    std::atomic<uint64_t> next{1};
+    EXPECT_EQ(next_handoff_identity(next), 1u);
+    EXPECT_EQ(next_handoff_identity(next), 2u);
+    next.store(std::numeric_limits<uint64_t>::max() - 1);
+    EXPECT_EQ(next_handoff_identity(next), std::numeric_limits<uint64_t>::max() - 1);
+    EXPECT_THROW((void)next_handoff_identity(next), std::overflow_error);
+    EXPECT_THROW((void)next_handoff_identity(next), std::overflow_error);
+    EXPECT_EQ(next.load(), std::numeric_limits<uint64_t>::max());
+    next.store(0);
+    EXPECT_THROW((void)next_handoff_identity(next), std::overflow_error);
+    EXPECT_FALSE(std::is_default_constructible_v<experimental::native_detail::LoadedFirmware>);
+    EXPECT_FALSE(std::is_copy_constructible_v<experimental::native_detail::LoadedFirmware>);
+}
+
+TEST(NiuManagedInvocationContractTest, ConcurrentHandoffCorrelationIdentitiesStayDistinct) {
+    std::atomic<uint64_t> next{1};
+    std::array<uint64_t, 32> identities{};
+    std::vector<std::thread> threads;
+    for (auto& identity : identities)
+        threads.emplace_back([&next, &identity] {
+            identity = experimental::native_detail::next_handoff_identity(next);
+        });
+    for (auto& thread : threads) thread.join();
+    std::sort(identities.begin(), identities.end());
+    for (size_t index = 0; index != identities.size(); ++index) EXPECT_EQ(identities[index], index + 1);
+}
+
 template <class Execution, class... Inputs>
 void expect_unbooted_managed_rejection(Inputs&&... inputs) {
     if constexpr (requires { Execution::acquire_managed(std::forward<Inputs>(inputs)...); }) {
@@ -121,6 +291,12 @@ void expect_unbooted_managed_rejection(Inputs&&... inputs) {
     } else {
         ADD_FAILURE() << "SDK has no token-bound managed invocation entrypoint";
     }
+}
+
+void expect_handoff_rejection(detail::ProgramExecution& execution) {
+    const auto before = unexpected_handoff_reads;
+    EXPECT_THROW(execution.observe_handoff(), std::runtime_error);
+    EXPECT_EQ(unexpected_handoff_reads, before);
 }
 
 template <class Execution>
@@ -255,6 +431,57 @@ TEST_F(NiuInfrastructureTest, ManagedDirectInvocationRequiresActualBootBeforePre
     EXPECT_FALSE(program.impl().is_compiled());
     EXPECT_FALSE(program.impl().is_finalized());
     EXPECT_FALSE(context->native_firmware(chip));
+}
+
+TEST_F(NiuInfrastructureTest, ManagedReloadWithoutOwnedStageJournalRejectsBeforeBootOrIo) {
+    ASSERT_NO_FATAL_FAILURE(open_device());
+    auto program = worker_program();
+    program.impl().set_reload_table(0x10000, CoreRangeSet(CoreRange({0, 0}, {0, 0})));
+    const std::array<IDevice*, 1> devices{device.get()};
+    try {
+        auto invocation = detail::ProgramExecution::acquire_managed(program, devices);
+        FAIL() << "Unjournaled reload must reject before admission";
+    } catch (const std::runtime_error& error) {
+        EXPECT_NE(std::string(error.what()).find("reload"), std::string::npos) << error.what();
+    }
+    EXPECT_FALSE(program.impl().is_compiled());
+    EXPECT_FALSE(program.impl().is_finalized());
+    EXPECT_FALSE(context->native_firmware(chip));
+}
+
+TEST_F(NiuInfrastructureTest, OrdinaryExecutionRejectsHandoffObservationBeforeMailboxIo) {
+    ASSERT_NO_FATAL_FAILURE(open_device());
+    auto program = worker_program();
+    auto execution = detail::ProgramExecution::reserve(program, std::array<IDevice*, 1>{device.get()});
+    ASSERT_TRUE(execution);
+    expect_handoff_rejection(*execution);
+    EXPECT_FALSE(context->native_firmware(chip));
+    EXPECT_FALSE(program.impl().is_compiled());
+}
+
+TEST_F(NiuInfrastructureTest, ClosedDeviceExecutionRejectsHandoffObservationBeforeMailboxIo) {
+    ASSERT_NO_FATAL_FAILURE(open_device());
+    auto program = worker_program();
+    auto execution = detail::ProgramExecution::reserve(program, std::array<IDevice*, 1>{device.get()});
+    ASSERT_TRUE(execution);
+    ASSERT_TRUE(device->close());
+    expect_handoff_rejection(*execution);
+    EXPECT_FALSE(context->native_firmware(chip));
+}
+
+TEST_F(NiuInfrastructureTest, ExpiredContextExecutionRejectsHandoffObservationBeforeMailboxIo) {
+    ASSERT_NO_FATAL_FAILURE(open_device());
+    std::shared_ptr<detail::ProgramExecution> execution;
+    {
+        auto program = worker_program();
+        execution = detail::ProgramExecution::reserve(program, std::array<IDevice*, 1>{device.get()});
+    }
+    device.reset();
+    MetalContext::destroy_instance(false, *context_id);
+    context_id.reset();
+    environment.reset();
+    expect_handoff_rejection(*execution);
+    EXPECT_NO_THROW(execution.reset());
 }
 
 TEST_F(NiuInfrastructureTest, QuarantinedProgramRejectsConfigureOnlyBeforeCompilation) {

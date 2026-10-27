@@ -13,6 +13,7 @@
 #include "impl/experimental/native_kernel/native_image.hpp"
 #include "impl/experimental/native_kernel/native_kernel.hpp"
 #include "impl/allocator/allocator.hpp"
+#include "impl/buffers/buffer_impl.hpp"
 #include "impl/internal/service/service_core_manager_impl.hpp"
 #include "distributed/mesh_device_impl.hpp"
 #include "distributed/mesh_workload_impl.hpp"
@@ -20,9 +21,90 @@
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/mesh_workload.hpp>
 #include <tt-metalium/mesh_command_queue.hpp>
+#include <tt-metalium/experimental/range_lockstep_allocation/buffer.hpp>
 #include <tt_stl/assert.hpp>
 
 namespace tt::tt_metal::detail {
+namespace {
+std::atomic<uint64_t> next_invocation_identity{1};
+
+void validate_managed_reload(const ProgramImpl& program) {
+    for (const auto& cores : program.logical_cores())
+        for (const auto& core : cores)
+            TT_FATAL(program.get_reload_table_addr(CoreRangeSet(CoreRange(core, core))) == 0,
+                     "Managed reload requires an owned actual GO/stage journal");
+}
+}  // namespace
+
+struct ProgramExecution::ManagedInvocation::ItemWitnessStorage {
+    NiuKey niu;
+    CoreCoord logical_core;
+    std::weak_ptr<Kernel> kernel;
+    std::weak_ptr<ProgramImpl> program;
+    std::weak_ptr<Buffer> backing;
+    IDevice* device;
+    size_t member;
+    uint64_t device_epoch;
+    uint32_t address;
+    tt_niu_item_witness_request request;
+};
+
+uint32_t ProgramExecution::ManagedInvocation::ItemWitnessLease::address() const { return storage_->address; }
+const tt_niu_item_witness_request& ProgramExecution::ManagedInvocation::ItemWitnessLease::request() const {
+    return storage_->request;
+}
+const tt_niu_item_witness_request& ProgramExecution::ManagedInvocation::ItemWitnessObservation::request() const {
+    return storage_->request;
+}
+NiuKey ProgramExecution::ManagedInvocation::ItemWitnessObservation::niu() const { return storage_->niu; }
+ProgramExecution::ManagedInvocation::ItemCompletionFact
+ProgramExecution::ManagedInvocation::ItemWitnessObservation::completion() const {
+    return static_cast<ItemCompletionFact>(storage_->request.completion);
+}
+
+bool ProgramExecution::validate_item_witness_locked(
+    NiuAdmission& admission, const NiuAdmission::Guard& guard,
+    const ManagedInvocation::ItemWitnessStorage& storage, bool issued) const {
+    if (!managed || !token || simulated || resources_retired || preparation.cancelled() ||
+        owner.lock().get() != &admission ||
+        (issued ? state != State::Issued && state != State::Stopped : state != State::Reserved))
+        return false;
+    std::string error;
+    if (state == State::Stopped) {
+        if (!admission.validate_stopped_managed_locked(guard, *token, boots, error)) return false;
+    } else if (!admission.validate_managed_locked(guard, *token, boots, error)) return false;
+    const auto epoch = admission.device_epochs_.find(storage.niu.chip);
+    if (!attached_chips.contains(storage.niu.chip) ||
+        storage.device_epoch != (epoch == admission.device_epochs_.end() ? 0 : epoch->second)) return false;
+    const auto boot = boots.find(storage.niu.chip);
+    if (boot == boots.end() || !boot->second || !boot->second->live() ||
+        boot->second->boot_cookie() != storage.request.boot_cookie ||
+        invocation_identity != storage.request.invocation_id || storage.member >= members.size()) return false;
+    const auto selected = std::find_if(managed->selections().begin(), managed->selections().end(),
+                                     [&](const auto& row) { return row.niu == storage.niu; });
+    if (selected == managed->selections().end() || storage.request.selector >= niu_selector_count ||
+        !selected->selectors.test(storage.request.selector)) return false;
+    const auto& member = members[storage.member];
+    const auto device = member.devices.find(storage.niu.chip);
+    const auto cores = member.cores.find(storage.niu.chip);
+    auto program = storage.program.lock();
+    auto kernel = storage.kernel.lock();
+    if (device == member.devices.end() || device->second != storage.device || cores == member.cores.end() ||
+        !cores->second.contains(storage.niu.physical_worker) || !program || member.program.lock() != program ||
+        !kernel || !kernel->is_on_logical_core(storage.logical_core) ||
+        program->managed_niu_invocation_.lock().get() != this) return false;
+    size_t matches = 0;
+    for (const auto& [identity, frozen] : member.kernels) {
+        if (frozen.lock() != kernel) continue;
+        const auto& current = program->get_kernels(identity.first);
+        const auto found = current.find(identity.second);
+        if (found == current.end() || found->second != kernel) return false;
+        ++matches;
+    }
+    const auto leaf = leaves.find({storage.member, storage.niu.chip});
+    return matches == 1 && leaf != leaves.end() &&
+           (!issued || leaf->second.state == State::Issued || leaf->second.state == State::Stopped);
+}
 
 ProgramExecution::FailureScope::FailureScope(std::shared_ptr<ProgramExecution> execution) :
     execution(std::move(execution)), exceptions(std::uncaught_exceptions()) {}
@@ -266,6 +348,7 @@ void ProgramExecution::validate_managed_traffic(
     auto program = member.program.lock();
     TT_FATAL(program && member.kernels.size() == program->num_kernels(),
              "Managed native Program lost its complete algorithm inventory");
+    validate_managed_reload(*program);
     std::vector<std::shared_ptr<Kernel>> retained;
     std::vector<const NativeElfKernel*> native;
     for (const auto& [identity, frozen] : member.kernels) {
@@ -411,6 +494,7 @@ std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_m
             program && !member.cores.empty() && identities.insert(program.get()).second,
             "Managed invocation requires distinct nonempty Worker Program members");
         TT_FATAL(program->get_context_id() == context.get_context_id(), "Managed Program belongs to another context");
+        validate_managed_reload(*program);
         {
             auto guard = context.niu_admission().lock();
             if (auto previous = program->managed_niu_invocation_.lock()) {
@@ -471,6 +555,8 @@ std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_m
     try {
         auto execution = std::shared_ptr<ProgramExecution>(
             new ProgramExecution(context, origin, std::move(cores), std::move(allocation)));
+        execution->invocation_identity = ::tt::tt_metal::experimental::native_detail::next_handoff_identity(
+            next_invocation_identity);
         execution->boots = std::move(boots);
         execution->managed_endpoints = std::move(endpoints);
         execution->members = std::move(members);
@@ -746,6 +832,572 @@ std::shared_ptr<ProgramExecution> ProgramExecution::reserve_dispatch(
 }
 
 const NiuAdmission::Allocation& ProgramExecution::ManagedInvocation::allocation() const { return *execution->managed; }
+
+std::vector<ProgramExecution::ManagedInvocation::CompletionBinding>
+ProgramExecution::completion_bindings() const {
+    auto admission = owner.lock();
+    TT_FATAL(admission, "Managed completion binding context has closed");
+    auto guard = admission->lock();
+    TT_FATAL(
+        managed && token && !simulated && invocation_identity && !resources_retired &&
+            state != State::Quarantined && state != State::Withdrawn && owner.lock().get() == admission.get(),
+        "Managed completion binding requires a live invocation owner");
+    size_t expected_selections = 0;
+    for (const auto& [chip, workers] : footprint) expected_selections += workers.size() * 2;
+    TT_FATAL(
+        managed->selections().size() == expected_selections,
+        "Managed completion binding lost an allocated physical NIU");
+    std::vector<ManagedInvocation::CompletionBinding> result;
+    result.reserve(managed->selections().size());
+    for (const auto& selection : managed->selections()) {
+        const auto boot = boots.find(selection.niu.chip);
+        TT_FATAL(
+            boot != boots.end() && boot->second && boot->second->live(),
+            "Managed completion binding lost its original live firmware boot");
+        result.push_back({selection.niu, selection.selectors, boot->second->boot_cookie(), invocation_identity});
+    }
+    return result;
+}
+
+std::vector<ProgramExecution::ManagedInvocation::CompletionBinding>
+ProgramExecution::ManagedInvocation::completion_bindings() const {
+    return execution->completion_bindings();
+}
+
+std::optional<ProgramExecution::ManagedInvocation::SelectorLease>
+ProgramExecution::ManagedInvocation::acquire_selector(const NiuKey& niu) const {
+    auto admission = execution->owner.lock();
+    TT_FATAL(admission, "Managed selector lease context has closed");
+    auto guard = admission->lock();
+    TT_FATAL(
+        execution->managed && execution->token && !execution->simulated && execution->invocation_identity &&
+            !execution->resources_retired && execution->state == State::Reserved &&
+            !execution->preparation.cancelled() && execution->owner.lock().get() == admission.get(),
+        "Managed selector lease requires a live invocation owner");
+    std::string error;
+    TT_FATAL(
+        admission->validate_managed_locked(guard, *execution->token, execution->boots, error),
+        "Managed selector lease lost its original boot admission: {}", error);
+    const auto boot = execution->boots.find(niu.chip);
+    if (boot == execution->boots.end()) {
+        return std::nullopt;
+    }
+    auto selected = execution->managed->acquire_selector(niu);
+    if (!selected) {
+        return std::nullopt;
+    }
+    return SelectorLease(execution, std::move(*selected), boot->second->boot_cookie(), execution->invocation_identity);
+}
+
+std::optional<ProgramExecution::ManagedInvocation::ItemWitnessLease>
+ProgramExecution::ManagedInvocation::acquire_item_witness(
+    const SelectorLease& selector, const ItemWitnessRequirement& requirement) const {
+    const auto valid_identity = [](uint64_t value) { return value && value != UINT64_MAX; };
+    if (!selector.valid() || selector.owner_ != execution || !requirement.kernel ||
+        !valid_identity(requirement.item) || !valid_identity(requirement.generation) ||
+        !valid_identity(requirement.occurrence) || !requirement.leaf ||
+        (requirement.completion != ItemCompletionFact::ReadDestinationLocal &&
+         requirement.completion != ItemCompletionFact::NonPostedWriteAcknowledged)) return std::nullopt;
+    auto* native = dynamic_cast<NativeElfKernel*>(requirement.kernel.get());
+    if (!native || native->native_images().images.size() != 1 ||
+        !native->is_on_logical_core(requirement.logical_core)) return std::nullopt;
+    const auto role = native->native_images().images.front().role();
+    if (role != experimental::TensixKernelRole::Brisc && role != experimental::TensixKernelRole::Ncrisc)
+        return std::nullopt;
+    auto admission = execution->owner.lock();
+    if (!admission) return std::nullopt;
+    // Keep the allocation's destructor before the lifetime gate on unwind.
+    // No allocator destructor or device IO is allowed under admission mutex.
+    std::optional<Preparation> lifetime;
+    std::shared_ptr<Buffer> backing;
+    std::shared_ptr<ProgramImpl> original_program;
+    auto storage = std::make_shared<ItemWitnessStorage>();
+    storage->niu = selector.niu();
+    storage->logical_core = requirement.logical_core;
+    storage->kernel = requirement.kernel;
+    storage->member = SIZE_MAX;
+    {
+        auto guard = admission->lock();
+        if (execution->state != State::Reserved || !execution->managed || !execution->token ||
+            execution->preparation.cancelled() || execution->resources_retired ||
+            execution->item_witnesses.size() >= UINT32_MAX - 1) return std::nullopt;
+        std::string error;
+        if (!admission->validate_managed_locked(guard, *execution->token, execution->boots, error))
+            return std::nullopt;
+        const auto boot = execution->boots.find(storage->niu.chip);
+        if (boot == execution->boots.end() || !boot->second || !boot->second->live() ||
+            boot->second->boot_cookie() != selector.boot_cookie() ||
+            execution->invocation_identity != selector.invocation_id()) return std::nullopt;
+        for (size_t index = 0; index != execution->members.size(); ++index) {
+            const auto& member = execution->members[index];
+            const auto cores = member.cores.find(storage->niu.chip);
+            if (cores == member.cores.end() || !cores->second.contains(storage->niu.physical_worker)) continue;
+            for (const auto& [identity, kernel] : member.kernels) {
+                if (kernel.lock() != requirement.kernel) continue;
+                if (storage->member != SIZE_MAX) return std::nullopt;
+                storage->member = index;
+                original_program = member.program.lock();
+                storage->program = original_program;
+                storage->device = member.devices.at(storage->niu.chip);
+            }
+        }
+        if (!original_program || storage->member == SIZE_MAX) return std::nullopt;
+        for (const auto& previous : execution->item_witnesses)
+            if (previous->niu == storage->niu &&
+                (previous->request.selector == selector.selector() ||
+                 (previous->request.item == requirement.item && previous->request.generation == requirement.generation &&
+                  previous->request.occurrence == requirement.occurrence && previous->request.leaf == requirement.leaf)))
+                return std::nullopt;
+        const auto epoch = admission->device_epochs_.find(storage->niu.chip);
+        storage->device_epoch = epoch == admission->device_epochs_.end() ? 0 : epoch->second;
+        storage->request = {TT_NIU_ITEM_WITNESS_VERSION,
+                            static_cast<uint32_t>(execution->item_witnesses.size() + 1),
+                            selector.boot_cookie(), selector.invocation_id(), requirement.item,
+                            requirement.generation, requirement.occurrence, requirement.leaf,
+                            static_cast<uint8_t>(storage->niu.noc), selector.selector(),
+                            static_cast<uint8_t>(role == experimental::TensixKernelRole::Brisc ? 1 : 2),
+                            static_cast<uint8_t>(requirement.completion), 0};
+        if (!execution->validate_item_witness_locked(*admission, guard, *storage, false) ||
+            !execution->preparation.acquire()) return std::nullopt;
+        lifetime.emplace(Preparation(execution, true));
+    }
+    auto& context = MetalContext::instance(original_program->get_context_id());
+    if (context.niu_admission_owner().lock() != admission || !storage->device ||
+        !storage->device->is_initialized() || !storage->device->allocator()) return std::nullopt;
+    const auto& cluster = context.get_cluster();
+    const auto& soc = cluster.get_soc_desc(storage->niu.chip);
+    if (soc.get_physical_tensix_core_from_logical(storage->logical_core) != storage->niu.physical_worker)
+        return std::nullopt;
+    const auto single_core = CoreRangeSet(CoreRange(storage->logical_core, storage->logical_core));
+    auto sharding = BufferShardingArgs(
+        ShardSpecBuffer(single_core, {1, 1}, ShardOrientation::ROW_MAJOR, {1, 1}, {1, 1}),
+        TensorMemoryLayout::HEIGHT_SHARDED);
+    experimental::range_lockstep_allocation::set_range_lockstep_allocation(sharding, true);
+    backing = BufferImpl::create(storage->device, sizeof(tt_niu_item_witness_region),
+                                 sizeof(tt_niu_item_witness_region), BufferType::L1, sharding);
+    if (!backing || !backing->is_allocated() || backing->device() != storage->device) return std::nullopt;
+    storage->address = backing->address();
+    storage->backing = backing;
+    const auto& layout = storage->device->allocator()->impl().get_config();
+    if (storage->address % TT_NIU_ITEM_WITNESS_ALIGNMENT || storage->address < layout.l1_unreserved_base ||
+        storage->address > layout.worker_l1_size ||
+        sizeof(tt_niu_item_witness_region) > layout.worker_l1_size - storage->address) return std::nullopt;
+    // Native algorithms may contain compiler-fixed local payload addresses.
+    // Their admitted traffic envelopes remain authoritative even when no
+    // separate Buffer object describes that scratch range to the allocator.
+    const uint64_t witness_end = uint64_t(storage->address) + sizeof(tt_niu_item_witness_region);
+    for (const auto& member : execution->members) {
+        const auto cores = member.cores.find(storage->niu.chip);
+        if (cores == member.cores.end() || !cores->second.contains(storage->niu.physical_worker)) continue;
+        for (const auto& [identity, kernel] : member.kernels) {
+            auto current = kernel.lock();
+            if (!current || !current->is_native()) return std::nullopt;
+            for (const auto& image : current->native_images().images) {
+                const auto traffic = image.noc_contract();
+                if (!traffic || (traffic->l1_begin < witness_end && storage->address < traffic->l1_end))
+                    return std::nullopt;
+            }
+        }
+    }
+    const auto translated = soc.translate_coord_to(storage->niu.physical_worker, tt::CoordSystem::NOC0,
+                                                    tt::CoordSystem::TRANSLATED);
+    const tt_cxy_pair core(storage->niu.chip, translated.x, translated.y);
+    const auto base = uint64_t(storage->address) +
+                      context.hal().get_l1_noc_offset(HalProgrammableCoreType::TENSIX);
+    {
+        auto guard = admission->lock();
+        if (!execution->validate_item_witness_locked(*admission, guard, *storage, false)) return std::nullopt;
+    }
+    const auto initialized = NiuHandoffReceiver::write_item_request(
+        [&](uint32_t offset, std::span<const std::byte> bytes) {
+            if (offset > sizeof(tt_niu_item_witness_region) ||
+                bytes.size() > sizeof(tt_niu_item_witness_region) - offset) return NiuHandoffIoStatus::Failed;
+            cluster.write_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
+            cluster.l1_barrier(storage->niu.chip);
+            return NiuHandoffIoStatus::Complete;
+        },
+        [&](uint32_t offset, std::span<std::byte> bytes) {
+            if (offset > sizeof(tt_niu_item_witness_region) ||
+                bytes.size() > sizeof(tt_niu_item_witness_region) - offset) return NiuHandoffIoStatus::Failed;
+            cluster.read_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
+            return NiuHandoffIoStatus::Complete;
+        },
+        storage->request);
+    if (initialized != NiuHandoffWriteStatus::Published) return std::nullopt;
+    auto guard = admission->lock();
+    if (!execution->validate_item_witness_locked(*admission, guard, *storage, false)) return std::nullopt;
+    // Reserve before either nonthrowing publication to keep the batch atomic.
+    execution->item_witnesses.reserve(execution->item_witnesses.size() + 1);
+    execution->retained_witness_backing.reserve(execution->retained_witness_backing.size() + 1);
+    execution->item_witnesses.push_back(storage);
+    execution->retained_witness_backing.push_back(backing);
+    return ItemWitnessLease(execution, std::move(storage));
+}
+
+std::optional<ProgramExecution::ManagedInvocation::ItemWitnessObservation>
+ProgramExecution::ManagedInvocation::observe_item(const ItemWitnessLease& lease) const {
+    if (lease.owner_ != execution || !lease.storage_) return std::nullopt;
+    auto admission = execution->owner.lock();
+    if (!admission) return std::nullopt;
+    std::optional<Preparation> lifetime;
+    std::shared_ptr<Buffer> backing;
+    std::shared_ptr<ProgramImpl> program;
+    const auto& storage = *lease.storage_;
+    {
+        auto guard = admission->lock();
+        if (std::find(execution->item_witnesses.begin(), execution->item_witnesses.end(), lease.storage_) ==
+                execution->item_witnesses.end() ||
+            !execution->validate_item_witness_locked(*admission, guard, storage, true)) return std::nullopt;
+        backing = storage.backing.lock();
+        program = storage.program.lock();
+        if (!backing || !program || !execution->preparation.acquire()) return std::nullopt;
+        lifetime.emplace(Preparation(execution, true));
+    }
+    auto& context = MetalContext::instance(program->get_context_id());
+    if (context.niu_admission_owner().lock() != admission || !backing->is_allocated() ||
+        backing->address() != storage.address || backing->device() != storage.device ||
+        !storage.device->is_initialized()) return std::nullopt;
+    const auto& cluster = context.get_cluster();
+    const auto& soc = cluster.get_soc_desc(storage.niu.chip);
+    if (soc.get_physical_tensix_core_from_logical(storage.logical_core) != storage.niu.physical_worker)
+        return std::nullopt;
+    const auto translated = soc.translate_coord_to(storage.niu.physical_worker, tt::CoordSystem::NOC0,
+                                                  tt::CoordSystem::TRANSLATED);
+    const tt_cxy_pair core(storage.niu.chip, translated.x, translated.y);
+    const auto base = uint64_t(storage.address) +
+                      context.hal().get_l1_noc_offset(HalProgrammableCoreType::TENSIX);
+    auto observed = NiuHandoffReceiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) {
+        if (offset > sizeof(tt_niu_item_witness_region) || bytes.size() > sizeof(tt_niu_item_witness_region) - offset)
+            return NiuHandoffIoStatus::Failed;
+        cluster.read_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
+        return NiuHandoffIoStatus::Complete;
+    });
+    auto guard = admission->lock();
+    if (!execution->validate_item_witness_locked(*admission, guard, storage, true) ||
+        observed.status != NiuHandoffReadStatus::Observed || !observed.observation ||
+        !NiuHandoffReceiver::closed_item(*observed.observation, storage.request)) return std::nullopt;
+    return ItemWitnessObservation(execution, lease.storage_);
+}
+
+std::vector<ProgramExecution::HandoffObservation> ProgramExecution::ManagedInvocation::handoff_observations() const {
+    auto admission = execution->owner.lock();
+    TT_FATAL(admission, "Managed handoff observation context has closed");
+    auto guard = admission->lock();
+    TT_FATAL(execution->handoff_snapshot, "Managed invocation has no stable handoff observation batch");
+    execution->validate_handoff_locked(*admission, guard, *execution->handoff_snapshot);
+    return execution->observed_handoffs;
+}
+
+std::vector<ProgramExecution::ManagedInvocation::CompletionObservation>
+ProgramExecution::ManagedInvocation::completion_observations() const {
+    const auto bindings = completion_bindings();
+    const auto observations = handoff_observations();
+    std::vector<CompletionObservation> result;
+    result.reserve(bindings.size());
+    for (const auto& binding : bindings) {
+        const auto found = std::find_if(
+            observations.begin(), observations.end(), [&](const HandoffObservation& observation) {
+                return observation.chip == binding.niu.chip && observation.physical_worker == binding.niu.physical_worker;
+            });
+        TT_FATAL(
+            found != observations.end(),
+            "Managed completion observation lost the allocation's physical Worker mailbox");
+        result.push_back({binding, *found});
+    }
+    return result;
+}
+
+std::optional<ProgramExecution::ManagedInvocation::SelectorObservation>
+ProgramExecution::ManagedInvocation::observe_selector(const SelectorLease& selector) const {
+    if (!selector.valid() || selector.owner_ != execution) return std::nullopt;
+    auto admission = execution->owner.lock();
+    if (!admission) return std::nullopt;
+    auto guard = admission->lock();
+    if (execution->state != State::Stopped || !execution->handoff_snapshot) return std::nullopt;
+    execution->validate_handoff_locked(*admission, guard, *execution->handoff_snapshot);
+    const auto niu = selector.niu();
+    const auto boot = execution->boots.find(niu.chip);
+    if (boot == execution->boots.end() || !boot->second || !boot->second->live() ||
+        boot->second->boot_cookie() != selector.boot_cookie() ||
+        execution->invocation_identity != selector.invocation_id())
+        return std::nullopt;
+    const auto selected = std::find_if(
+        execution->managed->selections().begin(), execution->managed->selections().end(),
+        [&](const auto& selection) { return selection.niu == niu; });
+    if (selected == execution->managed->selections().end() ||
+        selector.selector() >= niu_selector_count || !selected->selectors.test(selector.selector()))
+        return std::nullopt;
+    const auto observed = std::find_if(
+        execution->observed_handoffs.begin(), execution->observed_handoffs.end(),
+        [&](const auto& observation) {
+            return observation.chip == niu.chip && observation.physical_worker == niu.physical_worker;
+        });
+    if (observed == execution->observed_handoffs.end() ||
+        !NiuHandoffReceiver::closed_selector(
+            observed->mailbox, execution->handoff_snapshot->expected.at(niu.chip).at(niu.physical_worker),
+            static_cast<uint8_t>(niu.noc), selector.selector()))
+        return std::nullopt;
+    return SelectorObservation(execution, niu, selector.selector(), selector.boot_cookie(), selector.invocation_id());
+}
+
+bool ProgramExecution::ManagedInvocation::retire_selectors() const {
+    auto admission = execution->owner.lock();
+    if (!admission) return false;
+    auto guard = admission->lock();
+    if (execution->state != State::Stopped || !execution->handoff_snapshot ||
+        execution->preparation.occupied())
+        return false;
+    execution->validate_handoff_locked(*admission, guard, *execution->handoff_snapshot);
+    for (const auto& selection : execution->managed->selections()) {
+        const auto observed = std::find_if(
+            execution->observed_handoffs.begin(), execution->observed_handoffs.end(),
+            [&](const auto& observation) {
+                return observation.chip == selection.niu.chip &&
+                       observation.physical_worker == selection.niu.physical_worker;
+            });
+        if (observed == execution->observed_handoffs.end()) return false;
+        for (size_t selector = 0; selector != niu_selector_count; ++selector) {
+            if (selection.selectors.test(selector) &&
+                !NiuHandoffReceiver::closed_selector(
+                    observed->mailbox, execution->handoff_snapshot->expected.at(selection.niu.chip).at(
+                                           selection.niu.physical_worker),
+                    static_cast<uint8_t>(selection.niu.noc), static_cast<uint8_t>(selector)))
+                return false;
+        }
+    }
+    std::string error;
+    TT_FATAL(admission->record_clean_locked(*execution->token, execution->boots, error),
+             "Managed selector clean reception lost its original stopped admission: {}", error);
+    for (auto& group : execution->groups) group.state = GroupState::Clean;
+    // Selector counters no longer exclude this allocation, but posted payload
+    // visibility and backing retention are separate obligations. Preserve the
+    // execution and all original native resources until their independent
+    // receiver, or actual boot withdrawal, authorizes retirement.
+    execution->state = State::SelectorsClean;
+    return true;
+}
+
+void ProgramExecution::validate_request_locked(
+    NiuAdmission& admission, const NiuAdmission::Guard& guard, const HandoffSnapshot& snapshot) const {
+    TT_FATAL(managed && token && !simulated && state == State::Issued && !resources_retired &&
+                 preparation.owned() && !preparation.cancelled() && owner.lock().get() == &admission,
+             "Managed handoff request requires its original issued host preparation");
+    TT_FATAL(!footprint.empty() && snapshot.footprint == footprint && snapshot.boots == boots &&
+                 snapshot.epochs.size() == footprint.size() && attached_chips.size() == footprint.size(),
+             "Managed handoff request lost its original footprint or boot owners");
+    std::string error;
+    TT_FATAL(admission.validate_managed_locked(guard, snapshot.token, snapshot.boots, error),
+             "Managed handoff request binding changed: {}", error);
+    auto* record = admission.find_locked(snapshot.token, error);
+    TT_FATAL(record && record == admission.find_locked(*token, error),
+             "Managed handoff request lost its original token: {}", error);
+    std::set<NiuKey> expected;
+    for (const auto& [chip, workers] : footprint) {
+        const auto epoch = admission.device_epochs_.find(chip);
+        const auto frozen = snapshot.epochs.find(chip);
+        TT_FATAL(attached_chips.contains(chip) && frozen != snapshot.epochs.end() &&
+                     frozen->second == (epoch == admission.device_epochs_.end() ? 0 : epoch->second),
+                 "Managed handoff request belongs to another Device epoch");
+        for (const auto& worker : workers)
+            for (auto noc : {NiuNoc::Noc0, NiuNoc::Noc1}) expected.insert({chip, worker, noc});
+    }
+    const std::set<NiuKey> actual(record->nius.begin(), record->nius.end());
+    TT_FATAL(actual.size() == record->nius.size() && actual == expected,
+             "Managed handoff request changed its exact physical NIUs");
+}
+
+void ProgramExecution::prepare_handoff() {
+    if (!managed) return;
+    auto admission = owner.lock();
+    TT_FATAL(admission, "Managed handoff request context has closed");
+    std::optional<Preparation> lifetime;
+    std::shared_ptr<ProgramImpl> original_program;
+    std::shared_ptr<HandoffSnapshot> frozen;
+    Cores payload;
+    {
+        auto guard = admission->lock();
+        if (issued_handoff) {
+            validate_request_locked(*admission, guard, *issued_handoff);
+            return;
+        }
+        TT_FATAL(token && !retained_programs.empty() && groups.size() == 1 && invocation_identity,
+                 "Managed handoff request requires its original single-group invocation journal");
+        frozen = std::make_shared<HandoffSnapshot>(HandoffSnapshot{*token, boots, footprint, {}, {}});
+        for (const auto& [chip, workers] : footprint) {
+            const auto epoch = admission->device_epochs_.find(chip);
+            frozen->epochs.emplace(chip, epoch == admission->device_epochs_.end() ? 0 : epoch->second);
+        }
+        validate_request_locked(*admission, guard, *frozen);
+        for (const auto& member : members) {
+            for (const auto& [chip, workers] : member.cores) {
+                auto& assigned = payload[chip];
+                for (const auto& worker : workers)
+                    TT_FATAL(assigned.insert(worker).second,
+                             "Managed overlapping members require an owned multi-GO handoff journal");
+            }
+        }
+        original_program = retained_programs.front();
+        TT_FATAL(original_program && preparation.acquire(),
+                 "Managed handoff request lost its original host preparation owner");
+        lifetime.emplace(Preparation(shared_from_this(), true));
+    }
+    // Preparation retains the original Programs/resources while IO occurs
+    // outside the admission lock. The immutable journal describes the actual
+    // scheduled one-GO/non-reload submission, including empty FD recipients.
+    auto& context = MetalContext::instance(original_program->get_context_id());
+    TT_FATAL(context.niu_admission_owner().lock() == admission,
+             "Managed handoff request resolved another context owner");
+    const auto& cluster = context.get_cluster();
+    const auto& hal = context.hal();
+    for (const auto& [chip, workers] : frozen->footprint) {
+        const auto& boot = frozen->boots.at(chip);
+        for (const auto& worker : workers) {
+            auto result = NiuHandoffReceiver::read(cluster, hal, chip, worker);
+            TT_FATAL(result.status == NiuHandoffReadStatus::Observed && result.observation,
+                     "Managed handoff request has no stable initial mailbox");
+            const auto sources = payload.find(chip);
+            auto expected = NiuHandoffReceiver::initial_execution(
+                *result.observation, boot->boot_cookie(), invocation_identity,
+                sources != payload.end() && sources->second.contains(worker));
+            TT_FATAL(expected, "Managed handoff requires an owned initial GO journal; prior control/GO is unsupported");
+            frozen->expected[chip].emplace(worker, *expected);
+        }
+    }
+    {
+        auto guard = admission->lock();
+        validate_request_locked(*admission, guard, *frozen);
+    }
+    for (const auto& [chip, workers] : frozen->expected)
+        for (const auto& [worker, expected] : workers)
+            TT_FATAL(NiuHandoffReceiver::write_request(cluster, hal, chip, worker, expected.request) ==
+                         NiuHandoffWriteStatus::Published,
+                     "Managed handoff request publication failed");
+    auto guard = admission->lock();
+    validate_request_locked(*admission, guard, *frozen);
+    issued_handoff = std::move(frozen);
+    // Failure at any point unwinds the actual Submission, quarantining its
+    // entire exclusion even if only a prefix of requests reached the device.
+}
+
+void ProgramExecution::validate_handoff_locked(
+    NiuAdmission& admission, const NiuAdmission::Guard& guard, const HandoffSnapshot& snapshot) const {
+    TT_FATAL(
+        managed && token && !simulated && state == State::Stopped && !resources_retired &&
+            owner.lock().get() == &admission,
+        "Managed handoff observation requires its original stopped invocation");
+    TT_FATAL(issued_handoff && issued_handoff.get() == &snapshot && snapshot.expected.size() == footprint.size(),
+             "Managed handoff observation has no original issued request journal");
+    TT_FATAL(
+        !footprint.empty() && snapshot.footprint == footprint && snapshot.epochs.size() == footprint.size() &&
+            attached_chips.size() == footprint.size(),
+        "Managed handoff observation lost its complete physical footprint");
+    TT_FATAL(
+        !groups.empty() && std::all_of(groups.begin(), groups.end(), [](const auto& group) {
+            return group.state == GroupState::Stopped;
+        }) && !leaves.empty() && std::all_of(leaves.begin(), leaves.end(), [](const auto& entry) {
+            return entry.second.state == State::Stopped && entry.second.pending.empty();
+        }),
+        "Managed handoff observation requires every original group and member to have stopped");
+    std::string error;
+    TT_FATAL(
+        admission.validate_stopped_managed_locked(guard, snapshot.token, snapshot.boots, error),
+        "Managed handoff observation binding changed: {}", error);
+    auto* record = admission.find_locked(snapshot.token, error);
+    TT_FATAL(
+        record && record == admission.find_locked(*token, error) &&
+            admission.validate_stopped_managed_locked(guard, *token, boots, error),
+        "Managed handoff observation lost its original execution token: {}", error);
+    std::set<NiuKey> expected;
+    for (const auto& [chip, workers] : footprint) {
+        const auto epoch = admission.device_epochs_.find(chip);
+        const auto frozen = snapshot.epochs.find(chip);
+        TT_FATAL(
+            attached_chips.contains(chip) && frozen != snapshot.epochs.end() &&
+                frozen->second == (epoch == admission.device_epochs_.end() ? 0 : epoch->second),
+            "Managed handoff observation belongs to another Device epoch");
+        for (const auto& worker : workers)
+            for (auto noc : {NiuNoc::Noc0, NiuNoc::Noc1}) expected.insert({chip, worker, noc});
+        const auto journal = snapshot.expected.find(chip);
+        TT_FATAL(journal != snapshot.expected.end() && journal->second.size() == workers.size(),
+                 "Managed handoff observation lost its complete request journal");
+        for (const auto& worker : workers)
+            TT_FATAL(journal->second.contains(worker), "Managed handoff observation lost a physical Worker request");
+    }
+    const std::set<NiuKey> actual(record->nius.begin(), record->nius.end());
+    TT_FATAL(
+        actual.size() == record->nius.size() && actual == expected,
+        "Managed handoff observation token changed its exact physical NIUs");
+}
+
+void ProgramExecution::observe_handoff() {
+    auto admission = owner.lock();
+    TT_FATAL(admission, "Managed handoff observation context has closed");
+    auto self = shared_from_this();
+    // Destroy the temporary Program owner before releasing the retirement
+    // gate, so its final resource cleanup cannot outlive that gate.
+    std::optional<Preparation> lifetime;
+    std::shared_ptr<ProgramImpl> original_program;
+    std::shared_ptr<const HandoffSnapshot> frozen;
+    {
+        auto guard = admission->lock();
+        TT_FATAL(
+            managed && token && !simulated && state == State::Stopped && !retained_programs.empty(),
+            "Managed handoff observation requires its original stopped invocation and actual boot");
+        TT_FATAL(issued_handoff, "Managed handoff observation has no issued request journal");
+        validate_handoff_locked(*admission, guard, *issued_handoff);
+        original_program = retained_programs.front();
+        TT_FATAL(original_program, "Managed handoff observation lost its original Program owner");
+        TT_FATAL(preparation.acquire(), "Managed handoff observation already has another host owner");
+        // Reuse the existing host lifetime gate. Withdrawal may invalidate the
+        // observation immediately, but cannot retire retained resources until
+        // this RAII scope releases, including on every failure path.
+        lifetime.emplace(Preparation(self, true));
+        frozen = issued_handoff;
+    }
+    try {
+        // Context IDs are only lookup keys. Recycled IDs cannot replace the
+        // original admission owner. Existing SDK Context/Device caller-lifetime
+        // requirements still apply; this does not authorize concurrent teardown.
+        auto& context = MetalContext::instance(original_program->get_context_id());
+        TT_FATAL(
+            context.niu_admission_owner().lock() == admission,
+            "Managed handoff observation resolved another context owner");
+        const auto& cluster = context.get_cluster();
+        const auto& hal = context.hal();
+        std::vector<HandoffObservation> observed;
+        for (const auto& [chip, workers] : frozen->footprint) {
+            for (const auto& worker : workers) {
+                auto result = NiuHandoffReceiver::read(cluster, hal, chip, worker);
+                TT_FATAL(
+                    result.status == NiuHandoffReadStatus::Observed && result.observation,
+                    "Managed handoff mailbox has no stable observation");
+                TT_FATAL(NiuHandoffReceiver::check(
+                             *result.observation, frozen->expected.at(chip).at(worker)) == NiuHandoffCheck::Match,
+                         "Managed handoff mailbox differs from its original invocation request or GO journal");
+                observed.push_back({chip, worker, std::move(*result.observation)});
+            }
+        }
+        auto guard = admission->lock();
+        validate_handoff_locked(*admission, guard, *frozen);
+        // Publish the entire batch only after the original token, live boots,
+        // epochs and physical footprint still agree. No clean transition occurs.
+        observed_handoffs.swap(observed);
+        handoff_snapshot = std::move(frozen);
+    } catch (...) {
+        auto guard = admission->lock();
+        observed_handoffs.clear();
+        handoff_snapshot.reset();
+        if (state == State::Stopped) {
+            std::string ignored;
+            admission->quarantine_locked(guard, frozen->token, ignored);
+            state = State::Quarantined;
+        }
+        // A concurrent withdrawal keeps its Withdrawn state. The lifetime
+        // scope then releases normally; quarantine owns any retained exclusion.
+        throw;
+    }
+}
+
 ProgramExecution::ManagedInvocation::~ManagedInvocation() { execution->abandon_managed(); }
 
 void ProgramExecution::abandon_managed(bool preparation_owner_only) noexcept {
@@ -887,13 +1539,17 @@ ProgramExecution::Submission ProgramExecution::issue(internal::ServiceCoreManage
 }
 
 ProgramExecution::Submission ProgramExecution::issue(GroupKey group) {
-    return Submission(*this, nullptr, std::nullopt, group);
+    auto submission = Submission(*this, nullptr, std::nullopt, group);
+    prepare_handoff();
+    return submission;
 }
 
 ProgramExecution::Submission ProgramExecution::issue(
     Program& program, IDevice& device, internal::ServiceCoreManagerImpl* services) {
     const auto leaf = managed ? std::optional(leaf_key(program, device.id())) : std::nullopt;
-    return Submission(*this, services, leaf, leaf ? std::optional(members[leaf->first].group) : std::nullopt);
+    auto submission = Submission(*this, services, leaf, leaf ? std::optional(members[leaf->first].group) : std::nullopt);
+    prepare_handoff();
+    return submission;
 }
 
 std::shared_ptr<const ProgramExecution::DispatchFootprint> ProgramExecution::snapshot(
@@ -994,22 +1650,27 @@ void ProgramExecution::stop() {
 void ProgramExecution::stop(GroupKey key) {
     auto admission = owner.lock();
     TT_FATAL(admission, "Managed queue completion context has closed");
-    auto guard = admission->lock();
-    if (!token || state != State::Issued) {
-        return;
-    }
-    TT_FATAL(managed && origin == Origin::Queue, "Managed group completion requires its original queue invocation");
-    auto& group = groups.at(key.index);
-    TT_FATAL(group.state == GroupState::Issued, "Managed queue completion has no issued workload group");
-    for (auto member : group.members) {
-        for (const auto& [chip, workers] : members[member].cores) {
-            auto& leaf = leaves.at({member, chip});
-            TT_FATAL(leaf.state == State::Issued, "Managed queue completion omitted an issued member");
-            leaf.state = State::Stopped;
-            leaf.pending.clear();
+    bool stopped = false;
+    {
+        auto guard = admission->lock();
+        if (!token || state != State::Issued) {
+            return;
         }
+        TT_FATAL(managed && origin == Origin::Queue, "Managed group completion requires its original queue invocation");
+        auto& group = groups.at(key.index);
+        TT_FATAL(group.state == GroupState::Issued, "Managed queue completion has no issued workload group");
+        for (auto member : group.members) {
+            for (const auto& [chip, workers] : members[member].cores) {
+                auto& leaf = leaves.at({member, chip});
+                TT_FATAL(leaf.state == State::Issued, "Managed queue completion omitted an issued member");
+                leaf.state = State::Stopped;
+                leaf.pending.clear();
+            }
+        }
+        receive_managed_stop_locked(*admission);
+        stopped = state == State::Stopped;
     }
-    receive_managed_stop_locked(*admission);
+    if (stopped) observe_handoff();
 }
 
 void ProgramExecution::receive_managed_stop_locked(NiuAdmission& admission) {
@@ -1046,13 +1707,18 @@ void ProgramExecution::stop(Program& program, IDevice& device) {
     }
     auto admission = owner.lock();
     TT_FATAL(admission, "Managed completion context has closed");
-    auto guard = admission->lock();
-    TT_FATAL(state == State::Issued && origin == Origin::Direct, "Managed direct completion has no issued invocation");
-    auto& leaf = leaves.at(leaf_key(program, device.id()));
-    TT_FATAL(leaf.state == State::Issued, "Managed direct completion has no issued member");
-    leaf.state = State::Stopped;
-    leaf.pending.clear();
-    receive_managed_stop_locked(*admission);
+    bool stopped = false;
+    {
+        auto guard = admission->lock();
+        TT_FATAL(state == State::Issued && origin == Origin::Direct, "Managed direct completion has no issued invocation");
+        auto& leaf = leaves.at(leaf_key(program, device.id()));
+        TT_FATAL(leaf.state == State::Issued, "Managed direct completion has no issued member");
+        leaf.state = State::Stopped;
+        leaf.pending.clear();
+        receive_managed_stop_locked(*admission);
+        stopped = state == State::Stopped;
+    }
+    if (stopped) observe_handoff();
 }
 
 ProgramExecution::Completion ProgramExecution::observe_cores(
@@ -1102,49 +1768,55 @@ void ProgramExecution::Completion::receive() {
     auto admission = this->owner.lock();
     TT_FATAL(admission, "Program NIU completion context has closed");
     auto& owner = *admission;
-    auto guard = owner.lock();
-    for (auto& [execution, key] : managed_leaves) {
-        if (execution->state != State::Issued) {
-            continue;
+    std::vector<std::shared_ptr<ProgramExecution>> stopped_managed;
+    stopped_managed.reserve(managed_leaves.size());
+    {
+        auto guard = owner.lock();
+        for (auto& [execution, key] : managed_leaves) {
+            if (execution->state != State::Issued) {
+                continue;
+            }
+            auto& leaf = execution->leaves.at(key);
+            if (leaf.state != State::Issued) {
+                continue;
+            }
+            for (auto core : physical) {
+                leaf.pending.erase(core);
+            }
+            if (leaf.pending.empty()) {
+                leaf.state = State::Stopped;
+            }
+            execution->receive_managed_stop_locked(owner);
+            if (execution->state == State::Stopped) stopped_managed.push_back(execution);
         }
-        auto& leaf = execution->leaves.at(key);
-        if (leaf.state != State::Issued) {
-            continue;
+        for (auto& execution : executions) {
+            if (execution->state != State::Issued) {
+                continue;
+            }
+            auto found = execution->pending.find(chip);
+            if (found == execution->pending.end()) {
+                continue;
+            }
+            for (auto core : physical) {
+                found->second.erase(core);
+            }
+            if (found->second.empty()) {
+                execution->pending.erase(found);
+            }
+            if (!execution->pending.empty()) {
+                continue;
+            }
+            std::string error;
+            TT_FATAL(
+                owner.record_stop_locked(*execution->token, execution->boots, error), "Program NIU stop failed: {}", error);
+            execution->state = State::Stopped;
         }
-        for (auto core : physical) {
-            leaf.pending.erase(core);
-        }
-        if (leaf.pending.empty()) {
-            leaf.state = State::Stopped;
-        }
-        execution->receive_managed_stop_locked(owner);
+        std::erase_if(owner.executions_, [](const auto& execution) {
+            return !execution->managed && execution->state == State::Stopped;
+        });
+        received = true;
     }
-    for (auto& execution : executions) {
-        if (execution->state != State::Issued) {
-            continue;
-        }
-        auto found = execution->pending.find(chip);
-        if (found == execution->pending.end()) {
-            continue;
-        }
-        for (auto core : physical) {
-            found->second.erase(core);
-        }
-        if (found->second.empty()) {
-            execution->pending.erase(found);
-        }
-        if (!execution->pending.empty()) {
-            continue;
-        }
-        std::string error;
-        TT_FATAL(
-            owner.record_stop_locked(*execution->token, execution->boots, error), "Program NIU stop failed: {}", error);
-        execution->state = State::Stopped;
-    }
-    std::erase_if(owner.executions_, [](const auto& execution) {
-        return !execution->managed && execution->state == State::Stopped;
-    });
-    received = true;
+    for (const auto& execution : stopped_managed) execution->observe_handoff();
 }
 
 ProgramExecution::Completion::~Completion() {

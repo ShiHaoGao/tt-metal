@@ -1017,6 +1017,8 @@ void LaunchProgram(IDevice* device, Program& program, bool wait_until_cores_done
     auto preparation = ProgramExecution::reserve_direct(program, *device);
     auto execution = preparation.execution();
     auto niu_failure = execution->watch_failure();
+    TT_FATAL(!force_slow_dispatch || !execution->managed,
+             "Managed forced slow dispatch requires an owned RESET/GO handoff journal");
     {  // Profiler scope start
         ZoneScoped;
         MetalContext& metal_ctx = MetalContext::instance(extract_context_id(device));

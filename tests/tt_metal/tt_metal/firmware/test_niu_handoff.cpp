@@ -5,11 +5,179 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace tt::niu_handoff {
 namespace {
+template <class Receiver>
+concept exposes_item_publisher = requires {
+    typename Receiver::ItemPublisher;
+    typename Receiver::ItemWitnessRequest;
+    typename Receiver::ItemWitnessReceipt;
+};
+
+template <class Receiver>
+void check_item_publisher_contract() {
+    if constexpr (!exposes_item_publisher<Receiver>) {
+        ADD_FAILURE() << "Device has no issue-before-close item witness publisher";
+    } else {
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Receipt = typename Receiver::ItemWitnessReceipt;
+        struct ItemIO {
+            Request request{};
+            Receipt receipt{};
+            uint32_t outstanding = 1;
+            uint32_t outgoing = 1;
+            std::vector<unsigned> events;
+            uint32_t requestGeneration() { return request.request_generation; }
+            uint32_t receiptSequence() { return receipt.publish_sequence; }
+            Request readRequest() { return request; }
+            void invalidate() { events.push_back(3); }
+            tt_niu_handoff_selector_observation selectorObserved(unsigned noc, unsigned selector) {
+                EXPECT_EQ(noc, request.noc);
+                EXPECT_EQ(selector, request.selector);
+                events.push_back(4);
+                return {outstanding, outgoing};
+            }
+            void publish(const Receipt& value) {
+                receipt = value;
+                events.push_back(10 + value.state);
+            }
+        };
+        ItemIO io;
+        io.request.abi_version = 1;
+        io.request.request_generation = 1;
+        io.request.boot_cookie = 3;
+        io.request.invocation_id = 5;
+        io.request.item = 7;
+        io.request.generation = UINT64_C(1) << 35;
+        io.request.occurrence = (UINT64_C(1) << 36) + 1;
+        io.request.leaf = 2;
+        io.request.noc = 1;
+        io.request.selector = 15;
+        io.request.issuer = 2;
+        io.request.completion = 2;
+        typename Receiver::ItemPublisher publisher;
+        ASSERT_TRUE(publisher.arm(io));
+        EXPECT_FALSE(publisher.close(io, [] {}));
+        EXPECT_EQ(io.receipt.closed_occurrence, 0u);
+        ASSERT_TRUE(publisher.issue(io, [&] { io.events.push_back(1); }));
+        EXPECT_EQ(io.receipt.state, 1u);
+        EXPECT_EQ(io.receipt.issued_occurrence, io.request.occurrence);
+        EXPECT_EQ(io.receipt.closed_occurrence, 0u);
+        EXPECT_FALSE(publisher.issue(io, [] {}));
+        bool waited = false;
+        ASSERT_TRUE(publisher.close(io, [&] {
+            waited = true;
+            io.events.push_back(2);
+            io.outstanding = io.outgoing = 0;
+        }));
+        EXPECT_TRUE(waited);
+        EXPECT_EQ(io.receipt.state, 2u);
+        EXPECT_EQ(io.receipt.closed_occurrence, io.request.occurrence);
+        EXPECT_EQ(io.receipt.publish_sequence & 1u, 0u);
+        const auto issue = std::find(io.events.begin(), io.events.end(), 1u);
+        const auto issued = std::find(io.events.begin(), io.events.end(), 11u);
+        const auto wait = std::find(io.events.begin(), io.events.end(), 2u);
+        const auto closed = std::find(io.events.begin(), io.events.end(), 12u);
+        EXPECT_LT(issue, issued);
+        EXPECT_LT(issued, wait);
+        EXPECT_LT(wait, closed);
+        EXPECT_FALSE(publisher.close(io, [] {}));
+        EXPECT_FALSE(publisher.arm(io));
+        typename Receiver::ItemPublisher recreated;
+        EXPECT_FALSE(recreated.arm(io)) << "A fresh writer cannot reopen an already published SDK slot";
+        // A wait callback returning without real hardware closure may not
+        // publish Closed, and a changed original request poisons the writer.
+        typename Receiver::ItemPublisher blocked;
+        io.receipt = {};
+        ASSERT_TRUE(blocked.arm(io));
+        ASSERT_TRUE(blocked.issue(io, [] {}));
+        io.outstanding = 1;
+        EXPECT_FALSE(blocked.close(io, [] {}));
+        EXPECT_EQ(io.receipt.state, 3u);
+        EXPECT_EQ(io.receipt.closed_occurrence, 0u);
+        typename Receiver::ItemPublisher changed;
+        io.receipt = {};
+        ASSERT_TRUE(changed.arm(io));
+        ASSERT_TRUE(changed.issue(io, [] {}));
+        ++io.request.generation;
+        io.outstanding = io.outgoing = 0;
+        EXPECT_FALSE(changed.close(io, [] {}));
+        EXPECT_EQ(io.receipt.state, 3u);
+        io.request.occurrence = std::numeric_limits<uint64_t>::max();
+        typename Receiver::ItemPublisher wrapped;
+        EXPECT_FALSE(wrapped.arm(io));
+    }
+}
+
+TEST(NiuItemPublisher, RequiresActualIssueWaitAndUnchangedOriginalRequest) {
+    check_item_publisher_contract<Receiver>();
+}
+
+struct ItemMemoryPlatform {
+    void invalidate() {}
+    tt_niu_handoff_selector_observation selectorObserved(unsigned, unsigned) { return {}; }
+};
+
+template <class Receiver>
+concept exposes_item_memory = requires { typename Receiver::template ItemMemory<ItemMemoryPlatform>; };
+
+template <class Receiver>
+void check_item_memory_contract() {
+    if constexpr (!exposes_item_memory<Receiver>) {
+        ADD_FAILURE() << "Device has no ordered volatile L1 item witness publication adapter";
+    } else {
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Receipt = typename Receiver::ItemWitnessReceipt;
+        typename Receiver::ItemWitnessRegion region{};
+        auto& request = region.request;
+        request.abi_version = 1;
+        request.request_generation = 1;
+        request.boot_cookie = UINT64_C(0x123456789abcdef0);
+        request.invocation_id = 5;
+        request.item = 7;
+        request.generation = UINT64_C(1) << 35;
+        request.occurrence = (UINT64_C(1) << 36) + 1;
+        request.leaf = 2;
+        request.noc = 1;
+        request.selector = 15;
+        request.issuer = 2;
+        request.completion = 2;
+        struct Platform {
+            decltype(region)& memory;
+            std::vector<std::pair<uint32_t, uint32_t>> fences;
+            void invalidate() { fences.emplace_back(memory.receipt.publish_sequence, memory.receipt.state); }
+            tt_niu_handoff_selector_observation selectorObserved(unsigned, unsigned) { return {}; }
+        } platform{region};
+        typename Receiver::template ItemMemory<Platform> memory(region, platform);
+        const Request copied = memory.readRequest();
+        EXPECT_EQ(copied.boot_cookie, request.boot_cookie);
+        EXPECT_EQ(copied.generation, request.generation);
+        EXPECT_EQ(copied.occurrence, request.occurrence);
+        Receipt receipt{};
+        receipt.request = request;
+        receipt.publish_sequence = 2;
+        receipt.state = 1;
+        receipt.issued_occurrence = request.occurrence;
+        memory.publish(receipt);
+        ASSERT_EQ(platform.fences.size(), 2u);
+        EXPECT_EQ(platform.fences[0], (std::pair<uint32_t, uint32_t>{1, 0}));
+        EXPECT_EQ(platform.fences[1], (std::pair<uint32_t, uint32_t>{1, 1}));
+        EXPECT_EQ(region.receipt.publish_sequence, 2u);
+        EXPECT_EQ(region.receipt.issued_occurrence, request.occurrence);
+        EXPECT_EQ(region.receipt.closed_occurrence, 0u);
+        EXPECT_EQ(region.request.boot_cookie, request.boot_cookie);
+        EXPECT_EQ(region.request.generation, request.generation);
+    }
+}
+
+TEST(NiuItemPublisher, PublishesOddBodyFenceEvenToActualVolatileSlot) {
+    check_item_memory_contract<Receiver>();
+}
+
 enum class Event { SourceRead, Poll, Rebase, ProfileExit, Notify, DescriptorReadback, BootReady, Pending, Publish };
 
 // Only the physical MMIO and L1 boundary is modeled. Admission, accounting,

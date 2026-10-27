@@ -8,7 +8,14 @@
 #include <optional>
 #include <span>
 
+#include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/device_types.hpp>
+
 #include "hostdev/niu_handoff_contract.h"
+#include "hostdev/niu_item_witness_contract.h"
+
+namespace tt { class Cluster; }
+namespace tt::tt_metal { class Hal; }
 
 namespace tt::tt_metal::detail {
 
@@ -17,6 +24,7 @@ namespace tt::tt_metal::detail {
 // selector normalization, or payload-visibility capability.
 enum class NiuHandoffIoStatus { Complete, Failed };
 enum class NiuHandoffReadStatus { Observed, Unpublished, InProgress, Changed, Invalid, IoFailure };
+enum class NiuHandoffWriteStatus { Published, InvalidRequest, IoFailure, ReadbackMismatch };
 enum class NiuHandoffCheck {
     Match,
     Pending,
@@ -53,15 +61,64 @@ struct NiuHandoffExpectedExecution {
     uint32_t source_valid_noc_mask;
 };
 
+class NiuItemWitnessObservation final {
+public:
+    const tt_niu_item_witness_region& wire() const { return wire_; }
+
+private:
+    friend class NiuHandoffReceiver;
+    explicit NiuItemWitnessObservation(tt_niu_item_witness_region wire) : wire_(wire) {}
+    tt_niu_item_witness_region wire_;
+};
+
+struct NiuItemWitnessReadResult {
+    NiuHandoffReadStatus status;
+    std::optional<NiuItemWitnessObservation> observation;
+};
+
 class NiuHandoffReceiver final {
 public:
-    // Offsets are relative to the actual HAL-validated mailbox. The future
-    // owner adapter captures the original Cluster/chip/core/base, performs no
-    // admission-locked IO, and propagates transport exceptions to that owner.
+    using ItemWitnessRequest = tt_niu_item_witness_request;
+    using ItemWitnessRegion = tt_niu_item_witness_region;
+    // Offsets are relative to the mailbox. This byte decoder neither chooses
+    // the device endpoint nor establishes owner/boot lifetime.
     using Read = std::function<NiuHandoffIoStatus(uint32_t, std::span<std::byte>)>;
+    using Write = std::function<NiuHandoffIoStatus(uint32_t, std::span<const std::byte>)>;
+    // Complete writes are ordered before the following read. The owner must
+    // exclude GO and retain/revalidate the original boot throughout publication.
+    static NiuHandoffWriteStatus write_request(const Write&, const Read&, const tt_niu_handoff_request&);
+    static NiuHandoffWriteStatus write_request(
+        const Cluster&, const Hal&, ChipId, CoreCoord, const tt_niu_handoff_request&);
+    // Projects the initial single-GO journal only. BootReady bytes do not grant
+    // bootstrap or clean state; ProgramExecution owns the live owner checks.
+    static std::optional<NiuHandoffExpectedExecution> initial_execution(
+        const NiuHandoffObservation&, uint64_t boot_cookie, uint64_t invocation_id, bool has_source);
     static NiuHandoffReadResult read(const Read& read);
+    // physical_worker is in the original chip's NOC0 coordinates. The caller
+    // keeps Cluster/Hal alive and performs IO outside the admission lock;
+    // its owner layer must revalidate boot and execution state afterward.
+    // Transport exceptions propagate without producing an observation.
+    static NiuHandoffReadResult read(
+        const Cluster& cluster, const Hal& hal, ChipId chip, CoreCoord physical_worker);
     static NiuHandoffCheck check(
         const NiuHandoffObservation& observation, const NiuHandoffExpectedExecution& expected);
+    // Pure observation only. The invocation receiver must additionally retain
+    // and validate the original token, stopped issuers, boot and Device epoch.
+    // This does not establish posted-payload or consumer-cache visibility.
+    static bool closed_selector(
+        const NiuHandoffObservation& observation, const NiuHandoffExpectedExecution& expected,
+        uint8_t noc, uint8_t selector);
+    // Byte observation only. The ManagedInvocation must own the original
+    // allocation, request, selector lease, live boot and issuing processor.
+    // The expected request must come from that retained owner, never receipt
+    // echo. Physical completion facts do not establish consumer visibility.
+    // Initialization requires a new, exclusively owned slot with GO excluded.
+    // The complete gen0 region is verified before the generation is exposed.
+    static NiuHandoffWriteStatus write_item_request(
+        const Write&, const Read&, const ItemWitnessRequest&);
+    static NiuItemWitnessReadResult read_item(const Read& read);
+    static bool closed_item(
+        const NiuItemWitnessObservation& observation, const ItemWitnessRequest& expected);
 };
 
 }  // namespace tt::tt_metal::detail

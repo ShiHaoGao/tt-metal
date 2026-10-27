@@ -12,6 +12,7 @@
 #include <limits>
 
 #include "impl/context/niu_admission.hpp"
+#include "impl/context/niu_handoff_receiver.hpp"
 #include "hostdev/native_kernel_contract.h"
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/sub_device_types.hpp>
@@ -23,6 +24,7 @@ class MetalContext;
 class Program;
 class IDevice;
 class Kernel;
+class Buffer;
 namespace experimental {
 void DispatchCompiledProgramToDevice(IDevice*, Program&);
 }
@@ -107,12 +109,159 @@ public:
         int exceptions;
     };
     FailureScope watch_failure() { return FailureScope(shared_from_this()); }
+    // Stable mailbox bytes matched against this invocation's frozen request
+    // and exact stopped footprint. These are not bootstrap or clean receipts.
+    struct HandoffObservation {
+        ChipId chip;
+        CoreCoord physical_worker;
+        NiuHandoffObservation mailbox;
+    };
     class ManagedInvocation final {
+        struct ItemWitnessStorage;
     public:
+        class SelectorLease final {
+        public:
+            SelectorLease(SelectorLease&&) noexcept = default;
+            SelectorLease& operator=(SelectorLease&&) noexcept = default;
+            SelectorLease(const SelectorLease&) = delete;
+            SelectorLease& operator=(const SelectorLease&) = delete;
+            detail::NiuKey niu() const { return selector_.niu(); }
+            uint8_t selector() const { return selector_.selector(); }
+            // Handle population only; a retained handle is not a new live-boot
+            // admission, issue epoch, or completion capability.
+            bool valid() const noexcept { return owner_ && selector_.valid(); }
+            uint64_t boot_cookie() const { return boot_cookie_; }
+            uint64_t invocation_id() const { return invocation_id_; }
+
+        private:
+            friend class ManagedInvocation;
+            SelectorLease(
+                std::shared_ptr<ProgramExecution> owner,
+                NiuAdmission::SelectorLease selector,
+                uint64_t boot_cookie,
+                uint64_t invocation_id) :
+                owner_(std::move(owner)),
+                selector_(std::move(selector)),
+                boot_cookie_(boot_cookie),
+                invocation_id_(invocation_id) {}
+            // Retain the original managed execution, its allocation, and its
+            // original boot set. These correlation values never grant issue,
+            // completion, visibility, or clean-state authority.
+            std::shared_ptr<ProgramExecution> owner_;
+            NiuAdmission::SelectorLease selector_;
+            uint64_t boot_cookie_;
+            uint64_t invocation_id_;
+        };
+        // This is the narrow handoff that the SDK can currently prove for a
+        // managed invocation.  It is projected directly from the immutable
+        // NiuAdmission allocation and the original firmware boot.  The
+        // correlation values identify this invocation/boot only; they are not
+        // NIU or NoC transaction IDs.
+        struct CompletionBinding {
+            detail::NiuKey niu;
+            detail::NiuSelectorMask selectors;
+            uint64_t boot_cookie = 0;
+            uint64_t invocation_id = 0;
+        };
+        // An aggregate mailbox receipt correlated with one allocation row.
+        // The mailbox is shared by the two NoCs on a Worker and therefore
+        // does not establish per-item payload completion or a TRID lease.
+        struct CompletionObservation {
+            CompletionBinding binding;
+            HandoffObservation handoff;
+        };
+        // Minted only after all original issuers stopped and their retained
+        // request-correlated hardware selector counters are both zero. This
+        // is a terminal observation, never online item publication or payload
+        // visibility. A retained value cannot authorize later selector reuse.
+        class SelectorObservation final {
+        public:
+            detail::NiuKey niu() const { return niu_; }
+            uint8_t selector() const { return selector_; }
+            uint64_t boot_cookie() const { return boot_cookie_; }
+            uint64_t invocation_id() const { return invocation_id_; }
+
+        private:
+            friend class ManagedInvocation;
+            SelectorObservation(
+                std::shared_ptr<ProgramExecution> owner, detail::NiuKey niu, uint8_t selector,
+                uint64_t boot_cookie, uint64_t invocation_id) :
+                owner_(std::move(owner)), niu_(niu), selector_(selector),
+                boot_cookie_(boot_cookie), invocation_id_(invocation_id) {}
+            std::shared_ptr<ProgramExecution> owner_;
+            detail::NiuKey niu_;
+            uint8_t selector_;
+            uint64_t boot_cookie_;
+            uint64_t invocation_id_;
+        };
+        enum class ItemCompletionFact : uint8_t {
+            ReadDestinationLocal = TT_NIU_ITEM_READ_DESTINATION_LOCAL,
+            NonPostedWriteAcknowledged = TT_NIU_ITEM_NONPOSTED_WRITE_ACKNOWLEDGED,
+        };
+        struct ItemWitnessRequirement {
+            std::shared_ptr<Kernel> kernel;
+            CoreCoord logical_core;
+            uint64_t item;
+            uint64_t generation;
+            uint64_t occurrence;
+            uint32_t leaf;
+            ItemCompletionFact completion;
+        };
+        class ItemWitnessLease final {
+        public:
+            ItemWitnessLease(ItemWitnessLease&&) noexcept = default;
+            ItemWitnessLease& operator=(ItemWitnessLease&&) noexcept = default;
+            ItemWitnessLease(const ItemWitnessLease&) = delete;
+            ItemWitnessLease& operator=(const ItemWitnessLease&) = delete;
+            uint32_t address() const;
+            const tt_niu_item_witness_request& request() const;
+
+        private:
+            friend class ManagedInvocation;
+            ItemWitnessLease(std::shared_ptr<ProgramExecution> owner, std::shared_ptr<const ItemWitnessStorage> storage) :
+                owner_(std::move(owner)), storage_(std::move(storage)) {}
+            std::shared_ptr<ProgramExecution> owner_;
+            std::shared_ptr<const ItemWitnessStorage> storage_;
+        };
+        class ItemWitnessObservation final {
+        public:
+            const tt_niu_item_witness_request& request() const;
+            detail::NiuKey niu() const;
+            ItemCompletionFact completion() const;
+
+        private:
+            friend class ManagedInvocation;
+            ItemWitnessObservation(
+                std::shared_ptr<ProgramExecution> owner, std::shared_ptr<const ItemWitnessStorage> storage) :
+                owner_(std::move(owner)), storage_(std::move(storage)) {}
+            std::shared_ptr<ProgramExecution> owner_;
+            std::shared_ptr<const ItemWitnessStorage> storage_;
+        };
         ~ManagedInvocation();
         ManagedInvocation(const ManagedInvocation&) = delete;
         ManagedInvocation& operator=(const ManagedInvocation&) = delete;
         const NiuAdmission::Allocation& allocation() const;
+        std::vector<CompletionBinding> completion_bindings() const;
+        // Selects one real hardware TRID from this invocation's admitted NIU
+        // allocation. No item ordinal, group id, or mailbox observation is
+        // accepted as a selector source.
+        std::optional<SelectorLease> acquire_selector(const NiuKey& niu) const;
+        std::vector<HandoffObservation> handoff_observations() const;
+        std::vector<CompletionObservation> completion_observations() const;
+        std::optional<SelectorObservation> observe_selector(const SelectorLease& selector) const;
+        // Revalidate every admitted selector against the original stopped
+        // invocation. Nonzero/uncertain counters preserve the full exclusion.
+        // No caller-supplied counters, receipt, bool or generation can retire.
+        bool retire_selectors() const;
+        // The SDK allocates and initializes one real Worker L1 slot before
+        // issue, binding the exact frozen native kernel and original selector.
+        // No caller-supplied address or copied receipt can produce a lease.
+        std::optional<ItemWitnessLease> acquire_item_witness(
+            const SelectorLease&, const ItemWitnessRequirement&) const;
+        // Online observation reads the original allocation and then revalidates
+        // the original boot/token/Device epoch. It reports physical completion
+        // only, never consumer visibility, release or rolling-slot reuse.
+        std::optional<ItemWitnessObservation> observe_item(const ItemWitnessLease&) const;
 
     private:
         friend class ProgramExecution;
@@ -139,6 +288,9 @@ public:
         distributed::MeshDevice& mesh, std::span<const SubDeviceId> sub_devices, distributed::MeshWorkload& workload);
     static std::shared_ptr<ProgramExecution> validate_workload(
         distributed::MeshDevice& mesh, distributed::MeshWorkload& workload);
+    // Actual stop receivers call this only after the complete managed
+    // invocation has stopped. It never releases NIUs or grants clean state.
+    void observe_handoff();
     ~ProgramExecution();
     ProgramExecution(const ProgramExecution&) = delete;
     ProgramExecution& operator=(const ProgramExecution&) = delete;
@@ -155,7 +307,7 @@ private:
     friend void ::tt::tt_metal::experimental::DispatchCompiledProgramToDevice(IDevice*, Program&);
 
     enum class Origin { Direct, Queue };
-    enum class State { Reserved, Issued, Stopped, Quarantined, Withdrawn };
+    enum class State { Reserved, Issued, Stopped, SelectorsClean, Quarantined, Withdrawn };
     enum class GroupState { Reserved, Issued, Stopped, Clean };
     using Cores = std::map<ChipId, std::set<CoreCoord>>;
     using Endpoints = std::map<ChipId, std::vector<tt_native_noc_endpoint>>;
@@ -183,6 +335,13 @@ private:
         Cores cores;
         std::vector<SubDeviceId> subdevices;
         GroupState state = GroupState::Reserved;
+    };
+    struct HandoffSnapshot {
+        NiuAdmission::Token token;
+        NiuAdmission::Boots boots;
+        Cores footprint;
+        std::map<ChipId, uint64_t> epochs;
+        std::map<ChipId, std::map<CoreCoord, NiuHandoffExpectedExecution>> expected;
     };
     ProgramExecution(
         MetalContext& context,
@@ -215,6 +374,14 @@ private:
     void validate_leaf_overlap_locked(LeafKey leaf) const;
     void abandon_managed(bool preparation_owner_only = false) noexcept;
     void receive_managed_stop_locked(NiuAdmission& admission);
+    void validate_handoff_locked(
+        NiuAdmission& admission, const NiuAdmission::Guard& guard, const HandoffSnapshot& snapshot) const;
+    bool validate_item_witness_locked(
+        NiuAdmission&, const NiuAdmission::Guard&, const ManagedInvocation::ItemWitnessStorage&, bool issued) const;
+    void validate_request_locked(
+        NiuAdmission& admission, const NiuAdmission::Guard& guard, const HandoffSnapshot& snapshot) const;
+    void prepare_handoff();
+    std::vector<ManagedInvocation::CompletionBinding> completion_bindings() const;
     class Submission final {
     public:
         ~Submission();
@@ -275,7 +442,11 @@ private:
     const Cores footprint;
     Cores pending;
     std::optional<NiuAdmission::Token> token;
+    uint64_t invocation_identity = 0;
     NiuAdmission::Boots boots;
+    std::shared_ptr<const HandoffSnapshot> handoff_snapshot;
+    std::shared_ptr<const HandoffSnapshot> issued_handoff;
+    std::vector<HandoffObservation> observed_handoffs;
     Endpoints managed_endpoints;
     std::optional<NiuAdmission::Boots> replay_boots;
     std::atomic<State> state{State::Reserved};
@@ -284,6 +455,8 @@ private:
     std::vector<Group> groups;
     std::vector<std::shared_ptr<ProgramImpl>> retained_programs;
     std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>> retained_workloads;
+    std::vector<std::shared_ptr<Buffer>> retained_witness_backing;
+    std::vector<std::shared_ptr<const ManagedInvocation::ItemWitnessStorage>> item_witnesses;
     std::set<ChipId> attached_chips;
     std::set<ChipId> retirement_chips;
     ProgramPreparation preparation;

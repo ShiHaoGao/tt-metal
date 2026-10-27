@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 #include <array>
+#include <algorithm>
+#include <thread>
 
 namespace tt::tt_metal::detail {
 namespace {
@@ -41,6 +43,69 @@ TEST_F(NiuLedgerTest, ManagedSelectorsAreUniqueWithinOnePhysicalNiu) {
     EXPECT_FALSE((first->selections[0].selectors & second->selections[0].selectors).any());
     EXPECT_FALSE(acquire(a, 1));
     EXPECT_FALSE(ordinary(a));
+}
+
+TEST_F(NiuLedgerTest, SelectorSubleasesUseOnlyTheirActualAllocationMask) {
+    auto occupied = acquire(a, 5);
+    auto allocation = acquire(a, 4);
+    ASSERT_TRUE(occupied) << error;
+    ASSERT_TRUE(allocation) << error;
+    NiuSelectorLeaseBook selectors(allocation->selections);
+    EXPECT_FALSE(selectors.acquire(b));
+    NiuSelectorMask observed;
+    for (unsigned item = 0; item != 4; ++item) {
+        auto selector = selectors.acquire(a);
+        ASSERT_TRUE(selector);
+        ASSERT_LT(*selector, niu_selector_count);
+        EXPECT_TRUE(allocation->selections[0].selectors.test(*selector));
+        EXPECT_FALSE(occupied->selections[0].selectors.test(*selector));
+        EXPECT_FALSE(observed.test(*selector));
+        observed.set(*selector);
+    }
+    EXPECT_EQ(observed, allocation->selections[0].selectors);
+    EXPECT_FALSE(selectors.acquire(a));
+}
+
+TEST_F(NiuLedgerTest, SelectorSubleasesRemainDistinctAcrossConcurrentClaimers) {
+    auto allocation = acquire(a, 16);
+    ASSERT_TRUE(allocation) << error;
+    NiuSelectorLeaseBook selectors(allocation->selections);
+    std::array<std::optional<uint8_t>, 32> claims;
+    std::vector<std::thread> threads;
+    for (size_t item = 0; item != claims.size(); ++item) {
+        threads.emplace_back([&, item] { claims[item] = selectors.acquire(a); });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    NiuSelectorMask observed;
+    size_t accepted = 0;
+    for (const auto& selector : claims) {
+        if (!selector) {
+            continue;
+        }
+        ++accepted;
+        ASSERT_LT(*selector, niu_selector_count);
+        EXPECT_FALSE(observed.test(*selector));
+        observed.set(*selector);
+    }
+    EXPECT_EQ(accepted, niu_selector_count);
+    EXPECT_EQ(observed, allocation->selections[0].selectors);
+    EXPECT_FALSE(selectors.acquire(a));
+}
+
+TEST_F(NiuLedgerTest, SelectorSubleaseExhaustionDoesNotReleaseThePhysicalAllocation) {
+    auto allocation = acquire(a, 1);
+    ASSERT_TRUE(allocation) << error;
+    NiuSelectorLeaseBook selectors(allocation->selections);
+    ASSERT_TRUE(selectors.acquire(a));
+    EXPECT_FALSE(selectors.acquire(a));
+    // A consumed/dropped selector is not an NIU-clean receipt. The original
+    // physical allocation still excludes ordinary traffic and remains live.
+    EXPECT_FALSE(ordinary(a));
+    auto remainder = acquire(a, 15);
+    ASSERT_TRUE(remainder) << error;
+    EXPECT_FALSE(acquire(a, 1));
 }
 
 TEST_F(NiuLedgerTest, OrdinaryProgramsShareButEveryReservationExcludesManaged) {

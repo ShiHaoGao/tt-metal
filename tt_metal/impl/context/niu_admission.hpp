@@ -3,6 +3,7 @@
 #pragma once
 
 #include <bitset>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -20,6 +21,7 @@
 #include <umd/device/types/cluster_descriptor_types.hpp>
 
 namespace tt::tt_metal { class NiuAdmission; }
+namespace tt::tt_metal { class Buffer; }
 namespace tt::tt_metal::distributed { class MeshWorkloadImpl; }
 
 namespace tt::tt_metal::detail {
@@ -72,6 +74,25 @@ private:
 struct NiuAllocation {
     NiuToken token;
     std::vector<NiuSelection> selections;
+};
+
+// Shared only by copies of one managed allocation.  The book is populated from
+// the actual selector mask selected by NiuLedger; it is not a second physical
+// allocator and cannot mint selectors outside that mask.
+class NiuSelectorLeaseBook final {
+public:
+    explicit NiuSelectorLeaseBook(std::span<const NiuSelection> selections);
+    std::optional<uint8_t> acquire(const NiuKey& niu);
+
+private:
+    struct Selection {
+        explicit Selection(uint16_t available) : available(available) {}
+        uint16_t available;
+        std::atomic<uint16_t> leased{0};
+    };
+    // This map is immutable after construction; selector claims are the only
+    // mutable state and use CAS rather than a second admission mutex.
+    std::map<NiuKey, Selection> selections_;
 };
 
 // Pure allocation/state algorithm. It has no LoadedFirmware or activation
@@ -163,6 +184,37 @@ public:
         std::shared_ptr<const Lease> lease_;
         uint64_t id_ = 0;
     };
+    class Allocation;
+    // A move-only, invocation-owned view of one selector in the actual managed
+    // allocation.  The selector value is the hardware TRID; callers cannot
+    // construct one or choose an ordinal.  Claims are single-use within the
+    // parent allocation: destruction cannot prove an unknown device access has
+    // stopped, and therefore never makes a selector available for reissue.
+    class SelectorLease final {
+    public:
+        SelectorLease(SelectorLease&& other) noexcept;
+        SelectorLease& operator=(SelectorLease&& other) noexcept;
+        SelectorLease(const SelectorLease&) = delete;
+        SelectorLease& operator=(const SelectorLease&) = delete;
+        ~SelectorLease();
+
+        detail::NiuKey niu() const { return niu_; }
+        uint8_t selector() const { return selector_; }
+        bool valid() const noexcept { return owner_ != nullptr && book_ != nullptr; }
+
+    private:
+        friend class Allocation;
+        SelectorLease(
+            std::shared_ptr<const Token::Lease> owner,
+            std::shared_ptr<detail::NiuSelectorLeaseBook> book,
+            detail::NiuKey niu,
+            uint8_t selector) :
+            owner_(std::move(owner)), book_(std::move(book)), niu_(niu), selector_(selector) {}
+        std::shared_ptr<const Token::Lease> owner_;
+        std::shared_ptr<detail::NiuSelectorLeaseBook> book_;
+        detail::NiuKey niu_{};
+        uint8_t selector_ = 0;
+    };
     class Allocation {
     public:
         Allocation(const Allocation&) = default;
@@ -173,10 +225,14 @@ public:
     private:
         friend class NiuAdmission;
         friend class detail::ProgramExecution;
+        std::optional<SelectorLease> acquire_selector(const detail::NiuKey& niu) const;
         Allocation(Token token, std::vector<detail::NiuSelection> selections) :
-            token_(std::move(token)), selections_(std::move(selections)) {}
+            token_(std::move(token)),
+            selections_(std::move(selections)),
+            selector_book_(std::make_shared<detail::NiuSelectorLeaseBook>(selections_)) {}
         Token token_;
         std::vector<detail::NiuSelection> selections_;
+        std::shared_ptr<detail::NiuSelectorLeaseBook> selector_book_;
     };
 
     NiuAdmission();
@@ -209,6 +265,7 @@ private:
         const Guard& guard, std::span<const detail::NiuKey> nius, std::string& error);
     bool validate_ordinary_locked(const Guard& guard, const Token& token, std::string& error);
     bool validate_managed_locked(const Guard& guard, const Token& token, const Boots& boots, std::string& error);
+    bool validate_stopped_managed_locked(const Guard& guard, const Token& token, const Boots& boots, std::string& error);
     bool cancel_unissued_locked(const Guard& guard, const Token& token, std::string& error);
     bool quarantine_locked(const Guard& guard, const Token& token, std::string& error);
     bool mark_issued_locked(const Guard& guard, const Token& token, std::string& error);
@@ -251,6 +308,8 @@ private:
         std::vector<std::shared_ptr<detail::ProgramImpl>> single_programs;
         std::vector<std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>>> workloads;
         std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>> single_workloads;
+        std::vector<std::vector<std::shared_ptr<Buffer>>> witness_backing;
+        std::vector<std::shared_ptr<Buffer>> single_witness_backing;
         std::shared_ptr<detail::ProgramExecution> single_execution;
     };
     Retirement retire_executions_locked();

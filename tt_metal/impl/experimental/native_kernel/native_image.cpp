@@ -163,6 +163,7 @@ struct Image {
 };
 }  // namespace
 
+
 struct FirmwareBundle::Impl {
     std::array<Image, TT_NATIVE_ROLE_COUNT> images;
     std::optional<tt_niu_handoff_record> niu_handoff;

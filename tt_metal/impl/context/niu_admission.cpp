@@ -20,6 +20,40 @@ bool NiuKey::operator<(const NiuKey& other) const noexcept {
 
 NiuLedger::NiuLedger() : owner_(std::make_shared<const NiuToken::Owner>()) {}
 
+NiuSelectorLeaseBook::NiuSelectorLeaseBook(std::span<const NiuSelection> selections) {
+    for (const auto& selection : selections) {
+        auto [position, inserted] = selections_.try_emplace(
+            selection.niu, static_cast<uint16_t>(selection.selectors.to_ulong()));
+        if (!inserted || position->second.available == 0) {
+            throw std::invalid_argument("Selector subleases require distinct nonempty actual NIU allocations");
+        }
+    }
+}
+
+std::optional<uint8_t> NiuSelectorLeaseBook::acquire(const NiuKey& niu) {
+    const auto found = selections_.find(niu);
+    if (found == selections_.end()) {
+        return std::nullopt;
+    }
+    auto& selection = found->second;
+    uint16_t leased = selection.leased.load(std::memory_order_relaxed);
+    for (;;) {
+        const auto available = static_cast<uint16_t>(selection.available & ~leased);
+        if (available == 0) {
+            return std::nullopt;
+        }
+        uint8_t selector = 0;
+        while ((available & (uint16_t{1} << selector)) == 0) {
+            ++selector;
+        }
+        if (selection.leased.compare_exchange_weak(
+                leased, static_cast<uint16_t>(leased | (uint16_t{1} << selector)),
+                std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return selector;
+        }
+    }
+}
+
 namespace {
 bool valid_niu(const NiuKey& key) {
     return key.chip >= 0 && (key.noc == NiuNoc::Noc0 || key.noc == NiuNoc::Noc1);
@@ -223,6 +257,38 @@ void NiuLedger::withdraw() {
 }  // namespace tt::tt_metal::detail
 
 namespace tt::tt_metal {
+
+NiuAdmission::SelectorLease::SelectorLease(SelectorLease&& other) noexcept :
+    owner_(std::move(other.owner_)),
+    book_(std::move(other.book_)),
+    niu_(other.niu_),
+    selector_(other.selector_) {
+    other.selector_ = 0;
+}
+
+NiuAdmission::SelectorLease& NiuAdmission::SelectorLease::operator=(SelectorLease&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    owner_ = std::move(other.owner_);
+    book_ = std::move(other.book_);
+    niu_ = other.niu_;
+    selector_ = other.selector_;
+    other.selector_ = 0;
+    return *this;
+}
+
+NiuAdmission::SelectorLease::~SelectorLease() = default;
+
+std::optional<NiuAdmission::SelectorLease> NiuAdmission::Allocation::acquire_selector(
+    const detail::NiuKey& niu) const {
+    if (!token_.lease_ || !selector_book_) {
+        return std::nullopt;
+    }
+    const auto selector = selector_book_->acquire(niu);
+    return selector ? std::optional<SelectorLease>(SelectorLease(token_.lease_, selector_book_, niu, *selector))
+                    : std::nullopt;
+}
 
 namespace {
 bool same_boot(
@@ -566,6 +632,18 @@ bool NiuAdmission::record_clean_locked(const Token& token, const Boots& boots, s
     return true;
 }
 
+bool NiuAdmission::validate_stopped_managed_locked(
+    const Guard& guard, const Token& token, const Boots& boots, std::string& error) {
+    validate_guard(guard);
+    quarantine_abandoned_locked();
+    auto* record = find_locked(token, error);
+    if (!record) return false;
+    if (record->kind != Kind::Managed || record->state != State::Stopped)
+        return detail::reject(error, "Managed NIU handoff requires its stopped invocation");
+    return validate_boots_locked(*record, boots, error) &&
+           validate_bindings_locked(*record, detail::NiuLedger::State::Stopped, error);
+}
+
 void NiuAdmission::publish_boots_locked(const FirmwareSet& firmware, const LedgerSet& ledgers) {
     quarantine_abandoned_locked();
     if (firmware.size() != ledgers.size()) throw std::runtime_error("NIU boot ledger set is incomplete");
@@ -626,7 +704,9 @@ NiuAdmission::Retirement::Retirement(Retirement&& other) noexcept :
     owner(std::exchange(other.owner, nullptr)), chips(std::move(other.chips)),
     executions(std::move(other.executions)), programs(std::move(other.programs)),
     single_programs(std::move(other.single_programs)), workloads(std::move(other.workloads)),
-    single_workloads(std::move(other.single_workloads)), single_execution(std::move(other.single_execution)) {}
+    single_workloads(std::move(other.single_workloads)), witness_backing(std::move(other.witness_backing)),
+    single_witness_backing(std::move(other.single_witness_backing)),
+    single_execution(std::move(other.single_execution)) {}
 
 NiuAdmission::Retirement& NiuAdmission::Retirement::operator=(Retirement&& other) noexcept {
     if (this == &other) return *this;
@@ -638,6 +718,8 @@ NiuAdmission::Retirement& NiuAdmission::Retirement::operator=(Retirement&& other
     single_programs = std::move(other.single_programs);
     workloads = std::move(other.workloads);
     single_workloads = std::move(other.single_workloads);
+    witness_backing = std::move(other.witness_backing);
+    single_witness_backing = std::move(other.single_witness_backing);
     single_execution = std::move(other.single_execution);
     return *this;
 }
@@ -651,6 +733,8 @@ void NiuAdmission::Retirement::release() noexcept {
     programs.clear();
     single_workloads.clear();
     workloads.clear();
+    single_witness_backing.clear();
+    witness_backing.clear();
     if (owner) {
         auto guard = owner->lock();
         for (auto chip : chips) --owner->retirements_.at(chip);
@@ -668,6 +752,7 @@ void NiuAdmission::retire_managed_locked(detail::ProgramExecution& execution, Re
     retired.chips.swap(execution.retirement_chips);
     retired.single_programs.swap(execution.retained_programs);
     retired.single_workloads.swap(execution.retained_workloads);
+    retired.single_witness_backing.swap(execution.retained_witness_backing);
     retired.single_execution = execution.shared_from_this();
     for (auto chip : retired.chips) ++retirements_.at(chip);
     retired.owner = this;
@@ -680,6 +765,7 @@ NiuAdmission::Retirement NiuAdmission::retire_executions_locked() {
     retired.executions.reserve(executions_.size());
     retired.programs.reserve(executions_.size());
     retired.workloads.reserve(executions_.size());
+    retired.witness_backing.reserve(executions_.size());
     for (const auto& execution : executions_)
         if (execution->state == detail::ProgramExecution::State::Withdrawn &&
             (!execution->managed || (execution->attached_chips.empty() && !execution->preparation.occupied())))
@@ -696,6 +782,7 @@ NiuAdmission::Retirement NiuAdmission::retire_executions_locked() {
         if (execution->managed && execution->token) records_.erase(execution->token->id_);
         retired.programs.push_back(std::move(execution->retained_programs));
         retired.workloads.push_back(std::move(execution->retained_workloads));
+        retired.witness_backing.push_back(std::move(execution->retained_witness_backing));
         retired.executions.push_back(std::move(execution));
     }
     std::erase(executions_, nullptr);

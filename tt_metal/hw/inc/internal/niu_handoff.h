@@ -3,6 +3,7 @@
 #pragma once
 
 #include "hostdev/niu_handoff_contract.h"
+#include "hostdev/niu_item_witness_contract.h"
 
 // The firmware compiler otherwise completely peels the two-NoC loops during
 // LTO, even with the per-loop unroll directive. Preserve the receiver's loops
@@ -27,11 +28,166 @@ constexpr GoSequenceAdvance advanceGoSequence(uint32_t current) {
     return {GoSequenceStatus::Consumed, current + 1};
 }
 
+// Actual L1 adapter shared by the generated device path and CPU ordering
+// tests. Platform owns the architectural cache fence and selector MMIO. The
+// adapter owns every volatile load/store, including split RV32 uint64 words.
+template <typename Platform>
+class ItemWitnessMemory final {
+public:
+    ItemWitnessMemory(volatile tt_niu_item_witness_region& region, Platform& platform) :
+        region_(region), platform_(platform) {}
+    void invalidate() { platform_.invalidate(); }
+    uint32_t requestGeneration() { return region_.request.request_generation; }
+    uint32_t receiptSequence() { return region_.receipt.publish_sequence; }
+    tt_niu_item_witness_request readRequest() {
+        tt_niu_item_witness_request request;
+        const auto* input = reinterpret_cast<volatile const unsigned char*>(&region_.request);
+        auto* output = reinterpret_cast<unsigned char*>(&request);
+#ifdef __clang__
+#pragma clang loop unroll(disable) interleave(disable) vectorize(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 0
+#endif
+        for (unsigned byte = 0; byte != sizeof(request); ++byte) output[byte] = input[byte];
+        return request;
+    }
+    tt_niu_handoff_selector_observation selectorObserved(unsigned noc, unsigned selector) {
+        return platform_.selectorObserved(noc, selector);
+    }
+    void publish(const tt_niu_item_witness_receipt& receipt) {
+        // One writer only, and Publisher supplies nonwrapping even sequences.
+        // The first fence makes odd visible before any body store; the second
+        // makes all body stores visible before the final even publication.
+        region_.receipt.publish_sequence = receipt.publish_sequence - 1;
+        platform_.invalidate();
+        auto* output = reinterpret_cast<volatile unsigned char*>(&region_.receipt);
+        const auto* input = reinterpret_cast<const unsigned char*>(&receipt);
+#ifdef __clang__
+#pragma clang loop unroll(disable) interleave(disable) vectorize(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 0
+#endif
+        for (unsigned byte = sizeof(uint32_t); byte != sizeof(receipt); ++byte) output[byte] = input[byte];
+        platform_.invalidate();
+        region_.receipt.publish_sequence = receipt.publish_sequence;
+    }
+
+private:
+    volatile tt_niu_item_witness_region& region_;
+    Platform& platform_;
+};
+
+// One instance owns one immutable, SDK-initialized slot. It is deliberately
+// single-use: safe rolling-slot reuse requires a separate acknowledged
+// generation frontier and cannot be inferred from the previous Closed state.
+class ItemWitnessPublisher final {
+public:
+    template <typename IO>
+    bool arm(IO& io) {
+        if (phase_ != Phase::Cold) return false;
+        io.invalidate();
+        const auto sequence = io.receiptSequence();
+        const auto generation = io.requestGeneration();
+        request_ = io.readRequest();
+        io.invalidate();
+        if (sequence || io.receiptSequence() || generation != io.requestGeneration() ||
+            generation != request_.request_generation || !valid(request_)) {
+            phase_ = Phase::Poisoned;
+            return false;
+        }
+        receipt_.request = request_;
+        phase_ = Phase::Armed;
+        return true;
+    }
+
+    template <typename IO, typename Issue>
+    bool issue(IO& io, Issue&& issue_body) {
+        if (phase_ != Phase::Armed) return false;
+        if (!unchanged(io)) return reject(io);
+        issue_body();  // The generated algorithm owns actual scoped issue.
+        io.invalidate();
+        if (!unchanged(io)) return reject(io);
+        receipt_.issued_occurrence = request_.occurrence;
+        phase_ = Phase::Issued;
+        return publish(io, TT_NIU_ITEM_WITNESS_ISSUED);
+    }
+
+    template <typename IO, typename Wait>
+    bool close(IO& io, Wait&& scoped_wait) {
+        if (phase_ != Phase::Issued) return false;
+        if (!unchanged(io)) return reject(io);
+        scoped_wait();  // Exact read/nonposted-write TRID barrier, not queue wait.
+        io.invalidate();
+        if (!unchanged(io)) return reject(io);
+        const auto selector = io.selectorObserved(request_.noc, request_.selector);
+        if (selector.outstanding || selector.outgoing) return reject(io);
+        receipt_.closed_occurrence = request_.occurrence;
+        phase_ = Phase::Closed;
+        return publish(io, TT_NIU_ITEM_WITNESS_CLOSED);
+    }
+
+private:
+    enum class Phase { Cold, Armed, Issued, Closed, Poisoned };
+    static bool valid(const tt_niu_item_witness_request& request) {
+        return request.abi_version == TT_NIU_ITEM_WITNESS_VERSION && request.request_generation &&
+               request.request_generation != UINT32_MAX && request.boot_cookie && request.boot_cookie != UINT64_MAX &&
+               request.invocation_id && request.invocation_id != UINT64_MAX && request.item && request.item != UINT64_MAX &&
+               request.generation && request.generation != UINT64_MAX && request.occurrence &&
+               request.occurrence != UINT64_MAX && request.leaf && request.noc < 2 && request.selector < 16 &&
+               (request.issuer == 1 || request.issuer == 2) &&
+               (request.completion == TT_NIU_ITEM_READ_DESTINATION_LOCAL ||
+                request.completion == TT_NIU_ITEM_NONPOSTED_WRITE_ACKNOWLEDGED) && request.reserved == 0;
+    }
+    static bool same(const tt_niu_item_witness_request& lhs, const tt_niu_item_witness_request& rhs) {
+        return lhs.abi_version == rhs.abi_version && lhs.request_generation == rhs.request_generation &&
+               lhs.boot_cookie == rhs.boot_cookie && lhs.invocation_id == rhs.invocation_id && lhs.item == rhs.item &&
+               lhs.generation == rhs.generation && lhs.occurrence == rhs.occurrence && lhs.leaf == rhs.leaf &&
+               lhs.noc == rhs.noc && lhs.selector == rhs.selector && lhs.issuer == rhs.issuer &&
+               lhs.completion == rhs.completion && lhs.reserved == rhs.reserved;
+    }
+    template <typename IO>
+    bool unchanged(IO& io) const {
+        io.invalidate();
+        const auto generation = io.requestGeneration();
+        const auto request = io.readRequest();
+        io.invalidate();
+        return generation == request_.request_generation && generation == io.requestGeneration() &&
+               same(request, request_);
+    }
+    template <typename IO>
+    bool publish(IO& io, uint32_t state) {
+        if (receipt_.publish_sequence > UINT32_MAX - 2) {
+            phase_ = Phase::Poisoned;
+            return false;
+        }
+        receipt_.state = state;
+        receipt_.publish_sequence += 2;
+        io.publish(receipt_);
+        return true;
+    }
+    template <typename IO>
+    bool reject(IO& io) {
+        phase_ = Phase::Poisoned;
+        receipt_.closed_occurrence = 0;
+        publish(io, TT_NIU_ITEM_WITNESS_REJECTED);
+        return false;
+    }
+    Phase phase_ = Phase::Cold;
+    tt_niu_item_witness_request request_{};
+    tt_niu_item_witness_receipt receipt_{};
+};
+
 // The IO boundary is the actual firmware MMIO/L1 adapter. No caller can
 // supply a clean flag: source counts, command readiness and hardware responses
 // are read here, after the last issuing processor has returned.
 class Receiver {
 public:
+    using ItemPublisher = ItemWitnessPublisher;
+    using ItemWitnessRequest = tt_niu_item_witness_request;
+    using ItemWitnessReceipt = tt_niu_item_witness_receipt;
+    using ItemWitnessRegion = tt_niu_item_witness_region;
+    template <typename Platform>
+    using ItemMemory = ItemWitnessMemory<Platform>;
     template <typename IO>
     bool initializeBoot(IO& io) {
         if (phase_ != Phase::Cold || consumed_go_sequence_ != 0 || fault_) return false;
