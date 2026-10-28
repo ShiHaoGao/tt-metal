@@ -20,7 +20,9 @@ class IDevice;
 class Program;
 class RiscFirmwareInitializer;
 namespace experimental {
-namespace native_detail { class NativeImageAccess; }
+namespace native_detail {
+class NativeImageAccess;
+}
 
 enum class TensixKernelRole : uint8_t {
     Brisc = TT_NATIVE_ROLE_BRISC,
@@ -44,6 +46,7 @@ public:
     // separate. The canonical record has BRISC role after five-role agreement.
     std::optional<tt_niu_handoff_record> niu_handoff() const;
     bool matches(const FirmwareBundle& other) const;
+
 private:
     struct Impl;
     explicit FirmwareBundle(std::shared_ptr<const Impl> impl);
@@ -56,8 +59,7 @@ private:
 class KernelElfImage {
 public:
     static KernelElfImage from_bytes(
-        std::span<const std::byte> image, const FirmwareBundle& firmware,
-        std::string_view label = "native kernel");
+        std::span<const std::byte> image, const FirmwareBundle& firmware, std::string_view label = "native kernel");
     TensixKernelRole role() const;
     std::span<const std::byte> image_bytes() const;
     const tt_native_image_record& contract() const;
@@ -66,8 +68,12 @@ public:
     std::optional<tt_native_noc_record> noc_contract() const;
     // Borrowed immutable view retained by this image's shared owner.
     std::span<const tt_native_noc_endpoint> noc_endpoints() const;
+    // Relative algorithm declarations retained by the same original image.
+    // Their presence does not create an allocation or authorize managed issue.
+    std::span<const tt_native_noc_window> noc_windows() const;
     const FirmwareBundle& firmware() const;
     std::string_view label() const;
+
 private:
     struct Impl;
     explicit KernelElfImage(std::shared_ptr<const Impl> impl);

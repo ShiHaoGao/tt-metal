@@ -185,32 +185,34 @@ void check_item_witness_contract() {
         using Region = typename Receiver::ItemWitnessRegion;
         Region region{};
         auto& request = region.request;
-        request.abi_version = 1;
+        request.abi_version = TT_NIU_ITEM_WITNESS_VERSION;
         request.request_generation = 7;
         request.boot_cookie = UINT64_C(0x123456789abcdef0);
         request.invocation_id = UINT64_C(0x223456789abcdef0);
         request.item = UINT64_C(0x323456789abcdef0);
         request.generation = UINT64_C(0x423456789abcdef0);
-        request.occurrence = UINT64_C(0x523456789abcdef0);
+        request.occurrence = 1;
         request.leaf = 3;
         request.noc = 1;
         request.selector = 15;
         request.issuer = 2;
         request.completion = 2;
         region.receipt.request = request;
-        region.receipt.publish_sequence = 2;
+        region.receipt.publish_sequence = 4;
         region.receipt.state = 2;
-        region.receipt.issued_occurrence = request.occurrence;
-        region.receipt.closed_occurrence = request.occurrence;
+        region.receipt.item.issued_occurrence = request.occurrence;
+        region.receipt.item.closed_occurrence = request.occurrence;
         bool change_after_body = false;
         auto read = [&] {
             return Receiver::read_item([&](uint32_t offset, std::span<std::byte> destination) {
-                if (offset > sizeof(region) || destination.size() > sizeof(region) - offset)
+                if (offset > sizeof(region) || destination.size() > sizeof(region) - offset) {
                     return NiuHandoffIoStatus::Failed;
-                std::memcpy(destination.data(), reinterpret_cast<const std::byte*>(&region) + offset,
-                            destination.size());
-                if (change_after_body && destination.size() == sizeof(region))
+                }
+                std::memcpy(
+                    destination.data(), reinterpret_cast<const std::byte*>(&region) + offset, destination.size());
+                if (change_after_body && destination.size() == sizeof(region)) {
                     region.receipt.publish_sequence += 2;
+                }
                 return NiuHandoffIoStatus::Complete;
             });
         };
@@ -220,18 +222,22 @@ void check_item_witness_contract() {
         EXPECT_TRUE(Receiver::closed_item(*observed.observation, expected));
         // Completion before actual issue, zero counters, or copied identity
         // must never mint the original owner's online completion fact.
-        region.receipt.issued_occurrence = 0;
+        region.receipt.item.issued_occurrence = 0;
         observed = read();
         ASSERT_TRUE(observed.observation);
         EXPECT_FALSE(Receiver::closed_item(*observed.observation, expected));
-        region.receipt.issued_occurrence = expected.occurrence;
-        --region.receipt.closed_occurrence;
+        region.receipt.item.issued_occurrence = expected.occurrence;
+        --region.receipt.item.closed_occurrence;
         observed = read();
         ASSERT_TRUE(observed.observation);
         EXPECT_FALSE(Receiver::closed_item(*observed.observation, expected));
-        region.receipt.closed_occurrence = expected.occurrence;
-        for (auto member : {&Request::boot_cookie, &Request::invocation_id, &Request::item,
-                            &Request::generation, &Request::occurrence}) {
+        region.receipt.item.closed_occurrence = expected.occurrence;
+        for (auto member :
+             {&Request::boot_cookie,
+              &Request::invocation_id,
+              &Request::item,
+              &Request::generation,
+              &Request::occurrence}) {
             Request foreign = expected;
             ++(foreign.*member);
             EXPECT_FALSE(Receiver::closed_item(*read().observation, foreign));
@@ -274,12 +280,12 @@ void check_item_witness_contract() {
         EXPECT_EQ(read().status, NiuHandoffReadStatus::Unpublished);
         region.receipt.publish_sequence = 3;
         EXPECT_EQ(read().status, NiuHandoffReadStatus::InProgress);
-        region.receipt.publish_sequence = 4;
+        region.receipt.publish_sequence = 6;
         change_after_body = true;
         EXPECT_EQ(read().status, NiuHandoffReadStatus::Changed);
-        EXPECT_EQ(Receiver::read_item([](uint32_t, std::span<std::byte>) {
-                      return NiuHandoffIoStatus::Failed;
-                  }).status, NiuHandoffReadStatus::IoFailure);
+        EXPECT_EQ(
+            Receiver::read_item([](uint32_t, std::span<std::byte>) { return NiuHandoffIoStatus::Failed; }).status,
+            NiuHandoffReadStatus::IoFailure);
     }
 }
 
@@ -289,10 +295,9 @@ TEST(NiuItemWitnessTest, RequiresStableOriginalItemAndPostIssueClosure) {
 
 template <class Receiver>
 concept exposes_item_request_writer = requires(
-    const typename Receiver::Write& write, const typename Receiver::Read& read,
-    const typename Receiver::ItemWitnessRequest& request) {
-    Receiver::write_item_request(write, read, request);
-};
+    const typename Receiver::Write& write,
+    const typename Receiver::Read& read,
+    const typename Receiver::ItemWitnessRequest& request) { Receiver::write_item_request(write, read, request); };
 
 template <class Receiver>
 void check_item_request_writer_contract() {
@@ -301,7 +306,7 @@ void check_item_request_writer_contract() {
     } else {
         using Request = typename Receiver::ItemWitnessRequest;
         using Region = typename Receiver::ItemWitnessRegion;
-        Request request{1, 7, 3, 5, 11, UINT64_C(1) << 35, (UINT64_C(1) << 36) + 1, 2, 1, 15, 2, 2, 0};
+        Request request{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, UINT64_C(1) << 35, 1, 2, 1, 15, 2, 2, 0};
         std::array<std::byte, sizeof(Region)> bytes;
         bytes.fill(std::byte{0xa5});
         std::vector<std::pair<uint32_t, size_t>> writes;
@@ -309,16 +314,20 @@ void check_item_request_writer_contract() {
         bool corrupt_readback = false;
         auto write = [&](uint32_t offset, std::span<const std::byte> source) {
             writes.emplace_back(offset, source.size());
-            if (fail_body || offset > bytes.size() || source.size() > bytes.size() - offset)
+            if (fail_body || offset > bytes.size() || source.size() > bytes.size() - offset) {
                 return NiuHandoffIoStatus::Failed;
+            }
             std::copy(source.begin(), source.end(), bytes.begin() + offset);
             return NiuHandoffIoStatus::Complete;
         };
         auto read = [&](uint32_t offset, std::span<std::byte> destination) {
-            if (offset > bytes.size() || destination.size() > bytes.size() - offset)
+            if (offset > bytes.size() || destination.size() > bytes.size() - offset) {
                 return NiuHandoffIoStatus::Failed;
+            }
             std::copy_n(bytes.begin() + offset, destination.size(), destination.begin());
-            if (corrupt_readback && destination.size() == bytes.size()) destination[24] ^= std::byte{1};
+            if (corrupt_readback && destination.size() == bytes.size()) {
+                destination[24] ^= std::byte{1};
+            }
             return NiuHandoffIoStatus::Complete;
         };
         EXPECT_EQ(Receiver::write_item_request(write, read, request), NiuHandoffWriteStatus::Published);
@@ -331,8 +340,8 @@ void check_item_request_writer_contract() {
         EXPECT_EQ(region.request.generation, request.generation);
         EXPECT_EQ(region.request.occurrence, request.occurrence);
         EXPECT_EQ(region.receipt.publish_sequence, 0u);
-        EXPECT_EQ(region.receipt.issued_occurrence, 0u);
-        EXPECT_EQ(region.receipt.closed_occurrence, 0u);
+        EXPECT_EQ(region.receipt.item.issued_occurrence, 0u);
+        EXPECT_EQ(region.receipt.item.closed_occurrence, 0u);
         writes.clear();
         corrupt_readback = true;
         EXPECT_EQ(Receiver::write_item_request(write, read, request), NiuHandoffWriteStatus::ReadbackMismatch);
@@ -353,6 +362,1187 @@ void check_item_request_writer_contract() {
 
 TEST(NiuItemWitnessTest, InitializesOnlyWithOrderedGenerationAndExactReadback) {
     check_item_request_writer_contract<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+concept exposes_item_witness_check =
+    requires(const NiuItemWitnessObservation& observation, const typename Receiver::ItemWitnessRequest& request) {
+        typename Receiver::ItemWitnessCheck;
+        Receiver::check_item(observation, request);
+    };
+
+template <class Receiver>
+void check_item_witness_outcome_contract() {
+    if constexpr (!exposes_item_witness_check<Receiver>) {
+        ADD_FAILURE() << "Item witness decoder conflates pending, rejection and invalid identity";
+    } else {
+        using Check = typename Receiver::ItemWitnessCheck;
+        typename Receiver::ItemWitnessRegion region{};
+        const typename Receiver::ItemWitnessRequest expected{
+            TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, UINT64_C(1) << 35, 1, 2, 1, 15, 2, 2, 0};
+        region.request = region.receipt.request = expected;
+        region.receipt.publish_sequence = 4;
+        const auto check = [&](const auto& original) {
+            const auto observed = Receiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) {
+                if (offset > sizeof(region) || bytes.size() > sizeof(region) - offset) {
+                    return NiuHandoffIoStatus::Failed;
+                }
+                std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            });
+            EXPECT_TRUE(observed.observation);
+            return Receiver::check_item(*observed.observation, original);
+        };
+        region.receipt.state = TT_NIU_ITEM_WITNESS_PENDING;
+        EXPECT_EQ(check(expected), Check::Pending);
+        region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+        region.receipt.item.issued_occurrence = expected.occurrence;
+        EXPECT_EQ(check(expected), Check::Pending);
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        EXPECT_EQ(check(expected), Check::OccurrenceMismatch);
+        region.receipt.item.closed_occurrence = expected.occurrence;
+        EXPECT_EQ(check(expected), Check::Match);
+        region.receipt.state = TT_NIU_ITEM_WITNESS_REJECTED;
+        region.receipt.item.closed_occurrence = 0;
+        EXPECT_EQ(check(expected), Check::Rejected);
+        auto foreign = expected;
+        ++foreign.invocation_id;
+        EXPECT_EQ(check(foreign), Check::RequestMismatch);
+        ++region.request.generation;
+        EXPECT_EQ(check(expected), Check::RequestMismatch);
+        region.request = expected;
+        region.receipt.request.selector = 14;
+        EXPECT_EQ(check(expected), Check::RequestMismatch);
+        region.receipt.request = expected;
+        foreign = expected;
+        foreign.occurrence = UINT64_MAX;
+        EXPECT_EQ(check(foreign), Check::InvalidRequest);
+        region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+        region.receipt.item.issued_occurrence = 0;
+        EXPECT_EQ(check(expected), Check::OccurrenceMismatch);
+        region.receipt.item.issued_occurrence = expected.occurrence;
+        region.receipt.item.closed_occurrence = expected.occurrence;
+        EXPECT_EQ(check(expected), Check::OccurrenceMismatch);
+        region.receipt.state = TT_NIU_ITEM_WITNESS_PENDING;
+        EXPECT_EQ(check(expected), Check::OccurrenceMismatch);
+    }
+}
+
+TEST(NiuItemWitnessTest, SeparatesPendingFromTerminalRejectAndIdentityMismatch) {
+    check_item_witness_outcome_contract<NiuHandoffReceiver>();
+}
+
+// These test the production reception algorithm, not LoadedFirmware or a
+// managed lease. ProgramExecution validates the actual owner before reception.
+void check_item_reception_stopped_contract() {
+    using Receiver = NiuHandoffReceiver;
+    using Reception = typename Receiver::ItemReception;
+    using Issuer = typename Reception::IssuerState;
+    using Status = typename Reception::Status;
+    const typename Receiver::ItemWitnessRequest expected{
+        TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, UINT64_C(1) << 35, 1, 2, 1, 15, 2, 2, 0};
+    typename Receiver::ItemWitnessRegion region{};
+    region.request = region.receipt.request = expected;
+    const auto read = [&] {
+        return Receiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) {
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        });
+    };
+    for (const auto sequence : {0u, 1u, 4u}) {
+        Reception reception(expected);
+        region.receipt.publish_sequence = sequence;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+        region.receipt.item.issued_occurrence = expected.occurrence;
+        region.receipt.item.closed_occurrence = 0;
+        EXPECT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, read()), Status::Rejected)
+            << "A stopped original issuer cannot advance an incomplete receipt";
+        EXPECT_FALSE(reception.accepted());
+        region.receipt.publish_sequence = 8;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        region.receipt.item.closed_occurrence = expected.occurrence;
+        EXPECT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, read()), Status::Rejected)
+            << "A terminal rejection cannot recover from later bytes";
+    }
+    Reception issued(expected);
+    region.receipt.publish_sequence = 0;
+    EXPECT_EQ(issued.receive(Issuer::Reserved, Issuer::Reserved, read()), Status::Pending);
+    EXPECT_EQ(issued.receive(Issuer::Issued, Issuer::Issued, read()), Status::Pending);
+    EXPECT_FALSE(issued.accepted());
+    region.receipt.publish_sequence = 8;
+    region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+    region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = expected.occurrence;
+    EXPECT_EQ(issued.receive(Issuer::Reserved, Issuer::Reserved, read()), Status::Pending);
+    EXPECT_FALSE(issued.accepted());
+    EXPECT_EQ(issued.receive(Issuer::Stopped, Issuer::Stopped, read()), Status::Rejected);
+    EXPECT_FALSE(issued.accepted());
+    EXPECT_FALSE(issued.terminal());
+}
+
+TEST(NiuItemWitnessReceptionTest, StoppedIssuerCannotLeaveIncompletePublicationPending) {
+    check_item_reception_stopped_contract();
+}
+
+void check_item_reception_retirement_contract() {
+    using Receiver = NiuHandoffReceiver;
+    using Reception = typename Receiver::ItemReception;
+    using Issuer = typename Reception::IssuerState;
+    using Status = typename Reception::Status;
+    const typename Receiver::ItemWitnessRequest expected{
+        TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, UINT64_C(1) << 35, 1, 2, 1, 15, 2, 2, 0};
+    typename Receiver::ItemWitnessRegion region{};
+    region.request = region.receipt.request = expected;
+    region.receipt.publish_sequence = 6;
+    region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+    region.receipt.item.issued_occurrence = expected.occurrence;
+    const auto read = [&] {
+        return Receiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) {
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        });
+    };
+    Reception first(expected);
+    auto second_request = expected;
+    ++second_request.item;
+    Reception second(second_request);
+    const auto all_accepted = [&] { return first.accepted() && second.accepted(); };
+    EXPECT_FALSE(all_accepted());
+    EXPECT_EQ(first.receive(Issuer::Issued, Issuer::Issued, read()), Status::Pending);
+    EXPECT_FALSE(all_accepted());
+    region.receipt.publish_sequence = 8;
+    region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+    region.receipt.item.closed_occurrence = expected.occurrence;
+    ASSERT_EQ(first.receive(Issuer::Issued, Issuer::Issued, read()), Status::Complete);
+    EXPECT_FALSE(all_accepted()) << "One accepted item cannot retire all items";
+    region.receipt.publish_sequence = 0;
+    EXPECT_EQ(first.receive(Issuer::Issued, Issuer::Issued, read()), Status::Complete);
+    ASSERT_TRUE(first.accepted());
+    EXPECT_EQ(first.accepted()->wire().receipt.publish_sequence, 8u);
+    EXPECT_EQ(first.accepted()->wire().receipt.request.item, expected.item);
+    region.request = region.receipt.request = second_request;
+    region.receipt.publish_sequence = 8;
+    region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+    region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = second_request.occurrence;
+    ASSERT_EQ(second.receive(Issuer::Issued, Issuer::Issued, read()), Status::Complete);
+    EXPECT_TRUE(all_accepted());
+    EXPECT_EQ(first.request().item, expected.item);
+    EXPECT_EQ(second.request().item, second_request.item);
+}
+
+TEST(NiuItemWitnessReceptionTest, RetainsExactAcceptedReceiptBeforeAllItemRetirement) {
+    check_item_reception_retirement_contract();
+}
+
+void check_sampled_item_reception_contract() {
+    using Reception = NiuHandoffReceiver::ItemReception;
+    using Issuer = typename Reception::IssuerState;
+    using Status = typename Reception::Status;
+    const NiuHandoffReceiver::ItemWitnessRequest expected{
+        TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+    NiuHandoffReceiver::ItemWitnessRegion region{};
+    region.request = region.receipt.request = expected;
+    const auto read = [&] {
+        return NiuHandoffReceiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) {
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        });
+    };
+    Reception rejected(expected);
+    const auto before_stop = read();
+    EXPECT_EQ(rejected.receive(Issuer::Issued, Issuer::Stopped, before_stop), Status::Pending);
+    EXPECT_FALSE(rejected.accepted());
+    EXPECT_EQ(rejected.receive(Issuer::Stopped, Issuer::Stopped, read()), Status::Rejected);
+    Reception completed(expected);
+    EXPECT_EQ(completed.receive(Issuer::Issued, Issuer::Stopped, before_stop), Status::Pending);
+    region.receipt.publish_sequence = 8;
+    region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+    region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = expected.occurrence;
+    EXPECT_EQ(completed.receive(Issuer::Stopped, Issuer::Stopped, read()), Status::Rejected);
+    EXPECT_FALSE(completed.accepted());
+    EXPECT_FALSE(completed.terminal());
+    Reception stopped_before_io(expected);
+    region.receipt.publish_sequence = 0;
+    EXPECT_EQ(stopped_before_io.receive(Issuer::Stopped, Issuer::Stopped, read()), Status::Rejected);
+}
+
+TEST(NiuItemWitnessReceptionTest, DiscardsPreStopSampleAndRequiresFreshStoppedPublication) {
+    check_sampled_item_reception_contract();
+}
+
+template <class Receiver>
+concept exposes_rolling_item_reception = requires(typename Receiver::ItemReception& reception) {
+    typename Receiver::ItemAcknowledgement;
+    typename Receiver::ItemWitnessAcknowledgement;
+    reception.acknowledgement();
+};
+
+// Exercise production byte transport and reception. No fixture constructs a
+// LoadedFirmware, ManagedInvocation lease or payload-reclamation capability.
+template <class Receiver>
+void check_rolling_item_reception() {
+    if constexpr (!exposes_rolling_item_reception<Receiver>) {
+        ADD_FAILURE() << "Item reception cannot acknowledge and receive a later device-origin occurrence";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        using Acknowledgement = typename Receiver::ItemAcknowledgement;
+        using Region = typename Receiver::ItemWitnessRegion;
+        using Request = typename Receiver::ItemWitnessRequest;
+        const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+        Region region{};
+        region.request = region.receipt.request = original;
+        const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+            if (offset > sizeof(region) || bytes.size() > sizeof(region) - offset) {
+                return NiuHandoffIoStatus::Failed;
+            }
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        std::vector<std::pair<uint32_t, size_t>> writes;
+        const auto write = [&](uint32_t offset, std::span<const std::byte> bytes) {
+            if (offset > sizeof(region) || bytes.size() > sizeof(region) - offset) {
+                return NiuHandoffIoStatus::Failed;
+            }
+            writes.emplace_back(offset, bytes.size());
+            std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        Reception reception(original);
+        EXPECT_FALSE(std::is_default_constructible_v<Acknowledgement>);
+        EXPECT_FALSE(std::is_aggregate_v<Acknowledgement>);
+        EXPECT_FALSE(reception.acknowledgement());
+        region.receipt.publish_sequence = 6;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+        region.receipt.item.issued_occurrence = original.occurrence;
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Pending);
+        EXPECT_FALSE(reception.acknowledgement());
+        region.receipt.publish_sequence = 8;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        region.receipt.item.closed_occurrence = original.occurrence;
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        ASSERT_TRUE(reception.accepted());
+        const auto first_observation = *reception.accepted();
+        const auto first_ack = reception.acknowledgement();
+        ASSERT_TRUE(first_ack);
+        EXPECT_EQ(first_ack->wire().closed_sequence, 8u);
+        EXPECT_EQ(first_ack->wire().request.occurrence, original.occurrence);
+        EXPECT_EQ(first_ack->wire().request.boot_cookie, original.boot_cookie);
+        EXPECT_EQ(first_ack->wire().request.invocation_id, original.invocation_id);
+        EXPECT_FALSE(reception.acknowledge(*first_ack)) << "An untransported acknowledgement grants no reuse";
+        Reception same_shaped(original);
+        ASSERT_EQ(same_shaped.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        EXPECT_FALSE(same_shaped.acknowledge(*first_ack)) << "Identical bytes do not transfer reception ownership";
+        ASSERT_EQ(Receiver::write_item_acknowledgement(write, read, *first_ack), NiuHandoffWriteStatus::Published);
+        constexpr uint32_t ack_offset = offsetof(Region, acknowledgement);
+        ASSERT_EQ(writes.size(), 3u);
+        EXPECT_EQ(writes[0], (std::pair<uint32_t, size_t>{ack_offset, sizeof(uint32_t)}));
+        EXPECT_EQ(
+            writes[1],
+            (std::pair<uint32_t, size_t>{
+                ack_offset + sizeof(uint32_t),
+                sizeof(typename Receiver::ItemWitnessAcknowledgement) - sizeof(uint32_t)}));
+        EXPECT_EQ(writes[2], (std::pair<uint32_t, size_t>{ack_offset, sizeof(uint32_t)}));
+        EXPECT_EQ(region.request.occurrence, original.occurrence);
+        EXPECT_EQ(region.receipt.publish_sequence, 8u);
+        EXPECT_EQ(region.receipt.item.closed_occurrence, original.occurrence);
+        ASSERT_TRUE(reception.acknowledge(*first_ack));
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_FALSE(reception.acknowledgement());
+        // The still-visible, already acknowledged Closed snapshot is ignored;
+        // it cannot report the first completion a second time.
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Pending);
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_FALSE(reception.acknowledge(*first_ack));
+        const uint64_t next = original.occurrence + 1;
+        region.receipt.request.occurrence = next;
+        region.receipt.publish_sequence = 10;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_PENDING;
+        region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = 0;
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Pending);
+        region.receipt.publish_sequence = 12;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+        region.receipt.item.issued_occurrence = next;
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Pending);
+        region.receipt.publish_sequence = 14;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        region.receipt.item.closed_occurrence = next;
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        ASSERT_TRUE(reception.accepted());
+        EXPECT_EQ(reception.accepted()->wire().receipt.item.closed_occurrence, next);
+        const auto second_ack = reception.acknowledgement();
+        ASSERT_TRUE(second_ack);
+        EXPECT_GT(second_ack->wire().publish_sequence, first_ack->wire().publish_sequence);
+        EXPECT_EQ(second_ack->wire().closed_sequence, 14u);
+        EXPECT_EQ(second_ack->wire().request.occurrence, next);
+        EXPECT_EQ(reception.request().occurrence, original.occurrence);
+        EXPECT_EQ(first_observation.wire().receipt.item.closed_occurrence, original.occurrence);
+        EXPECT_EQ(first_ack->wire().request.occurrence, original.occurrence);
+        EXPECT_FALSE(reception.acknowledge(*first_ack));
+        writes.clear();
+        ASSERT_EQ(Receiver::write_item_acknowledgement(write, read, *second_ack), NiuHandoffWriteStatus::Published);
+        ASSERT_TRUE(reception.acknowledge(*second_ack));
+    }
+}
+
+TEST(NiuItemWitnessRollingTest, AcknowledgesOnlyAcceptedClosedAndRetainsEachRoundSnapshot) {
+    check_rolling_item_reception<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_rolling_item_identity_rejections() {
+    if constexpr (!exposes_rolling_item_reception<Receiver>) {
+        ADD_FAILURE() << "Rolling item reception has no acknowledgement identity and monotonicity checks";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Region = typename Receiver::ItemWitnessRegion;
+        const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+        const auto closed = [&](Region& region, const Request& request, uint32_t sequence) {
+            region.request = original;
+            region.receipt.request = request;
+            region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+            region.receipt.publish_sequence = sequence;
+            region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = request.occurrence;
+        };
+        for (unsigned mutation = 0; mutation != 7; ++mutation) {
+            Region region{};
+            closed(region, original, 8);
+            const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+                std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            };
+            Reception reception(original);
+            ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+            const auto ack = reception.acknowledgement();
+            ASSERT_TRUE(ack);
+            const auto write = [&](uint32_t offset, std::span<const std::byte> bytes) {
+                std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            };
+            ASSERT_EQ(Receiver::write_item_acknowledgement(write, read, *ack), NiuHandoffWriteStatus::Published);
+            ASSERT_TRUE(reception.acknowledge(*ack));
+            auto next = original;
+            ++next.occurrence;
+            closed(region, next, 14);
+            switch (mutation) {
+                case 0: ++region.receipt.request.boot_cookie; break;
+                case 1: ++region.receipt.request.invocation_id; break;
+                case 2: --region.receipt.request.selector; break;
+                case 3:
+                    region.receipt.request.occurrence = original.occurrence - 1;
+                    region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence =
+                        original.occurrence - 1;
+                    break;
+                case 4: region.receipt.publish_sequence = 4; break;
+                case 5: region.receipt.request.occurrence = UINT64_MAX; break;
+                case 6: ++region.request.request_generation; break;
+            }
+            const auto status = reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read));
+            EXPECT_TRUE(status == Status::Rejected || status == Status::Invalidated) << mutation;
+            EXPECT_FALSE(reception.accepted());
+            EXPECT_FALSE(reception.acknowledgement());
+            closed(region, next, 14);
+            EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), status)
+                << "A poisoned transport cannot recover from later valid bytes";
+        }
+        // A later publication cannot erase an accepted but unacknowledged round.
+        Region region{};
+        closed(region, original, 8);
+        const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        Reception reception(original);
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        auto next = original;
+        ++next.occurrence;
+        closed(region, next, 14);
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        ASSERT_TRUE(reception.accepted());
+        EXPECT_EQ(reception.accepted()->wire().receipt.item.closed_occurrence, original.occurrence);
+        EXPECT_EQ(reception.acknowledgement()->wire().closed_sequence, 8u);
+        Request foreign = original;
+        ++foreign.invocation_id;
+        Reception other(foreign);
+        EXPECT_FALSE(other.acknowledge(*reception.acknowledgement()));
+    }
+}
+
+TEST(NiuItemWitnessRollingTest, RejectsForeignRegressingAndExhaustedRoundsWithoutLosingAcceptedItem) {
+    check_rolling_item_identity_rejections<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_rolling_acknowledgement_transport_failures() {
+    if constexpr (!exposes_rolling_item_reception<Receiver>) {
+        ADD_FAILURE() << "Rolling acknowledgement requires original reception and successful IO";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Region = typename Receiver::ItemWitnessRegion;
+        const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+        constexpr uint32_t ack_offset = offsetof(Region, acknowledgement);
+        for (unsigned failure = 0; failure != 9; ++failure) {
+            Region region{};
+            region.request = region.receipt.request = original;
+            region.receipt.publish_sequence = 8;
+            region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+            region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = original.occurrence;
+            unsigned writes = 0;
+            bool inject = false;
+            const unsigned failing_write = failure / 3 + 1;
+            const unsigned failure_kind = failure % 3;
+            const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+                if (inject && offset == ack_offset && writes == failing_write && failure_kind == 1) {
+                    return NiuHandoffIoStatus::Failed;
+                }
+                std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+                if (inject && offset == ack_offset && writes == failing_write && failure_kind == 2) {
+                    bytes.back() ^= std::byte{1};
+                }
+                return NiuHandoffIoStatus::Complete;
+            };
+            const auto write = [&](uint32_t offset, std::span<const std::byte> bytes) {
+                ++writes;
+                if (writes == failing_write && failure_kind == 0) {
+                    return NiuHandoffIoStatus::Failed;
+                }
+                std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            };
+            Reception reception(original);
+            ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+            const auto ack = reception.acknowledgement();
+            ASSERT_TRUE(ack);
+            inject = true;
+            const auto result = Receiver::write_item_acknowledgement(write, read, *ack);
+            EXPECT_EQ(
+                result, failure_kind == 2 ? NiuHandoffWriteStatus::ReadbackMismatch : NiuHandoffWriteStatus::IoFailure)
+                << failure;
+            EXPECT_FALSE(reception.acknowledge(*ack)) << failure;
+            ASSERT_TRUE(reception.accepted());
+            EXPECT_EQ(reception.accepted()->wire().receipt.item.closed_occurrence, original.occurrence);
+            EXPECT_EQ(ack->wire().closed_sequence, 8u);
+        }
+    }
+}
+
+TEST(NiuItemWitnessRollingTest, FailedAcknowledgementIoCannotOpenNextReception) {
+    check_rolling_acknowledgement_transport_failures<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_rolling_acknowledgement_lifetime() {
+    if constexpr (!exposes_rolling_item_reception<Receiver>) {
+        ADD_FAILURE() << "Rolling acknowledgement lacks lifetime validation";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Region = typename Receiver::ItemWitnessRegion;
+        const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+        const auto closed = [&] {
+            Region region{};
+            region.request = region.receipt.request = original;
+            region.receipt.publish_sequence = 8;
+            region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+            region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = original.occurrence;
+            return region;
+        };
+        Region region = closed();
+        unsigned writes = 0;
+        const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        const auto write = [&](uint32_t offset, std::span<const std::byte> bytes) {
+            ++writes;
+            std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        auto reception = std::make_unique<Reception>(original);
+        ASSERT_EQ(reception->receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        const auto abandoned = reception->acknowledgement();
+        ASSERT_TRUE(abandoned);
+        reception.reset();
+        EXPECT_EQ(Receiver::write_item_acknowledgement(write, read, *abandoned), NiuHandoffWriteStatus::InvalidRequest);
+        EXPECT_EQ(writes, 0u);
+        // Keeping the immutable old wire alive does not keep the abandoned
+        // reception writable or authorize a same-shaped replacement.
+        EXPECT_EQ(abandoned->wire().request.occurrence, original.occurrence);
+        Reception replacement(original);
+        ASSERT_EQ(replacement.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        EXPECT_FALSE(replacement.acknowledge(*abandoned));
+        const auto ack = replacement.acknowledgement();
+        ASSERT_TRUE(ack);
+        ++region.receipt.publish_sequence;
+        EXPECT_EQ(Receiver::write_item_acknowledgement(write, read, *ack), NiuHandoffWriteStatus::ReadbackMismatch);
+        EXPECT_EQ(writes, 0u);
+        EXPECT_FALSE(replacement.acknowledge(*ack));
+        region = closed();
+        ASSERT_EQ(Receiver::write_item_acknowledgement(write, read, *ack), NiuHandoffWriteStatus::Published);
+        ASSERT_TRUE(replacement.acknowledge(*ack));
+        writes = 0;
+        EXPECT_EQ(Receiver::write_item_acknowledgement(write, read, *ack), NiuHandoffWriteStatus::InvalidRequest);
+        EXPECT_EQ(writes, 0u);
+    }
+}
+
+TEST(NiuItemWitnessRollingTest, ExpiredChangedAndReplayedAcknowledgementsCannotWriteTheSlot) {
+    check_rolling_acknowledgement_lifetime<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_rolling_previous_receipt_after_progress() {
+    if constexpr (!exposes_rolling_item_reception<Receiver>) {
+        ADD_FAILURE() << "Rolling reception has no progress regression checks";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Region = typename Receiver::ItemWitnessRegion;
+        const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+        Region region{};
+        region.request = region.receipt.request = original;
+        region.receipt.publish_sequence = 8;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = original.occurrence;
+        const auto first = region.receipt;
+        const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        const auto write = [&](uint32_t offset, std::span<const std::byte> bytes) {
+            std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        Reception reception(original);
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+        const auto ack = reception.acknowledgement();
+        ASSERT_TRUE(ack);
+        ASSERT_EQ(Receiver::write_item_acknowledgement(write, read, *ack), NiuHandoffWriteStatus::Published);
+        ASSERT_TRUE(reception.acknowledge(*ack));
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Pending);
+        region.receipt.publish_sequence = 10;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_PENDING;
+        ++region.receipt.request.occurrence;
+        region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = 0;
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Pending);
+        region.receipt = first;
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Rejected);
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_FALSE(reception.acknowledgement());
+    }
+}
+
+TEST(NiuItemWitnessRollingTest, RejectsAcknowledgedReceiptAfterNewOccurrenceProgress) {
+    check_rolling_previous_receipt_after_progress<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_rolling_exact_round_sequences() {
+    if constexpr (!exposes_rolling_item_reception<Receiver>) {
+        ADD_FAILURE() << "Rolling reception lacks exact round publication sequence checks";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Region = typename Receiver::ItemWitnessRegion;
+        const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+        for (const auto [state, sequence] :
+             {std::pair{TT_NIU_ITEM_WITNESS_PENDING, 6u},
+              std::pair{TT_NIU_ITEM_WITNESS_ISSUED, 4u},
+              std::pair{TT_NIU_ITEM_WITNESS_CLOSED, 4u},
+              std::pair{TT_NIU_ITEM_WITNESS_CLOSED, 6u},
+              std::pair{TT_NIU_ITEM_WITNESS_CLOSED, 10u},
+              std::pair{TT_NIU_ITEM_WITNESS_CLOSED, UINT32_MAX - 1}}) {
+            Region region{};
+            region.request = region.receipt.request = original;
+            region.receipt.publish_sequence = sequence;
+            region.receipt.state = state;
+            if (state >= TT_NIU_ITEM_WITNESS_ISSUED) {
+                region.receipt.item.issued_occurrence = original.occurrence;
+            }
+            if (state == TT_NIU_ITEM_WITNESS_CLOSED) {
+                region.receipt.item.closed_occurrence = original.occurrence;
+            }
+            const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+                std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            };
+            Reception reception(original);
+            EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Rejected)
+                << state << '/' << sequence;
+            EXPECT_FALSE(reception.accepted());
+            EXPECT_FALSE(reception.acknowledgement());
+        }
+        // Host may miss intermediate publications, but the stable state still
+        // has the exact sequence allocated by the real arm/issue/close writer.
+        for (const auto next_sequence : {10u, 12u, 14u, 16u}) {
+            Region region{};
+            region.request = region.receipt.request = original;
+            region.receipt.publish_sequence = 8;
+            region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+            region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = original.occurrence;
+            const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+                std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            };
+            const auto write = [&](uint32_t offset, std::span<const std::byte> bytes) {
+                std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            };
+            Reception reception(original);
+            ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+            const auto ack = reception.acknowledgement();
+            ASSERT_TRUE(ack);
+            ASSERT_EQ(Receiver::write_item_acknowledgement(write, read, *ack), NiuHandoffWriteStatus::Published);
+            ASSERT_TRUE(reception.acknowledge(*ack));
+            ++region.receipt.request.occurrence;
+            region.receipt.publish_sequence = next_sequence;
+            region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence =
+                region.receipt.request.occurrence;
+            EXPECT_EQ(
+                reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)),
+                next_sequence == 14 ? Status::Complete : Status::Rejected)
+                << next_sequence;
+        }
+    }
+}
+
+TEST(NiuItemWitnessRollingTest, RejectsImpossiblePublicationSequencesAndAcceptsMissedIntermediateStates) {
+    check_rolling_exact_round_sequences<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_rolling_acknowledgement_publication_order() {
+    if constexpr (!exposes_rolling_item_reception<Receiver>) {
+        ADD_FAILURE() << "Rolling acknowledgement lacks odd/body/even publication";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        using Request = typename Receiver::ItemWitnessRequest;
+        using Region = typename Receiver::ItemWitnessRegion;
+        const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+        constexpr uint32_t ack_offset = offsetof(Region, acknowledgement);
+        Region region{};
+        region.request = region.receipt.request = original;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        std::vector<std::tuple<bool, uint32_t, size_t>> events;
+        bool exposed_mixed_stable_ack = false;
+        const auto read = [&](uint32_t offset, std::span<std::byte> bytes) {
+            if (offset >= ack_offset) {
+                events.emplace_back(false, offset, bytes.size());
+            }
+            std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+            return NiuHandoffIoStatus::Complete;
+        };
+        const auto write = [&](uint32_t offset, std::span<const std::byte> bytes) {
+            events.emplace_back(true, offset, bytes.size());
+            // A transport need not expose fields inside one write in address
+            // order. Expose its body first, as a real fragmented write may.
+            if (offset == ack_offset && bytes.size() > sizeof(uint32_t)) {
+                const auto old_sequence = region.acknowledgement.publish_sequence;
+                std::memcpy(
+                    reinterpret_cast<std::byte*>(&region) + offset + sizeof(uint32_t),
+                    bytes.data() + sizeof(uint32_t),
+                    bytes.size() - sizeof(uint32_t));
+                if (old_sequence && !(old_sequence & 1)) {
+                    exposed_mixed_stable_ack = true;
+                }
+                std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), sizeof(uint32_t));
+            } else {
+                std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+            }
+            return NiuHandoffIoStatus::Complete;
+        };
+        Reception reception(original);
+        for (unsigned round = 0; round != 2; ++round) {
+            region.receipt.publish_sequence = 6 * (round + 1) + 2;
+            region.receipt.request.occurrence = original.occurrence + round;
+            region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence =
+                region.receipt.request.occurrence;
+            ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, Receiver::read_item(read)), Status::Complete);
+            const auto ack = reception.acknowledgement();
+            ASSERT_TRUE(ack);
+            events.clear();
+            ASSERT_EQ(Receiver::write_item_acknowledgement(write, read, *ack), NiuHandoffWriteStatus::Published);
+            const std::vector<std::tuple<bool, uint32_t, size_t>> expected{
+                {true, ack_offset, sizeof(uint32_t)},
+                {false, ack_offset, sizeof(uint32_t)},
+                {true,
+                 ack_offset + sizeof(uint32_t),
+                 sizeof(typename Receiver::ItemWitnessAcknowledgement) - sizeof(uint32_t)},
+                {false, ack_offset, sizeof(typename Receiver::ItemWitnessAcknowledgement)},
+                {true, ack_offset, sizeof(uint32_t)},
+                {false, ack_offset, sizeof(typename Receiver::ItemWitnessAcknowledgement)}};
+            EXPECT_EQ(events, expected) << round;
+            ASSERT_TRUE(reception.acknowledge(*ack));
+        }
+        EXPECT_FALSE(exposed_mixed_stable_ack) << "A stable old ACK must be invalidated before its body changes";
+    }
+}
+
+TEST(NiuItemWitnessRollingTest, PublishesOddBeforeAnyAcknowledgementBodyAndEvenAfterVerifiedBody) {
+    check_rolling_acknowledgement_publication_order<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+concept exposes_item_series_reception = requires(const typename Receiver::ItemReception& reception) {
+    typename Receiver::ItemReception::SeriesTerminal;
+    reception.terminal()->final_count();
+    reception.closed_prefix();
+    reception.acknowledged_prefix();
+};
+
+// This fixture supplies transport bytes only. Production must prove source
+// termination and contiguous reception independently from real ACK transport.
+template <class Receiver>
+struct ItemSeriesMailbox {
+    using Region = typename Receiver::ItemWitnessRegion;
+    using Request = typename Receiver::ItemWitnessRequest;
+    Region region{};
+    const Request original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, 11, 13, 1, 2, 1, 15, 2, 2, 0};
+    ItemSeriesMailbox() { region.request = region.receipt.request = original; }
+    NiuHandoffIoStatus read(uint32_t offset, std::span<std::byte> bytes) const {
+        if (offset > sizeof(region) || bytes.size() > sizeof(region) - offset) {
+            return NiuHandoffIoStatus::Failed;
+        }
+        std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+        return NiuHandoffIoStatus::Complete;
+    }
+    NiuItemWitnessReadResult observe() const {
+        return Receiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) { return read(offset, bytes); });
+    }
+    void open() {
+        region.receipt = {};
+        region.receipt.request = original;
+        region.receipt.publish_sequence = 2;
+        region.receipt.state = 4;
+    }
+    void closed(uint64_t occurrence) {
+        region.receipt = {};
+        region.receipt.request = original;
+        region.receipt.request.occurrence = occurrence;
+        region.receipt.publish_sequence = 6 * occurrence + 2;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = occurrence;
+    }
+    void pending() {
+        closed(1);
+        region.receipt.publish_sequence = 4;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_PENDING;
+        region.receipt.item = {};
+    }
+    void end(uint64_t count) {
+        region.receipt = {};
+        region.receipt.request = original;
+        region.receipt.publish_sequence = 6 * count + 4;
+        region.receipt.state = 5;
+        region.receipt.series.final_count = count;
+        region.receipt.series.closed_sequence = count ? 6 * count + 2 : 0;
+        region.receipt.series.acknowledgement_sequence = 2 * count;
+    }
+    bool acknowledge(typename Receiver::ItemReception& reception) {
+        const auto ack = reception.acknowledgement();
+        if (!ack) {
+            return false;
+        }
+        const auto status = Receiver::write_item_acknowledgement(
+            [&](uint32_t offset, std::span<const std::byte> bytes) {
+                if (offset > sizeof(region) || bytes.size() > sizeof(region) - offset) {
+                    return NiuHandoffIoStatus::Failed;
+                }
+                std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+                return NiuHandoffIoStatus::Complete;
+            },
+            [&](uint32_t offset, std::span<std::byte> bytes) { return read(offset, bytes); },
+            *ack);
+        return status == NiuHandoffWriteStatus::Published && reception.acknowledge(*ack);
+    }
+};
+
+template <class Receiver>
+concept exposes_item_terminal_reception =
+    requires(const typename Receiver::ItemReception& reception) { reception.terminal(); };
+
+// These exercise final-round reception only. The original ManagedInvocation
+// still owns real stop, boot, token, allocation and device-epoch validation.
+template <class Receiver>
+void check_item_terminal_freshness() {
+    using Reception = typename Receiver::ItemReception;
+    using Issuer = typename Reception::IssuerState;
+    using Status = typename Reception::Status;
+    ItemSeriesMailbox<Receiver> mailbox;
+    Reception reception(mailbox.original);
+    mailbox.closed(1);
+    ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Complete);
+    const auto item = *reception.accepted();
+    EXPECT_FALSE(reception.terminal());
+    ASSERT_TRUE(mailbox.acknowledge(reception));
+    mailbox.end(1);
+    const auto before_stop = mailbox.observe();
+    EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Stopped, before_stop), Status::Pending);
+    EXPECT_FALSE(reception.terminal()) << "A pre-stop End is not a fresh stopped-writer publication";
+    ASSERT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Finished);
+    ASSERT_TRUE(reception.terminal());
+    EXPECT_EQ(reception.terminal()->observation().wire().receipt.publish_sequence, 10u);
+    EXPECT_EQ(reception.terminal()->final_count(), 1u);
+    EXPECT_EQ(item.wire().receipt.item.closed_occurrence, 1u);
+
+    ItemSeriesMailbox<Receiver> missing_end;
+    Reception incomplete(missing_end.original);
+    missing_end.closed(1);
+    ASSERT_EQ(incomplete.receive(Issuer::Issued, Issuer::Issued, missing_end.observe()), Status::Complete);
+    const auto old = *incomplete.accepted();
+    EXPECT_EQ(incomplete.receive(Issuer::Stopped, Issuer::Stopped, missing_end.observe()), Status::Rejected);
+    EXPECT_FALSE(incomplete.terminal()) << "Cached physical completion cannot hide the missing source End";
+    EXPECT_EQ(old.wire().receipt.item.closed_occurrence, 1u);
+}
+
+TEST(NiuItemWitnessTerminalTest, RequiresFreshStoppedObservationOfTheActualFinalRound) {
+    check_item_terminal_freshness<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_item_terminal_acknowledgement_order() {
+    using Reception = typename Receiver::ItemReception;
+    using Issuer = typename Reception::IssuerState;
+    using Status = typename Reception::Status;
+    for (const bool observe_end_online : {false, true}) {
+        ItemSeriesMailbox<Receiver> mailbox;
+        Reception reception(mailbox.original);
+        mailbox.closed(1);
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Complete);
+        const auto accepted = *reception.accepted();
+        const auto ack = reception.acknowledgement();
+        ASSERT_TRUE(ack);
+        ASSERT_TRUE(mailbox.acknowledge(reception));
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_FALSE(reception.terminal()) << "ACK alone grants no terminal or stopped proof";
+        mailbox.end(1);
+        if (observe_end_online) {
+            EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Pending);
+            EXPECT_FALSE(reception.terminal());
+        }
+        ASSERT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Finished);
+        ASSERT_TRUE(reception.terminal());
+        EXPECT_EQ(reception.terminal()->final_count(), 1u);
+        EXPECT_EQ(reception.terminal()->observation().wire().receipt.publish_sequence, 10u);
+        EXPECT_FALSE(reception.accepted()) << "The source End cannot redeliver an ACKed item";
+        EXPECT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Finished);
+        EXPECT_FALSE(reception.acknowledge(*ack));
+        EXPECT_EQ(accepted.wire().receipt.item.closed_occurrence, 1u);
+        EXPECT_EQ(ack->wire().request.occurrence, 1u);
+    }
+}
+
+TEST(NiuItemWitnessTerminalTest, PreservesFinalRoundAcrossAcknowledgementWithoutDuplicateCompletion) {
+    check_item_terminal_acknowledgement_order<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_item_terminal_latest_round() {
+    using Reception = typename Receiver::ItemReception;
+    using Issuer = typename Reception::IssuerState;
+    using Status = typename Reception::Status;
+    for (unsigned outcome = 0; outcome != 6; ++outcome) {
+        ItemSeriesMailbox<Receiver> mailbox;
+        Reception reception(mailbox.original);
+        mailbox.closed(1);
+        const auto first = mailbox.region.receipt;
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Complete);
+        const auto old = *reception.accepted();
+        const auto ack = reception.acknowledgement();
+        ASSERT_TRUE(ack);
+        ASSERT_TRUE(mailbox.acknowledge(reception));
+        mailbox.closed(2);
+        mailbox.region.receipt.publish_sequence = 10;
+        mailbox.region.receipt.state = TT_NIU_ITEM_WITNESS_PENDING;
+        mailbox.region.receipt.item = {};
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Pending);
+        switch (outcome) {
+            case 0: break;
+            case 1:
+                mailbox.region.receipt.publish_sequence = 12;
+                mailbox.region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+                mailbox.region.receipt.item.issued_occurrence = 2;
+                break;
+            case 2: mailbox.region.receipt = first; break;
+            default:
+                mailbox.closed(2);
+                if (outcome == 3) {
+                    ++mailbox.region.receipt.request.invocation_id;
+                }
+                if (outcome == 4) {
+                    mailbox.region.receipt.item.issued_occurrence = 0;
+                }
+                break;
+        }
+        const auto status = reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe());
+        EXPECT_TRUE(status == Status::Rejected || status == Status::Invalidated) << outcome;
+        EXPECT_FALSE(reception.terminal()) << "Even final Closed(2) must not stand in for source End(2)";
+        EXPECT_EQ(old.wire().receipt.item.closed_occurrence, 1u);
+        EXPECT_EQ(ack->wire().request.occurrence, 1u);
+    }
+}
+
+TEST(NiuItemWitnessTerminalTest, RejectsIncompleteForeignAndRegressingFinalRoundsAfterEarlierAcknowledgement) {
+    check_item_terminal_latest_round<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_zero_source_series() {
+    if constexpr (!exposes_item_series_reception<Receiver>) {
+        ADD_FAILURE() << "Receiver cannot distinguish explicit End(0) from an absent item";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        ItemSeriesMailbox<Receiver> mailbox;
+        Reception reception(mailbox.original);
+        mailbox.open();
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Pending);
+        mailbox.end(0);
+        EXPECT_EQ(reception.receive(Issuer::Reserved, Issuer::Reserved, mailbox.observe()), Status::Pending);
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Pending);
+        EXPECT_FALSE(reception.terminal());
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Stopped, mailbox.observe()), Status::Pending);
+        EXPECT_FALSE(reception.terminal());
+        ASSERT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::NotExecuted);
+        ASSERT_TRUE(reception.terminal());
+        EXPECT_EQ(reception.terminal()->final_count(), 0u);
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_FALSE(reception.acknowledgement());
+        EXPECT_EQ(reception.closed_prefix(), 0u);
+        EXPECT_EQ(reception.acknowledged_prefix(), 0u);
+    }
+}
+TEST(NiuItemWitnessSeriesTest, ZeroExecutionRequiresExplicitEndAndFreshStoppedRead) {
+    check_zero_source_series<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_source_series_missing_end() {
+    if constexpr (!exposes_item_series_reception<Receiver>) {
+        ADD_FAILURE() << "Receiver still infers series termination from stopped Closed";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        for (unsigned sample = 0; sample != 5; ++sample) {
+            ItemSeriesMailbox<Receiver> mailbox;
+            Reception reception(mailbox.original);
+            if (sample == 1) {
+                mailbox.open();
+            }
+            if (sample == 2) {
+                mailbox.pending();
+            }
+            if (sample >= 3) {
+                mailbox.closed(1);
+                if (sample == 3) {
+                    mailbox.region.receipt.publish_sequence = 6;
+                    mailbox.region.receipt.state = TT_NIU_ITEM_WITNESS_ISSUED;
+                    mailbox.region.receipt.item.closed_occurrence = 0;
+                }
+            }
+            EXPECT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Rejected)
+                << "Stopped sample " << sample << " cannot manufacture End";
+            EXPECT_FALSE(reception.terminal());
+        }
+        ItemSeriesMailbox<Receiver> mailbox;
+        Reception cached(mailbox.original);
+        mailbox.closed(1);
+        ASSERT_EQ(cached.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Complete);
+        EXPECT_EQ(cached.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Rejected);
+        EXPECT_FALSE(cached.terminal());
+    }
+}
+TEST(NiuItemWitnessSeriesTest, StoppedAbsentOpenPendingIssuedAndClosedDoNotProveEnd) {
+    check_source_series_missing_end<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_source_series_ack_frontier() {
+    if constexpr (!exposes_item_series_reception<Receiver>) {
+        ADD_FAILURE() << "Receiver lacks independent Closed and transported ACK frontiers";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        ItemSeriesMailbox<Receiver> mailbox;
+        Reception reception(mailbox.original);
+        mailbox.closed(1);
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Complete);
+        const auto snapshot = *reception.accepted();
+        EXPECT_EQ(reception.closed_prefix(), 1u);
+        EXPECT_EQ(reception.acknowledged_prefix(), 0u);
+        ASSERT_TRUE(mailbox.acknowledge(reception));
+        EXPECT_EQ(reception.acknowledged_prefix(), 1u);
+        mailbox.end(1);
+        EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Pending);
+        EXPECT_FALSE(reception.terminal());
+        ASSERT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Finished);
+        ASSERT_TRUE(reception.terminal());
+        EXPECT_EQ(reception.terminal()->final_count(), 1u);
+        EXPECT_EQ(snapshot.wire().receipt.item.closed_occurrence, 1u);
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_FALSE(reception.acknowledgement());
+        ItemSeriesMailbox<Receiver> unacknowledged;
+        Reception missing(unacknowledged.original);
+        unacknowledged.closed(1);
+        ASSERT_EQ(missing.receive(Issuer::Issued, Issuer::Issued, unacknowledged.observe()), Status::Complete);
+        const auto ack = missing.acknowledgement();
+        ASSERT_TRUE(ack);
+        EXPECT_FALSE(missing.acknowledge(*ack));
+        unacknowledged.end(1);
+        EXPECT_EQ(missing.receive(Issuer::Stopped, Issuer::Stopped, unacknowledged.observe()), Status::Rejected);
+        EXPECT_FALSE(missing.terminal());
+    }
+}
+TEST(NiuItemWitnessSeriesTest, EndRequiresReceivedAndTransportedAcknowledgedPrefix) {
+    check_source_series_ack_frontier<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_contiguous_source_series() {
+    if constexpr (!exposes_item_series_reception<Receiver>) {
+        ADD_FAILURE() << "Receiver does not require source-generated contiguous ordinals";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        ItemSeriesMailbox<Receiver> mailbox;
+        Reception reception(mailbox.original);
+        for (uint64_t occurrence = 1; occurrence != 3; ++occurrence) {
+            mailbox.closed(occurrence);
+            ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Complete);
+            ASSERT_TRUE(mailbox.acknowledge(reception));
+        }
+        mailbox.end(2);
+        ASSERT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Finished);
+        ASSERT_TRUE(reception.terminal());
+        EXPECT_EQ(reception.terminal()->final_count(), 2u);
+        EXPECT_EQ(reception.closed_prefix(), 2u);
+        EXPECT_EQ(reception.acknowledged_prefix(), 2u);
+        ItemSeriesMailbox<Receiver> skipped;
+        Reception gap(skipped.original);
+        skipped.closed(1);
+        ASSERT_EQ(gap.receive(Issuer::Issued, Issuer::Issued, skipped.observe()), Status::Complete);
+        ASSERT_TRUE(skipped.acknowledge(gap));
+        skipped.closed(3);
+        EXPECT_EQ(gap.receive(Issuer::Issued, Issuer::Issued, skipped.observe()), Status::Rejected);
+        EXPECT_FALSE(gap.terminal());
+    }
+}
+TEST(NiuItemWitnessSeriesTest, AcceptsTwoAcknowledgedRoundsAndRejectsSkippedOccurrence) {
+    check_contiguous_source_series<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_source_series_end_identity() {
+    if constexpr (!exposes_item_series_reception<Receiver>) {
+        ADD_FAILURE() << "Receiver has no explicit End identity and frontier validation";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        for (unsigned field = 0; field != 10; ++field) {
+            ItemSeriesMailbox<Receiver> mailbox;
+            Reception reception(mailbox.original);
+            mailbox.closed(1);
+            ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Complete);
+            ASSERT_TRUE(mailbox.acknowledge(reception));
+            mailbox.end(1);
+            switch (field) {
+                case 0: mailbox.region.receipt.series.final_count = 0; break;
+                case 1: mailbox.region.receipt.series.final_count = 2; break;
+                case 2: mailbox.region.receipt.series.closed_sequence = 6; break;
+                case 3: mailbox.region.receipt.series.acknowledgement_sequence = 0; break;
+                case 4: mailbox.region.receipt.series.reserved = 1; break;
+                case 5: mailbox.region.receipt.publish_sequence = 12; break;
+                case 6: ++mailbox.region.receipt.request.invocation_id; break;
+                case 7: ++mailbox.region.request.boot_cookie; break;
+                case 8: mailbox.region.receipt.request.occurrence = 2; break;
+                case 9: mailbox.region.receipt.series.final_count = UINT64_MAX; break;
+            }
+            const auto status = reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe());
+            EXPECT_TRUE(status == Status::Rejected || status == Status::Invalidated) << "field " << field;
+            EXPECT_FALSE(reception.terminal());
+        }
+    }
+}
+TEST(NiuItemWitnessSeriesTest, RejectsForeignMalformedEndAndUnprovedFrontier) {
+    check_source_series_end_identity<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_source_series_no_progress_after_end() {
+    if constexpr (!exposes_item_series_reception<Receiver>) {
+        ADD_FAILURE() << "Receiver cannot reject same-sequence End/Pending substitution";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        for (bool end_first : {false, true}) {
+            ItemSeriesMailbox<Receiver> mailbox;
+            Reception reception(mailbox.original);
+            if (end_first) {
+                mailbox.end(0);
+            } else {
+                mailbox.pending();
+            }
+            ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Pending);
+            if (end_first) {
+                mailbox.pending();
+            } else {
+                mailbox.end(0);
+            }
+            EXPECT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Status::Rejected);
+            EXPECT_FALSE(reception.terminal());
+        }
+    }
+}
+TEST(NiuItemWitnessSeriesTest, EndAndNextPendingCannotReplaceEachOtherAtTheSameSequence) {
+    check_source_series_no_progress_after_end<NiuHandoffReceiver>();
+}
+
+template <class Receiver>
+void check_source_series_zero_frontier() {
+    if constexpr (!exposes_item_series_reception<Receiver>) {
+        ADD_FAILURE() << "Receiver does not validate empty source-series and ACK frontiers";
+    } else {
+        using Reception = typename Receiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        using Status = typename Reception::Status;
+        for (unsigned field = 0; field != 5; ++field) {
+            ItemSeriesMailbox<Receiver> mailbox;
+            Reception reception(mailbox.original);
+            mailbox.end(0);
+            switch (field) {
+                case 0: mailbox.region.receipt.series.closed_sequence = 8; break;
+                case 1: mailbox.region.receipt.series.acknowledgement_sequence = 2; break;
+                case 2: mailbox.region.receipt.series.reserved = 1; break;
+                case 3: mailbox.region.receipt.publish_sequence = 2; break;
+                case 4: mailbox.region.acknowledgement.publish_sequence = 2; break;
+            }
+            EXPECT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Status::Rejected);
+            EXPECT_FALSE(reception.terminal());
+        }
+    }
+}
+TEST(NiuItemWitnessSeriesTest, EndZeroRequiresBothWireAndReceivedFrontiersToBeEmpty) {
+    check_source_series_zero_frontier<NiuHandoffReceiver>();
 }
 
 class NiuHandoffClusterTransportTest : public ::testing::Test {

@@ -710,6 +710,10 @@ bool Device::close() {
     this->disable_and_clear_program_cache();
     this->set_program_cache_misses_allowed(true);
 
+    // Mesh program caches may outlive their physical devices. Detach surviving
+    // programs while this device's allocator and statistics provider are valid.
+    this->detach_programs();
+
     default_allocator_.reset();
 
     this->ethernet_cores_.clear();
@@ -1143,6 +1147,19 @@ void Device::register_program(detail::ProgramImpl* program) {
 void Device::unregister_program(detail::ProgramImpl* program) {
     std::lock_guard<std::mutex> lock(active_programs_mutex_);
     active_programs_.erase(program);
+}
+
+void Device::detach_programs() {
+    std::unordered_set<detail::ProgramImpl*> programs;
+    {
+        std::lock_guard<std::mutex> lock(active_programs_mutex_);
+        programs.swap(active_programs_);
+    }
+    // Device close is quiescent. Do not hold the tracking mutex across callbacks
+    // that unregister programs or query the remaining allocation statistics.
+    for (auto* program : programs) {
+        program->deallocate_circular_buffers(this);
+    }
 }
 
 uint64_t Device::get_total_cb_allocated() const {

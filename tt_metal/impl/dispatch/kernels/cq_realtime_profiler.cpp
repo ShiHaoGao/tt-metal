@@ -34,6 +34,35 @@ volatile tt_l1_ptr realtime_profiler_msg_t* rt_profiler_msg =
 
 volatile RtProfilerRingBuffer* ring_buffer = reinterpret_cast<volatile RtProfilerRingBuffer*>(RING_BUFFER_ADDR);
 
+// The dispatch tile owns the queue. This reserved core copies only sealed
+// pages, then acknowledges each copied ordinal so no unconsumed slot is reused.
+__attribute__((noinline)) void dispatch_timing_drain() {
+    const uint32_t scratch = reinterpret_cast<uintptr_t>(&rt_profiler_msg->dispatch_timing_completed);
+    noc_async_read(get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, DISPATCH_TIMING_COMPLETED_ADDR),
+                   scratch, sizeof(uint32_t));
+    noc_async_read_barrier();
+    const uint32_t completed = rt_profiler_msg->dispatch_timing_completed;
+    uint32_t consumed = rt_profiler_msg->dispatch_timing_consumed;
+    while (consumed != completed) {
+        if (rt_ring_full(ring_buffer)) {
+            ring_buffer->ring_full_wait_count++;
+            while (rt_ring_full(ring_buffer)) invalidate_l1_cache();
+        }
+        const uint32_t source = DISPATCH_TIMING_RECORDS_ADDR +
+            (consumed % tt::dispatch_timing::capacity) * sizeof(realtime_profiler_dispatch_timing_t);
+        const uint32_t destination = rt_ring_data_addr(ring_buffer, ring_buffer->write_index);
+        noc_async_read(get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, source), destination,
+                       sizeof(realtime_profiler_dispatch_timing_t));
+        noc_async_read_barrier();
+        tt::dispatch_timing::publish_fence();
+        ring_buffer->write_index++;
+        rt_profiler_msg->dispatch_timing_consumed = ++consumed;
+        noc_inline_dw_write(get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, DISPATCH_TIMING_CONSUMED_ADDR),
+                            consumed);
+        noc_async_write_barrier();
+    }
+}
+
 // Read timestamps from dispatch_s into the next ring buffer slot
 __attribute__((noinline)) void realtime_profiler_read_and_enqueue(bool buffer_a) {
     // Heartbeat: ring_full_wait_count increments once per enqueue blocked on a full ring.
@@ -46,6 +75,9 @@ __attribute__((noinline)) void realtime_profiler_read_and_enqueue(bool buffer_a)
     }
 
     uint32_t slot_addr = rt_ring_data_addr(ring_buffer, ring_buffer->write_index);
+    auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot_addr);
+    for (uint32_t i = realtime_profiler_timestamp_size / sizeof(uint32_t); i < RT_PROFILER_ENTRY_SIZE / sizeof(uint32_t); ++i)
+        words[i] = 0;
 
     uint32_t dispatch_data_addr = buffer_a ? DISPATCH_DATA_ADDR_A : DISPATCH_DATA_ADDR_B;
     uint64_t dispatch_noc_addr = get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, dispatch_data_addr);
@@ -116,6 +148,7 @@ void kernel_main() {
 
     while (true) {
         invalidate_l1_cache();
+        dispatch_timing_drain();
 
         RealtimeProfilerState state = static_cast<RealtimeProfilerState>(rt_profiler_msg->realtime_profiler_state);
 

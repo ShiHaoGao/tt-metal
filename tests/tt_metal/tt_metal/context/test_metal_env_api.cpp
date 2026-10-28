@@ -171,6 +171,72 @@ TEST(MetalEnv, DefaultDescriptorFabricConfigIsDisabled) {
     EXPECT_EQ(settings.fabric_config_descriptor().fabric_config, tt_fabric::FabricConfig::DISABLED);
 }
 
+TEST(MetalEnv, PhysicalChipDiscoveryDefaultsToAllConnected) {
+    MetalEnvDescriptor settings;
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::AllConnected);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryExplicitlySelectsMmioOnly) {
+    MetalEnvDescriptor settings;
+    settings.set_physical_chip_discovery(PhysicalChipDiscovery::MmioOnly);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::MmioOnly);
+    EXPECT_FALSE(settings.is_mock_device());
+    settings.set_physical_chip_discovery(PhysicalChipDiscovery::AllConnected);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::AllConnected);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryRejectsUnknownModeWithoutMutation) {
+    MetalEnvDescriptor settings;
+    EXPECT_THROW(
+        settings.set_physical_chip_discovery(static_cast<PhysicalChipDiscovery>(255)), std::invalid_argument);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::AllConnected);
+    settings.set_physical_chip_discovery(PhysicalChipDiscovery::MmioOnly);
+    EXPECT_THROW(
+        settings.set_physical_chip_discovery(static_cast<PhysicalChipDiscovery>(255)), std::invalid_argument);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::MmioOnly);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryRejectsMockWithoutMutation) {
+    MetalEnvDescriptor settings(std::optional<std::string>{"mock-wormhole.yaml"});
+    EXPECT_THROW(settings.set_physical_chip_discovery(PhysicalChipDiscovery::MmioOnly), std::invalid_argument);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::AllConnected);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryRejectsFabricWithoutMutation) {
+    FabricConfigDescriptor fabric;
+    fabric.fabric_config = tt_fabric::FabricConfig::FABRIC_1D;
+    MetalEnvDescriptor settings(std::nullopt, fabric);
+    EXPECT_THROW(settings.set_physical_chip_discovery(PhysicalChipDiscovery::MmioOnly), std::invalid_argument);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::AllConnected);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryRejectsFabricTensixWithoutMutation) {
+    FabricConfigDescriptor fabric;
+    fabric.fabric_tensix_config = tt_fabric::FabricTensixConfig::MUX;
+    MetalEnvDescriptor settings(std::nullopt, fabric);
+    EXPECT_THROW(settings.set_physical_chip_discovery(PhysicalChipDiscovery::MmioOnly), std::invalid_argument);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::AllConnected);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryRejectsFabricUdmWithoutMutation) {
+    FabricConfigDescriptor fabric;
+    fabric.fabric_udm_mode = tt_fabric::FabricUDMMode::ENABLED;
+    MetalEnvDescriptor settings(std::nullopt, fabric);
+    EXPECT_THROW(settings.set_physical_chip_discovery(PhysicalChipDiscovery::MmioOnly), std::invalid_argument);
+    EXPECT_EQ(settings.physical_chip_discovery(), PhysicalChipDiscovery::AllConnected);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryClusterRejectsUnknownModeBeforeOpeningDriver) {
+    llrt::RunTimeOptions options;
+    EXPECT_THROW((Cluster{options, static_cast<PhysicalChipDiscovery>(255)}), std::invalid_argument);
+}
+
+TEST(MetalEnv, PhysicalChipDiscoveryClusterRejectsMockBeforeOpeningDriver) {
+    llrt::RunTimeOptions options;
+    options.set_mock_cluster_desc("mock-wormhole.yaml");
+    EXPECT_THROW((Cluster{options, PhysicalChipDiscovery::MmioOnly}), std::invalid_argument);
+}
+
 TEST(MetalEnv, FabricConfigPreservedThroughEnv) {
     FabricConfigDescriptor fc;
     fc.fabric_config = tt_fabric::FabricConfig::FABRIC_2D;

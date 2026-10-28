@@ -9,6 +9,13 @@
 
 namespace tt::tt_metal {
 
+// Selects which physical chips may enter an environment's UMD topology.
+// PCI/BDF visibility filtering still applies to the MMIO devices in either mode.
+enum class PhysicalChipDiscovery : std::uint8_t {
+    AllConnected = 0,
+    MmioOnly = 1,
+};
+
 /**
  * @brief Represents different types of hardware clusters
  *

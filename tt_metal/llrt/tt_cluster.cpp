@@ -218,8 +218,17 @@ bool Cluster::is_iommu_enabled() const { return this->iommu_enabled_; }
 
 bool Cluster::is_read_only_page_pinning_supported() const { return this->read_only_page_pinning_supported_; }
 
-Cluster::Cluster(llrt::RunTimeOptions& rtoptions) : rtoptions_(rtoptions) {
+Cluster::Cluster(llrt::RunTimeOptions& rtoptions, tt_metal::PhysicalChipDiscovery physical_chip_discovery) :
+    rtoptions_(rtoptions), physical_chip_discovery_(physical_chip_discovery) {
     ZoneScoped;
+    if (physical_chip_discovery_ != tt_metal::PhysicalChipDiscovery::AllConnected &&
+        physical_chip_discovery_ != tt_metal::PhysicalChipDiscovery::MmioOnly) {
+        throw std::invalid_argument("unknown physical chip discovery mode");
+    }
+    if (physical_chip_discovery_ == tt_metal::PhysicalChipDiscovery::MmioOnly &&
+        rtoptions_.get_target_device() != tt::TargetDevice::Silicon) {
+        throw std::invalid_argument("MMIO-only chip discovery requires physical silicon");
+    }
     log_info(tt::LogDevice, "Opening user mode device driver");
 
     this->detect_arch_and_target();
@@ -430,7 +439,14 @@ void Cluster::open_driver(const bool& /*skip_driver_allocs*/) {
     if (this->target_type_ == TargetDevice::Silicon) {
         device_driver = std::make_unique<tt::umd::Cluster>(tt::umd::ClusterOptions{
             .num_host_mem_ch_per_mmio_device = std::nullopt,  // Automatically determine number of host mem channels.
+            .topology_discovery_options = {
+                .discover_remote_devices = physical_chip_discovery_ != tt_metal::PhysicalChipDiscovery::MmioOnly,
+            },
         });
+        if (physical_chip_discovery_ == tt_metal::PhysicalChipDiscovery::MmioOnly &&
+            device_driver->get_target_device_ids() != device_driver->get_target_mmio_device_ids()) {
+            throw std::runtime_error("MMIO-only discovery returned a non-MMIO chip before driver startup");
+        }
     } else if (this->target_type_ == TargetDevice::Simulator) {
         const std::string sdesc_path = get_soc_description_file(this->arch_, this->target_type_, rtoptions_);
         std::unique_ptr<umd::ClusterDescriptor> mock_cluster_desc;

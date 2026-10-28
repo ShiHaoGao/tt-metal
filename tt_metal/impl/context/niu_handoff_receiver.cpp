@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "niu_handoff_receiver.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -12,6 +13,15 @@
 #include "llrt/tt_cluster.hpp"
 
 namespace tt::tt_metal::detail {
+
+struct NiuHandoffReceiver::ItemAcknowledgementState {
+    const ItemWitnessAcknowledgement wire;
+    const NiuItemWitnessObservation accepted;
+    const ItemWitnessAcknowledgement previous;
+    bool current = true;
+    bool published = false;
+};
+
 namespace {
 
 constexpr uint32_t all_nocs = (1u << TT_NIU_HANDOFF_NOC_COUNT) - 1;
@@ -40,10 +50,11 @@ bool valid_item_request(const tt_niu_item_witness_request& request) {
     return request.abi_version == TT_NIU_ITEM_WITNESS_VERSION && request.request_generation &&
            request.request_generation != UINT32_MAX && valid_identity(request.boot_cookie) &&
            valid_identity(request.invocation_id) && valid_identity(request.item) &&
-           valid_identity(request.generation) && valid_identity(request.occurrence) && request.leaf &&
-           request.noc < 2 && request.selector < 16 && (request.issuer == 1 || request.issuer == 2) &&
+           valid_identity(request.generation) && request.occurrence == 1 && request.leaf && request.noc < 2 &&
+           request.selector < 16 && (request.issuer == 1 || request.issuer == 2) &&
            (request.completion == TT_NIU_ITEM_READ_DESTINATION_LOCAL ||
-            request.completion == TT_NIU_ITEM_NONPOSTED_WRITE_ACKNOWLEDGED) && request.reserved == 0;
+            request.completion == TT_NIU_ITEM_NONPOSTED_WRITE_ACKNOWLEDGED) &&
+           request.reserved == 0;
 }
 
 bool same_item_request(const tt_niu_item_witness_request& lhs, const tt_niu_item_witness_request& rhs) {
@@ -52,6 +63,59 @@ bool same_item_request(const tt_niu_item_witness_request& lhs, const tt_niu_item
            lhs.generation == rhs.generation && lhs.occurrence == rhs.occurrence && lhs.leaf == rhs.leaf &&
            lhs.noc == rhs.noc && lhs.selector == rhs.selector && lhs.issuer == rhs.issuer &&
            lhs.completion == rhs.completion && lhs.reserved == rhs.reserved;
+}
+
+bool same_item_receipt(const tt_niu_item_witness_receipt& lhs, const tt_niu_item_witness_receipt& rhs) {
+    if (lhs.publish_sequence != rhs.publish_sequence || lhs.state != rhs.state ||
+        !same_item_request(lhs.request, rhs.request)) {
+        return false;
+    }
+    if (lhs.state == TT_NIU_ITEM_WITNESS_SERIES_OPEN || lhs.state == TT_NIU_ITEM_WITNESS_SERIES_END) {
+        return lhs.series.final_count == rhs.series.final_count &&
+               lhs.series.closed_sequence == rhs.series.closed_sequence &&
+               lhs.series.acknowledgement_sequence == rhs.series.acknowledgement_sequence &&
+               lhs.series.reserved == rhs.series.reserved;
+    }
+    return lhs.item.issued_occurrence == rhs.item.issued_occurrence &&
+           lhs.item.closed_occurrence == rhs.item.closed_occurrence && lhs.item.reserved == rhs.item.reserved;
+}
+
+bool same_item_acknowledgement(
+    const tt_niu_item_witness_acknowledgement& lhs, const tt_niu_item_witness_acknowledgement& rhs) {
+    if (lhs.publish_sequence != rhs.publish_sequence || lhs.closed_sequence != rhs.closed_sequence ||
+        !same_item_request(lhs.request, rhs.request)) {
+        return false;
+    }
+    for (size_t i = 0; i != 3; ++i) {
+        if (lhs.reserved[i] != rhs.reserved[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+NiuHandoffReceiver::ItemWitnessCheck check_item_receipt(
+    const tt_niu_item_witness_receipt& receipt, const tt_niu_item_witness_request& expected) {
+    using Check = NiuHandoffReceiver::ItemWitnessCheck;
+    if (!same_item_request(receipt.request, expected)) {
+        return Check::RequestMismatch;
+    }
+    if (receipt.state == TT_NIU_ITEM_WITNESS_REJECTED) {
+        return Check::Rejected;
+    }
+    if (receipt.state == TT_NIU_ITEM_WITNESS_PENDING) {
+        return !receipt.item.issued_occurrence && !receipt.item.closed_occurrence ? Check::Pending
+                                                                                  : Check::OccurrenceMismatch;
+    }
+    if (receipt.item.issued_occurrence != expected.occurrence) {
+        return Check::OccurrenceMismatch;
+    }
+    if (receipt.state == TT_NIU_ITEM_WITNESS_ISSUED) {
+        return !receipt.item.closed_occurrence ? Check::Pending : Check::OccurrenceMismatch;
+    }
+    return receipt.state == TT_NIU_ITEM_WITNESS_CLOSED && receipt.item.closed_occurrence == expected.occurrence
+               ? Check::Match
+               : Check::OccurrenceMismatch;
 }
 
 void encode_word(uint32_t value, std::span<std::byte> bytes) {
@@ -67,10 +131,7 @@ void encode_wide(uint64_t value, std::span<std::byte, sizeof(uint64_t)> bytes) {
     encode_word(static_cast<uint32_t>(value >> 32), bytes.subspan<4, 4>());
 }
 
-std::array<std::byte, sizeof(tt_niu_item_witness_region)> encode_item_region(
-    const tt_niu_item_witness_request& request) {
-    std::array<std::byte, sizeof(tt_niu_item_witness_region)> bytes{};
-    auto wire = std::span(bytes);
+void encode_item_request(const tt_niu_item_witness_request& request, std::span<std::byte, 64> wire) {
     encode_word(request.abi_version, wire.subspan<0, 4>());
     encode_word(request.request_generation, wire.subspan<4, 4>());
     encode_wide(request.boot_cookie, wire.subspan<8, 8>());
@@ -79,11 +140,29 @@ std::array<std::byte, sizeof(tt_niu_item_witness_region)> encode_item_region(
     encode_wide(request.generation, wire.subspan<32, 8>());
     encode_wide(request.occurrence, wire.subspan<40, 8>());
     encode_word(request.leaf, wire.subspan<48, 4>());
-    bytes[52] = std::byte(request.noc);
-    bytes[53] = std::byte(request.selector);
-    bytes[54] = std::byte(request.issuer);
-    bytes[55] = std::byte(request.completion);
+    wire[52] = std::byte(request.noc);
+    wire[53] = std::byte(request.selector);
+    wire[54] = std::byte(request.issuer);
+    wire[55] = std::byte(request.completion);
     encode_wide(request.reserved, wire.subspan<56, 8>());
+}
+
+std::array<std::byte, sizeof(tt_niu_item_witness_region)> encode_item_region(
+    const tt_niu_item_witness_request& request) {
+    std::array<std::byte, sizeof(tt_niu_item_witness_region)> bytes{};
+    encode_item_request(request, std::span(bytes).first<sizeof(tt_niu_item_witness_request)>());
+    return bytes;
+}
+
+std::array<std::byte, sizeof(tt_niu_item_witness_acknowledgement)> encode_item_acknowledgement(
+    const tt_niu_item_witness_acknowledgement& acknowledgement) {
+    std::array<std::byte, sizeof(tt_niu_item_witness_acknowledgement)> bytes{};
+    auto wire = std::span(bytes);
+    encode_word(acknowledgement.publish_sequence, wire.first<4>());
+    encode_word(acknowledgement.closed_sequence, wire.subspan<4, 4>());
+    encode_item_request(acknowledgement.request, wire.subspan<8, 64>());
+    for (size_t i = 0; i != 3; ++i)
+        encode_wide(acknowledgement.reserved[i], std::span<std::byte, 8>(wire.subspan(72 + i * 8, 8)));
     return bytes;
 }
 
@@ -190,49 +269,292 @@ NiuHandoffWriteStatus NiuHandoffReceiver::write_item_request(
     return observed == encoded ? NiuHandoffWriteStatus::Published : NiuHandoffWriteStatus::ReadbackMismatch;
 }
 
+NiuHandoffWriteStatus NiuHandoffReceiver::write_item_acknowledgement(
+    const Write& write, const Read& read, const ItemAcknowledgement& acknowledgement) {
+    const auto& state = acknowledgement.state_;
+    if (!state || !state->current || state->published) return NiuHandoffWriteStatus::InvalidRequest;
+    const auto observed = read_item(read);
+    if (observed.status == NiuHandoffReadStatus::IoFailure) return NiuHandoffWriteStatus::IoFailure;
+    if (observed.status != NiuHandoffReadStatus::Observed || !observed.observation)
+        return NiuHandoffWriteStatus::ReadbackMismatch;
+    const auto& original = state->accepted.wire();
+    const auto& current = observed.observation->wire();
+    if (!same_item_request(current.request, original.request) ||
+        !same_item_receipt(current.receipt, original.receipt) ||
+        !same_item_acknowledgement(current.acknowledgement, state->previous))
+        return NiuHandoffWriteStatus::ReadbackMismatch;
+
+    constexpr uint32_t offset = offsetof(ItemWitnessRegion, acknowledgement);
+    auto pending = state->wire;
+    --pending.publish_sequence;
+    const auto unpublished = encode_item_acknowledgement(pending);
+    const auto encoded = encode_item_acknowledgement(state->wire);
+    std::array<std::byte, sizeof(uint32_t)> sequence_readback{};
+    const auto odd = std::span(unpublished).first<sizeof(uint32_t)>();
+    std::array<std::byte, sizeof(ItemWitnessAcknowledgement)> readback{};
+    // Complete IO is ordered before its readback. Separate the odd word so a
+    // fragmented body write cannot expose new identity under the old even ACK.
+    if (write(offset, odd) != NiuHandoffIoStatus::Complete ||
+        read(offset, sequence_readback) != NiuHandoffIoStatus::Complete) return NiuHandoffWriteStatus::IoFailure;
+    if (!std::equal(sequence_readback.begin(), sequence_readback.end(), odd.begin()))
+        return NiuHandoffWriteStatus::ReadbackMismatch;
+    if (write(offset + sizeof(uint32_t), std::span(encoded).subspan<sizeof(uint32_t)>()) !=
+            NiuHandoffIoStatus::Complete ||
+        read(offset, readback) != NiuHandoffIoStatus::Complete) return NiuHandoffWriteStatus::IoFailure;
+    if (readback != unpublished) return NiuHandoffWriteStatus::ReadbackMismatch;
+    if (write(offset, std::span(encoded).first<sizeof(uint32_t)>()) != NiuHandoffIoStatus::Complete ||
+        read(offset, readback) != NiuHandoffIoStatus::Complete) return NiuHandoffWriteStatus::IoFailure;
+    if (readback != encoded) return NiuHandoffWriteStatus::ReadbackMismatch;
+    state->published = true;
+    return NiuHandoffWriteStatus::Published;
+}
+
 NiuItemWitnessReadResult NiuHandoffReceiver::read_item(const Read& read) {
     constexpr uint32_t sequence_offset = offsetof(ItemWitnessRegion, receipt);
-    const auto unavailable = [](NiuHandoffReadStatus status) {
-        return NiuItemWitnessReadResult{status, std::nullopt};
-    };
+    const auto unavailable = [](NiuHandoffReadStatus status) { return NiuItemWitnessReadResult{status, std::nullopt}; };
     std::array<std::byte, sizeof(uint32_t)> sequence;
-    if (read(sequence_offset, sequence) != NiuHandoffIoStatus::Complete)
+    if (read(sequence_offset, sequence) != NiuHandoffIoStatus::Complete) {
         return unavailable(NiuHandoffReadStatus::IoFailure);
+    }
     const auto first = decode_word(sequence);
-    if (!first) return unavailable(NiuHandoffReadStatus::Unpublished);
-    if (first & 1) return unavailable(NiuHandoffReadStatus::InProgress);
+    if (!first) {
+        return unavailable(NiuHandoffReadStatus::Unpublished);
+    }
+    if (first & 1) {
+        return unavailable(NiuHandoffReadStatus::InProgress);
+    }
     std::array<std::byte, sizeof(ItemWitnessRegion)> bytes;
     if (read(0, bytes) != NiuHandoffIoStatus::Complete ||
-        read(sequence_offset, sequence) != NiuHandoffIoStatus::Complete)
+        read(sequence_offset, sequence) != NiuHandoffIoStatus::Complete) {
         return unavailable(NiuHandoffReadStatus::IoFailure);
+    }
     const auto receipt = std::span<const std::byte>(bytes).subspan<64>();
-    if (decode_word(sequence) != first || decode_word(receipt.first<4>()) != first)
+    if (decode_word(sequence) != first || decode_word(receipt.first<4>()) != first) {
         return unavailable(NiuHandoffReadStatus::Changed);
+    }
     const auto state = decode_word(receipt.subspan<4, 4>());
-    if (state > TT_NIU_ITEM_WITNESS_REJECTED || decode_wide(receipt.subspan<88, 8>()) != 0)
+    if (state > TT_NIU_ITEM_WITNESS_SERIES_END || decode_wide(receipt.subspan<88, 8>()) != 0) {
         return unavailable(NiuHandoffReadStatus::Invalid);
-    ItemWitnessRegion region{decode_item_request(bytes),
-                             {first, state, decode_item_request(receipt.subspan<8, 64>()),
-                              decode_wide(receipt.subspan<72, 8>()), decode_wide(receipt.subspan<80, 8>()), 0}};
+    }
+    ItemWitnessRegion region{};
+    region.request = decode_item_request(bytes);
+    region.receipt.publish_sequence = first;
+    region.receipt.state = state;
+    region.receipt.request = decode_item_request(receipt.subspan<8, 64>());
+    if (state == TT_NIU_ITEM_WITNESS_SERIES_OPEN || state == TT_NIU_ITEM_WITNESS_SERIES_END) {
+        region.receipt.series = {
+            decode_wide(receipt.subspan<72, 8>()),
+            decode_word(receipt.subspan<80, 4>()),
+            decode_word(receipt.subspan<84, 4>()),
+            0};
+    } else {
+        region.receipt.item = {decode_wide(receipt.subspan<72, 8>()), decode_wide(receipt.subspan<80, 8>()), 0};
+    }
+    const auto acknowledgement =
+        std::span<const std::byte>(bytes).subspan<offsetof(ItemWitnessRegion, acknowledgement)>();
+    region.acknowledgement = {
+        decode_word(acknowledgement.first<4>()),
+        decode_word(acknowledgement.subspan<4, 4>()),
+        decode_item_request(acknowledgement.subspan<8, 64>()),
+        {decode_wide(acknowledgement.subspan<72, 8>()),
+         decode_wide(acknowledgement.subspan<80, 8>()),
+         decode_wide(acknowledgement.subspan<88, 8>())}};
     return {NiuHandoffReadStatus::Observed, NiuItemWitnessObservation(region)};
 }
 
-bool NiuHandoffReceiver::closed_item(
+NiuHandoffReceiver::ItemWitnessCheck NiuHandoffReceiver::check_item(
     const NiuItemWitnessObservation& observation, const ItemWitnessRequest& expected) {
     const auto& region = observation.wire();
-    return valid_item_request(expected) && same_item_request(region.request, expected) &&
-           same_item_request(region.receipt.request, expected) &&
-           region.receipt.state == TT_NIU_ITEM_WITNESS_CLOSED &&
-           region.receipt.issued_occurrence == expected.occurrence &&
-           region.receipt.closed_occurrence == expected.occurrence;
+    if (!valid_item_request(expected)) {
+        return ItemWitnessCheck::InvalidRequest;
+    }
+    if (!same_item_request(region.request, expected)) {
+        return ItemWitnessCheck::RequestMismatch;
+    }
+    return check_item_receipt(region.receipt, expected);
+}
+
+bool NiuHandoffReceiver::closed_item(const NiuItemWitnessObservation& observation, const ItemWitnessRequest& expected) {
+    return check_item(observation, expected) == ItemWitnessCheck::Match;
+}
+
+const NiuHandoffReceiver::ItemWitnessAcknowledgement& NiuHandoffReceiver::ItemAcknowledgement::wire() const {
+    return state_->wire;
+}
+
+NiuHandoffReceiver::ItemReception::ItemReception(ItemWitnessRequest request) : request_(request) {
+    if (!valid_item_request(request_)) {
+        status_ = Status::Invalidated;
+    }
+}
+
+NiuHandoffReceiver::ItemReception::~ItemReception() {
+    if (acknowledgement_) {
+        acknowledgement_->current = false;
+    }
+}
+
+std::optional<NiuHandoffReceiver::ItemAcknowledgement> NiuHandoffReceiver::ItemReception::acknowledgement() const {
+    if (status_ != Status::Complete || !acknowledgement_ || !acknowledgement_->current) {
+        return std::nullopt;
+    }
+    return ItemAcknowledgement(acknowledgement_);
+}
+
+bool NiuHandoffReceiver::ItemReception::acknowledge(const ItemAcknowledgement& acknowledgement) {
+    if (status_ != Status::Complete || !accepted_ || !acknowledgement_ || acknowledgement.state_ != acknowledgement_ ||
+        !acknowledgement_->current || !acknowledgement_->published || closed_prefix_ != acknowledged_prefix_ + 1 ||
+        accepted_->wire().receipt.request.occurrence != closed_prefix_) {
+        return false;
+    }
+    acknowledged_ = accepted_;
+    last_acknowledgement_ = acknowledgement_->wire;
+    acknowledgement_->current = false;
+    acknowledgement_.reset();
+    accepted_.reset();
+    acknowledged_prefix_ = closed_prefix_;
+    status_ = Status::Pending;
+    return true;
+}
+
+NiuHandoffReceiver::ItemReception::Status NiuHandoffReceiver::ItemReception::receive(
+    IssuerState sampled, IssuerState current, const NiuItemWitnessReadResult& observed) {
+    const bool stopped = sampled == IssuerState::Stopped && current == IssuerState::Stopped;
+    // A terminal series result is immutable. Online item delivery is cached
+    // only while its writer is still live; it cannot hide a missing final End.
+    if (status_ != Status::Pending && (status_ != Status::Complete || !stopped)) {
+        return status_;
+    }
+    const auto fail = [&](Status status) {
+        terminal_.reset();
+        if (acknowledgement_) {
+            acknowledgement_->current = false;
+        }
+        return status_ = status;
+    };
+    if (sampled == IssuerState::Reserved || current == IssuerState::Reserved) {
+        return Status::Pending;
+    }
+    // Stop raced this read. Only the next Stopped/read/Stopped sample can
+    // establish that the source epilogue's final publication really exists.
+    if (sampled == IssuerState::Issued && current == IssuerState::Stopped) {
+        return Status::Pending;
+    }
+    if (sampled == IssuerState::Stopped && current != IssuerState::Stopped) {
+        return fail(Status::Invalidated);
+    }
+    const auto pending = [&] { return stopped ? fail(Status::Rejected) : status_; };
+    switch (observed.status) {
+        case NiuHandoffReadStatus::Unpublished:
+        case NiuHandoffReadStatus::InProgress:
+        case NiuHandoffReadStatus::Changed: return pending();
+        case NiuHandoffReadStatus::IoFailure: return fail(Status::IoFailure);
+        case NiuHandoffReadStatus::Invalid: return fail(Status::Rejected);
+        case NiuHandoffReadStatus::Observed: break;
+    }
+    if (!observed.observation) {
+        return fail(Status::Rejected);
+    }
+    const auto& region = observed.observation->wire();
+    const auto& receipt = region.receipt;
+    auto identity = receipt.request;
+    identity.occurrence = request_.occurrence;
+    if (!same_item_request(region.request, request_) || !same_item_request(identity, request_)) {
+        return fail(Status::Invalidated);
+    }
+    if (!receipt.request.occurrence || receipt.request.occurrence == UINT64_MAX ||
+        receipt.state == TT_NIU_ITEM_WITNESS_REJECTED) {
+        return fail(Status::Rejected);
+    }
+    // End(N) and Pending(N+1) intentionally share a sequence. The state and
+    // entire body must therefore remain immutable at an observed sequence.
+    if (observed_) {
+        const auto& previous = observed_->wire().receipt;
+        if (receipt.publish_sequence < previous.publish_sequence ||
+            (receipt.publish_sequence == previous.publish_sequence && !same_item_receipt(receipt, previous)) ||
+            (previous.state == TT_NIU_ITEM_WITNESS_SERIES_END && !same_item_receipt(receipt, previous))) {
+            return fail(Status::Rejected);
+        }
+    }
+    if (receipt.state == TT_NIU_ITEM_WITNESS_SERIES_OPEN) {
+        if (stopped || !same_item_request(receipt.request, request_) || receipt.publish_sequence != 2 ||
+            receipt.series.final_count || receipt.series.closed_sequence || receipt.series.acknowledgement_sequence ||
+            closed_prefix_ || acknowledged_prefix_ || accepted_ ||
+            !same_item_acknowledgement(region.acknowledgement, last_acknowledgement_)) {
+            return fail(Status::Rejected);
+        }
+        observed_ = observed.observation;
+        return Status::Pending;
+    }
+    if (receipt.state == TT_NIU_ITEM_WITNESS_SERIES_END) {
+        const uint64_t count = receipt.series.final_count;
+        // Bound arithmetic before multiplying. These frontiers must come from
+        // original reception and successful ACK/readback, never receipt echo.
+        if (count > (UINT32_MAX - UINT64_C(4)) / 6 || accepted_ || !same_item_request(receipt.request, request_) ||
+            count != closed_prefix_ || count != acknowledged_prefix_ || receipt.publish_sequence != 6 * count + 4 ||
+            receipt.series.closed_sequence != (count ? 6 * count + 2 : 0) ||
+            receipt.series.acknowledgement_sequence != 2 * count ||
+            !same_item_acknowledgement(region.acknowledgement, last_acknowledgement_)) {
+            return fail(Status::Rejected);
+        }
+        observed_ = observed.observation;
+        if (!stopped) {
+            return Status::Pending;
+        }
+        terminal_ = SeriesTerminal(*observed.observation);
+        return status_ = count ? Status::Finished : Status::NotExecuted;
+    }
+    // A stopped writer owes an explicit End even when its last hardware
+    // operation is Closed and the exact final receipt was already ACKed.
+    if (stopped) {
+        return fail(Status::Rejected);
+    }
+    if (acknowledged_ && same_item_receipt(receipt, acknowledged_->wire().receipt)) {
+        return Status::Pending;
+    }
+    const uint64_t occurrence = acknowledged_prefix_ + 1;
+    const uint64_t base = 6 * acknowledged_prefix_ + 2;
+    if (closed_prefix_ != acknowledged_prefix_ || receipt.request.occurrence != occurrence || base > UINT32_MAX ||
+        !tt::niu_handoff::itemWitnessRoundAvailable(static_cast<uint32_t>(base)) ||
+        receipt.state > TT_NIU_ITEM_WITNESS_CLOSED ||
+        uint64_t(receipt.publish_sequence) != base + 2 * (uint64_t(receipt.state) + 1)) {
+        return fail(Status::Rejected);
+    }
+    auto expected = request_;
+    expected.occurrence = occurrence;
+    switch (check_item_receipt(receipt, expected)) {
+        case ItemWitnessCheck::Match: {
+            const auto next = tt::niu_handoff::advanceItemWitnessSequence(last_acknowledgement_.publish_sequence);
+            if (!next.available || next.sequence != 2 * occurrence) {
+                return fail(Status::Rejected);
+            }
+            accepted_ = observed.observation;
+            observed_ = observed.observation;
+            closed_prefix_ = occurrence;
+            ItemWitnessAcknowledgement wire{};
+            wire.publish_sequence = next.sequence;
+            wire.closed_sequence = receipt.publish_sequence;
+            wire.request = receipt.request;
+            acknowledgement_ = std::make_shared<ItemAcknowledgementState>(
+                ItemAcknowledgementState{wire, *accepted_, last_acknowledgement_});
+            return status_ = Status::Complete;
+        }
+        case ItemWitnessCheck::Pending: observed_ = observed.observation; return Status::Pending;
+        case ItemWitnessCheck::InvalidRequest:
+        case ItemWitnessCheck::RequestMismatch: return fail(Status::Invalidated);
+        case ItemWitnessCheck::Rejected:
+        case ItemWitnessCheck::OccurrenceMismatch: return fail(Status::Rejected);
+    }
+    return fail(Status::Rejected);
 }
 
 NiuHandoffReadResult NiuHandoffReceiver::read(
     const Cluster& cluster, const Hal& hal, ChipId chip, CoreCoord physical_worker) {
     const auto [core, base, size] = mailbox_address(cluster, hal, chip, physical_worker);
     return read([&](uint32_t offset, std::span<std::byte> bytes) {
-        if (offset > size || bytes.size() > size - offset)
+        if (offset > size || bytes.size() > size - offset) {
             throw std::out_of_range("NIU handoff read exceeds the HAL mailbox");
+        }
         cluster.read_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
         return NiuHandoffIoStatus::Complete;
     });

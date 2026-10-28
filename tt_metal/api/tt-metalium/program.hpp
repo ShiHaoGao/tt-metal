@@ -48,6 +48,9 @@ public:
 
     void set_runtime_id(ProgramId id);
     ProgramId get_runtime_id() const;
+    // One enqueue's explicit invocation identity; zero disables qualified timing.
+    void set_dispatch_timing_occurrence(uint64_t occurrence);
+    uint64_t get_dispatch_timing_occurrence() const;
 
     // Set before compilation or kernel-group projection. This is an explicit
     // worker-state contract, independent of kernel source/body mode. Program

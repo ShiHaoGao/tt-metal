@@ -39,6 +39,19 @@ public:
     void invalidate() { platform_.invalidate(); }
     uint32_t requestGeneration() { return region_.request.request_generation; }
     uint32_t receiptSequence() { return region_.receipt.publish_sequence; }
+    uint32_t acknowledgementSequence() { return region_.acknowledgement.publish_sequence; }
+    tt_niu_item_witness_acknowledgement readAcknowledgement() {
+        tt_niu_item_witness_acknowledgement acknowledgement;
+        const auto* input = reinterpret_cast<volatile const unsigned char*>(&region_.acknowledgement);
+        auto* output = reinterpret_cast<unsigned char*>(&acknowledgement);
+#ifdef __clang__
+#pragma clang loop unroll(disable) interleave(disable) vectorize(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 0
+#endif
+        for (unsigned byte = 0; byte != sizeof(acknowledgement); ++byte) output[byte] = input[byte];
+        return acknowledgement;
+    }
     tt_niu_item_witness_request readRequest() {
         tt_niu_item_witness_request request;
         const auto* input = reinterpret_cast<volatile const unsigned char*>(&region_.request);
@@ -77,14 +90,51 @@ private:
     Platform& platform_;
 };
 
-// One instance owns one immutable, SDK-initialized slot. It is deliberately
-// single-use: safe rolling-slot reuse requires a separate acknowledged
-// generation frontier and cannot be inferred from the previous Closed state.
+// One qualified issuing processor owns this immutable SDK-initialized slot.
+// Begin requires exact host acknowledgement of the previous Closed receipt.
+// The compiler independently keeps begin after Channel visibility/last-use and
+// all-consumer release; this transport never proves payload backing reuse.
 class ItemWitnessPublisher final {
+    enum class Boundary { Issue, Close };
+
+    template <Boundary boundary>
+    class BoundaryTicket final {
+    public:
+        BoundaryTicket(const BoundaryTicket&) = delete;
+        BoundaryTicket& operator=(const BoundaryTicket&) = delete;
+        BoundaryTicket(BoundaryTicket&& other) noexcept :
+            owner_(other.owner_), occurrence_(other.occurrence_), sequence_(other.sequence_), request_(other.request_) {
+            other.owner_ = nullptr;
+        }
+        BoundaryTicket& operator=(BoundaryTicket&&) = delete;
+        explicit operator bool() const { return owner_ != nullptr; }
+
+    private:
+        friend class ItemWitnessPublisher;
+        BoundaryTicket(ItemWitnessPublisher* owner, uint64_t occurrence, uint32_t sequence) :
+            owner_(owner), occurrence_(occurrence), sequence_(sequence),
+            request_(owner ? owner->request_ : tt_niu_item_witness_request{}) {}
+        ItemWitnessPublisher* owner_;
+        uint64_t occurrence_;
+        uint32_t sequence_;
+        tt_niu_item_witness_request request_;
+    };
+
 public:
+    enum class SeriesBeginStatus { Pending, Begun, Rejected };
+    enum class SeriesFinishStatus { Pending, NotExecuted, Finished, Rejected };
+    using IssueTicket = BoundaryTicket<Boundary::Issue>;
+    using CloseTicket = BoundaryTicket<Boundary::Close>;
+    ItemWitnessPublisher() = default;
+    ItemWitnessPublisher(const ItemWitnessPublisher&) = delete;
+    ItemWitnessPublisher& operator=(const ItemWitnessPublisher&) = delete;
+    ItemWitnessPublisher(ItemWitnessPublisher&&) = delete;
+    ItemWitnessPublisher& operator=(ItemWitnessPublisher&&) = delete;
     template <typename IO>
-    bool arm(IO& io) {
-        if (phase_ != Phase::Cold) return false;
+    bool open(IO& io) {
+        if (phase_ != Phase::Cold) {
+            return false;
+        }
         io.invalidate();
         const auto sequence = io.receiptSequence();
         const auto generation = io.requestGeneration();
@@ -96,44 +146,186 @@ public:
             return false;
         }
         receipt_.request = request_;
-        phase_ = Phase::Armed;
-        return true;
+        receipt_.series = {};
+        phase_ = Phase::Open;
+        // This excludes a second sequential instance on the one qualified
+        // processor; it is not a cross-RISC atomic claim. Compiler qualification
+        // must exclude other issuers and prevent the formal from escaping.
+        return publish(io, TT_NIU_ITEM_WITNESS_SERIES_OPEN);
     }
 
-    template <typename IO, typename Issue>
-    bool issue(IO& io, Issue&& issue_body) {
-        if (phase_ != Phase::Armed) return false;
-        if (!unchanged(io)) return reject(io);
-        issue_body();  // The generated algorithm owns actual scoped issue.
+    template <typename IO>
+    SeriesBeginStatus begin(IO& io) {
+        if (phase_ != Phase::Open && phase_ != Phase::Closed) {
+            return SeriesBeginStatus::Rejected;
+        }
+        if (!unchanged(io)) {
+            reject(io);
+            return SeriesBeginStatus::Rejected;
+        }
+        if (phase_ == Phase::Closed) {
+            const auto status = acknowledge(io);
+            if (status == AcknowledgementStatus::Pending) {
+                return SeriesBeginStatus::Pending;
+            }
+            if (status == AcknowledgementStatus::Rejected) {
+                reject(io);
+                return SeriesBeginStatus::Rejected;
+            }
+        }
+        if (!itemWitnessRoundAvailable(receipt_.publish_sequence) || occurrence_count_ == UINT64_MAX - 1) {
+            reject(io);
+            return SeriesBeginStatus::Rejected;
+        }
+        receipt_.request = request_;
+        receipt_.request.occurrence = ++occurrence_count_;
+        receipt_.item = {};
+        phase_ = Phase::Armed;
+        if (!publish(io, TT_NIU_ITEM_WITNESS_PENDING)) {
+            return SeriesBeginStatus::Rejected;
+        }
+        return SeriesBeginStatus::Begun;
+    }
+
+    template <typename IO>
+    SeriesFinishStatus finish(IO& io) {
+        if (phase_ != Phase::Open && phase_ != Phase::Closed) {
+            if (phase_ == Phase::Armed || phase_ == Phase::Issuing || phase_ == Phase::Issued ||
+                phase_ == Phase::Closing) {
+                reject(io);
+            }
+            return SeriesFinishStatus::Rejected;
+        }
+        if (!unchanged(io)) {
+            reject(io);
+            return SeriesFinishStatus::Rejected;
+        }
+        if (phase_ == Phase::Closed) {
+            const auto status = acknowledge(io);
+            if (status == AcknowledgementStatus::Pending) return SeriesFinishStatus::Pending;
+            if (status == AcknowledgementStatus::Rejected) {
+                reject(io);
+                return SeriesFinishStatus::Rejected;
+            }
+        }
+        // The source epilogue publishes its actual final count. In particular,
+        // zero execution and the last ACK never create a phantom Pending item.
+        receipt_.request = request_;
+        receipt_.series = {occurrence_count_, acknowledged_closed_, acknowledged_sequence_, 0};
+        phase_ = Phase::Ended;
+        if (!publish(io, TT_NIU_ITEM_WITNESS_SERIES_END)) return SeriesFinishStatus::Rejected;
+        return occurrence_count_ ? SeriesFinishStatus::Finished : SeriesFinishStatus::NotExecuted;
+    }
+
+    // Split boundaries allow the compiler to keep actual issue and wait in
+    // their original structured control flow. A ticket binds one publisher,
+    // immutable SDK request, source occurrence and publication frontier; it
+    // is not a completion fact.
+    // The compiler independently proves the intervening issue or scoped wait.
+    template <typename IO>
+    IssueTicket startIssue(IO& io) {
+        if (phase_ != Phase::Armed) return IssueTicket(nullptr, 0, 0);
+        if (!unchanged(io)) {
+            reject(io);
+            return IssueTicket(nullptr, 0, 0);
+        }
+        phase_ = Phase::Issuing;
+        return IssueTicket(this, receipt_.request.occurrence, receipt_.publish_sequence);
+    }
+
+    template <typename IO>
+    bool completeIssue(IO& io, IssueTicket&& ticket) {
+        if (!consume(ticket, Phase::Issuing)) return false;
         io.invalidate();
         if (!unchanged(io)) return reject(io);
-        receipt_.issued_occurrence = request_.occurrence;
+        receipt_.item.issued_occurrence = receipt_.request.occurrence;
         phase_ = Phase::Issued;
         return publish(io, TT_NIU_ITEM_WITNESS_ISSUED);
     }
 
-    template <typename IO, typename Wait>
-    bool close(IO& io, Wait&& scoped_wait) {
-        if (phase_ != Phase::Issued) return false;
-        if (!unchanged(io)) return reject(io);
-        scoped_wait();  // Exact read/nonposted-write TRID barrier, not queue wait.
+    template <typename IO>
+    CloseTicket startClose(IO& io) {
+        if (phase_ != Phase::Issued) return CloseTicket(nullptr, 0, 0);
+        if (!unchanged(io)) {
+            reject(io);
+            return CloseTicket(nullptr, 0, 0);
+        }
+        phase_ = Phase::Closing;
+        return CloseTicket(this, receipt_.request.occurrence, receipt_.publish_sequence);
+    }
+
+    template <typename IO>
+    bool completeClose(IO& io, CloseTicket&& ticket) {
+        if (!consume(ticket, Phase::Closing)) return false;
         io.invalidate();
         if (!unchanged(io)) return reject(io);
         const auto selector = io.selectorObserved(request_.noc, request_.selector);
         if (selector.outstanding || selector.outgoing) return reject(io);
-        receipt_.closed_occurrence = request_.occurrence;
+        receipt_.item.closed_occurrence = receipt_.request.occurrence;
         phase_ = Phase::Closed;
         return publish(io, TT_NIU_ITEM_WITNESS_CLOSED);
     }
 
+    template <typename IO, typename Issue>
+    bool issue(IO& io, Issue&& issue_body) {
+        auto ticket = startIssue(io);
+        if (!ticket) return false;
+        issue_body();  // The generated algorithm owns actual scoped issue.
+        return completeIssue(io, static_cast<IssueTicket&&>(ticket));
+    }
+
+    template <typename IO, typename Wait>
+    bool close(IO& io, Wait&& scoped_wait) {
+        auto ticket = startClose(io);
+        if (!ticket) return false;
+        scoped_wait();  // Exact read/nonposted-write TRID barrier, not queue wait.
+        return completeClose(io, static_cast<CloseTicket&&>(ticket));
+    }
+
 private:
-    enum class Phase { Cold, Armed, Issued, Closed, Poisoned };
+    enum class Phase { Cold, Open, Armed, Issuing, Issued, Closing, Closed, Ended, Poisoned };
+    enum class AcknowledgementStatus { Pending, Accepted, Rejected };
+    template <Boundary boundary>
+    bool consume(BoundaryTicket<boundary>& ticket, Phase expected) {
+        const bool matches = ticket.owner_ == this && phase_ == expected &&
+                             ticket.occurrence_ == receipt_.request.occurrence &&
+                             ticket.sequence_ == receipt_.publish_sequence && same(ticket.request_, request_);
+        ticket.owner_ = nullptr;
+        return matches;
+    }
+    template <typename IO>
+    AcknowledgementStatus acknowledge(IO& io) {
+        io.invalidate();
+        const uint32_t sequence = io.acknowledgementSequence();
+        if (!sequence || (sequence & 1)) return AcknowledgementStatus::Pending;
+        const tt_niu_item_witness_acknowledgement acknowledgement = io.readAcknowledgement();
+        io.invalidate();
+        if (sequence != io.acknowledgementSequence() || sequence != acknowledgement.publish_sequence)
+            return AcknowledgementStatus::Pending;
+        // A previous round may remain visible until the new host publication.
+        for (const auto reserved : acknowledgement.reserved)
+            if (reserved) return AcknowledgementStatus::Rejected;
+        if (sequence == acknowledged_sequence_) {
+            if (acknowledgement.closed_sequence != acknowledged_closed_ ||
+                !same(acknowledgement.request, acknowledged_request_)) return AcknowledgementStatus::Rejected;
+            return AcknowledgementStatus::Pending;
+        }
+        const auto next = advanceItemWitnessSequence(acknowledged_sequence_);
+        if (!next.available || sequence != next.sequence ||
+            acknowledgement.closed_sequence != receipt_.publish_sequence ||
+            !same(acknowledgement.request, receipt_.request)) return AcknowledgementStatus::Rejected;
+        if (!unchanged(io)) return AcknowledgementStatus::Rejected;
+        acknowledged_sequence_ = sequence;
+        acknowledged_closed_ = acknowledgement.closed_sequence;
+        acknowledged_request_ = acknowledgement.request;
+        return AcknowledgementStatus::Accepted;
+    }
     static bool valid(const tt_niu_item_witness_request& request) {
         return request.abi_version == TT_NIU_ITEM_WITNESS_VERSION && request.request_generation &&
                request.request_generation != UINT32_MAX && request.boot_cookie && request.boot_cookie != UINT64_MAX &&
                request.invocation_id && request.invocation_id != UINT64_MAX && request.item && request.item != UINT64_MAX &&
-               request.generation && request.generation != UINT64_MAX && request.occurrence &&
-               request.occurrence != UINT64_MAX && request.leaf && request.noc < 2 && request.selector < 16 &&
+               request.generation && request.generation != UINT64_MAX && request.occurrence == 1 &&
+               request.leaf && request.noc < 2 && request.selector < 16 &&
                (request.issuer == 1 || request.issuer == 2) &&
                (request.completion == TT_NIU_ITEM_READ_DESTINATION_LOCAL ||
                 request.completion == TT_NIU_ITEM_NONPOSTED_WRITE_ACKNOWLEDGED) && request.reserved == 0;
@@ -152,29 +344,35 @@ private:
         const auto request = io.readRequest();
         io.invalidate();
         return generation == request_.request_generation && generation == io.requestGeneration() &&
-               same(request, request_);
+               io.receiptSequence() == receipt_.publish_sequence && same(request, request_);
     }
     template <typename IO>
     bool publish(IO& io, uint32_t state) {
-        if (receipt_.publish_sequence > UINT32_MAX - 2) {
+        const auto next = advanceItemWitnessSequence(receipt_.publish_sequence);
+        if (!next.available) {
             phase_ = Phase::Poisoned;
             return false;
         }
         receipt_.state = state;
-        receipt_.publish_sequence += 2;
+        receipt_.publish_sequence = next.sequence;
         io.publish(receipt_);
         return true;
     }
     template <typename IO>
     bool reject(IO& io) {
         phase_ = Phase::Poisoned;
-        receipt_.closed_occurrence = 0;
-        publish(io, TT_NIU_ITEM_WITNESS_REJECTED);
+        receipt_.item.closed_occurrence = 0;
+        // A changed sequence is another publication, not our slot to overwrite.
+        if (io.receiptSequence() == receipt_.publish_sequence) publish(io, TT_NIU_ITEM_WITNESS_REJECTED);
         return false;
     }
     Phase phase_ = Phase::Cold;
     tt_niu_item_witness_request request_{};
     tt_niu_item_witness_receipt receipt_{};
+    uint64_t occurrence_count_ = 0;
+    uint32_t acknowledged_sequence_ = 0;
+    uint32_t acknowledged_closed_ = 0;
+    tt_niu_item_witness_request acknowledged_request_{};
 };
 
 // The IO boundary is the actual firmware MMIO/L1 adapter. No caller can
@@ -186,6 +384,13 @@ public:
     using ItemWitnessRequest = tt_niu_item_witness_request;
     using ItemWitnessReceipt = tt_niu_item_witness_receipt;
     using ItemWitnessRegion = tt_niu_item_witness_region;
+    using ItemWitnessAcknowledgement = tt_niu_item_witness_acknowledgement;
+    static constexpr ItemWitnessSequenceAdvance advanceItemWitnessSequence(uint32_t current) {
+        return tt::niu_handoff::advanceItemWitnessSequence(current);
+    }
+    static constexpr bool itemWitnessRoundAvailable(uint32_t current) {
+        return tt::niu_handoff::itemWitnessRoundAvailable(current);
+    }
     template <typename Platform>
     using ItemMemory = ItemWitnessMemory<Platform>;
     template <typename IO>

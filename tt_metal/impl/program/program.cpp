@@ -2256,7 +2256,7 @@ void detail::ProgramImpl::allocate_circular_buffers(const IDevice* device) {
     // If CB layout already calculated, skip allocation but report for new devices
     if (not this->local_circular_buffer_allocation_needed_) {
         // Report CB allocations for any NEW devices (using cached addresses)
-        if (!new_devices.empty() && !this->circular_buffers_.empty()) {
+        if (!new_devices.empty()) {
             for (const IDevice* dev : new_devices) {
                 for (const auto& circular_buffer : this->circular_buffers_) {
                     if (!circular_buffer->globally_allocated()) {
@@ -2403,26 +2403,26 @@ std::map<CoreCoord, std::vector<std::pair<uint64_t, uint64_t>>> detail::ProgramI
 }
 
 void detail::ProgramImpl::deallocate_circular_buffers() {
-    // Deallocate all circular buffers for this program on ALL devices
-    // This notifies the GraphTracker to report deallocations
-    if (!this->cb_devices_.empty() && !this->circular_buffers_.empty()) {
-        for (const IDevice* idevice : this->cb_devices_) {
-            tt::tt_metal::GraphTracker::instance().track_deallocate_cb(idevice);
-        }
+    while (!this->cb_devices_.empty()) {
+        this->deallocate_circular_buffers(*this->cb_devices_.begin());
+    }
+}
 
-        // Unregister program from ALL devices (matches registration)
-        for (const IDevice* idevice : this->cb_devices_) {
-            auto* device = dynamic_cast<Device*>(const_cast<IDevice*>(idevice));
-            if (device) {
-                device->unregister_program(this);
-                // Update locally-allocated CB stats via query (accurate after deallocation)
-                if (device->get_shm_stats_provider()) {
-                    device->get_shm_stats_provider()->update_from_allocator(device, getpid());
-                }
-            }
-        }
+void detail::ProgramImpl::deallocate_circular_buffers(const IDevice* idevice) {
+    if (this->cb_devices_.erase(idevice) == 0) {
+        return;
+    }
+    if (!this->circular_buffers_.empty()) {
+        tt::tt_metal::GraphTracker::instance().track_deallocate_cb(idevice);
+    }
 
-        this->cb_devices_.clear();  // Clear device set after deallocation
+    auto* device = dynamic_cast<Device*>(const_cast<IDevice*>(idevice));
+    if (device) {
+        device->unregister_program(this);
+        // Update locally-allocated CB stats via query (accurate after deallocation).
+        if (device->get_shm_stats_provider()) {
+            device->get_shm_stats_provider()->update_from_allocator(device, getpid());
+        }
     }
 }
 
@@ -3526,6 +3526,18 @@ void detail::ProgramImpl::compile_and_allocate(IDevice* device, bool force_slow_
 void detail::ProgramImpl::set_runtime_id(ProgramId id) { this->runtime_id = id; }
 
 void Program::set_runtime_id(ProgramId id) { internal_->set_runtime_id(id); }
+
+void detail::ProgramImpl::set_dispatch_timing_occurrence(uint64_t occurrence) {
+    TT_FATAL(occurrence == 0 || (runtime_id != 0 && runtime_id <= 0xffff),
+             "Qualified dispatch timing requires a lossless nonzero runtime ID");
+    dispatch_timing_occurrence_ = occurrence;
+}
+
+void Program::set_dispatch_timing_occurrence(uint64_t occurrence) {
+    internal_->set_dispatch_timing_occurrence(occurrence);
+}
+
+uint64_t Program::get_dispatch_timing_occurrence() const { return internal_->get_dispatch_timing_occurrence(); }
 
 void Program::set_worker_stream_state_owner(tt::worker_stream_state::Owner owner) {
     internal_->set_worker_stream_state_owner(owner);

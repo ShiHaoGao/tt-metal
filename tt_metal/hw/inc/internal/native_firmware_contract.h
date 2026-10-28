@@ -5,7 +5,7 @@
 #include "hostdev/native_kernel_contract.h"
 #include "hostdev/worker_stream_state_contract.h"
 
-#if defined(ARCH_BLACKHOLE)
+#if defined(ARCH_BLACKHOLE) || defined(ARCH_WORMHOLE)
 namespace {
 __attribute__((used, section(TT_NATIVE_IMAGE_SECTION)))
 const tt_native_image_record native_firmware_contract{
@@ -19,7 +19,11 @@ const tt_native_image_record native_firmware_contract{
 #else
     TT_NATIVE_ROLE_TRISC0 + COMPILE_FOR_TRISC,
 #endif
+#if defined(ARCH_BLACKHOLE)
     TT_NATIVE_ARCH_BLACKHOLE,
+#else
+    TT_NATIVE_ARCH_WORMHOLE,
+#endif
     TT_NATIVE_LOADING_DISCRETE,
 #if defined(PROFILE_KERNEL) && !defined(PROFILE_STREAMING)
     TT_NATIVE_PROFILE_CLASSIC_DRAM_PROGRAM,

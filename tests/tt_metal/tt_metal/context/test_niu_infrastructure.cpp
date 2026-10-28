@@ -6,10 +6,13 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <limits>
 #include <future>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -24,12 +27,16 @@
 #include <tt-metalium/experimental/mock_device/mock_device.hpp>
 #include <tt-metalium/experimental/dispatch_context.hpp>
 #include <tt-metalium/host_api.hpp>
+#include <tt-metalium/graph_tracking.hpp>
 #include <tt-metalium/program.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/mesh_workload.hpp>
 #include <tt-metalium/mesh_command_queue.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
+#include <tt-metalium/experimental/per_core_allocation/buffer.hpp>
+#include <tt-metalium/experimental/per_core_allocation/mesh_buffer.hpp>
 #include <tt-metalium/sub_device.hpp>
 #include "distributed/mesh_device_impl.hpp"
 #include "distributed/fd_mesh_command_queue.hpp"
@@ -39,6 +46,8 @@
 #include "impl/context/metal_env_accessor.hpp"
 #include "impl/context/metal_env_impl.hpp"
 #include "impl/device/device_impl.hpp"
+#include "impl/allocator/allocator.hpp"
+#include "impl/buffers/buffer_impl.hpp"
 #include "impl/experimental/native_kernel/native_image.hpp"
 #include "impl/dispatch/dispatch_core_manager.hpp"
 #include "impl/dispatch/system_memory_manager.hpp"
@@ -153,7 +162,7 @@ concept exposes_item_witness_owner = requires(
     const typename Invocation::ItemWitnessRequirement& requirement) {
     typename Invocation::ItemWitnessObservation;
     invocation.acquire_item_witness(selector, requirement);
-    invocation.observe_item(lease);
+    invocation.poll_item(lease);
 };
 
 template <class Invocation>
@@ -174,13 +183,523 @@ void check_item_witness_owner_contract() {
                                    const tt_niu_item_witness_request&>));
         EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Observation&>().request()),
                                    const tt_niu_item_witness_request&>));
-        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Invocation&>().observe_item(
-                                       std::declval<const Lease&>())), std::optional<Observation>>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Invocation&>().poll_item(
+                                       std::declval<const Lease&>())), typename Invocation::ItemWitnessResult>));
     }
 }
 
 TEST(NiuManagedInvocationContractTest, ItemWitnessCanOnlyComeFromOriginalSdkAllocationAndObserver) {
     check_item_witness_owner_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+concept exposes_item_witness_poll = requires(
+    const Invocation& invocation, const typename Invocation::ItemWitnessLease& lease) {
+    typename Invocation::ItemWitnessStatus;
+    typename Invocation::ItemWitnessResult;
+    invocation.poll_item(lease);
+};
+
+template <class Invocation>
+void check_item_witness_poll_contract() {
+    if constexpr (!exposes_item_witness_poll<Invocation>) {
+        ADD_FAILURE() << "Managed invocation cannot distinguish pending item progress from terminal failure";
+    } else {
+        using Lease = typename Invocation::ItemWitnessLease;
+        using Observation = typename Invocation::ItemWitnessObservation;
+        using Status = typename Invocation::ItemWitnessStatus;
+        using Result = typename Invocation::ItemWitnessResult;
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Invocation&>().poll_item(
+                                       std::declval<const Lease&>())), Result>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Result&>().status), Status>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Result&>().observation), std::optional<Observation>>));
+        EXPECT_NE(Status::Pending, Status::Complete);
+        EXPECT_NE(Status::Pending, Status::Rejected);
+        EXPECT_NE(Status::Pending, Status::Invalidated);
+        EXPECT_NE(Status::Pending, Status::IoFailure);
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ItemWitnessPollSeparatesPendingFromTerminalFailure) {
+    check_item_witness_poll_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+concept exposes_item_acknowledgement_owner = requires(
+    const Invocation& invocation, const typename Invocation::ItemWitnessObservation& observation) {
+    typename Invocation::ItemAcknowledgementStatus;
+    invocation.acknowledge_item(observation);
+};
+
+template <class Invocation, class Candidate>
+concept accepts_item_acknowledgement = requires(const Invocation& invocation, const Candidate& candidate) {
+    invocation.acknowledge_item(candidate);
+};
+
+template <class Invocation>
+void check_item_acknowledgement_owner_contract() {
+    if constexpr (!exposes_item_acknowledgement_owner<Invocation>) {
+        ADD_FAILURE() << "Managed invocation lacks an original-owner opaque item acknowledgement receiver";
+    } else {
+        using Observation = typename Invocation::ItemWitnessObservation;
+        using Status = typename Invocation::ItemAcknowledgementStatus;
+        EXPECT_FALSE(std::is_default_constructible_v<Observation>);
+        EXPECT_FALSE(std::is_aggregate_v<Observation>);
+        EXPECT_FALSE((std::is_constructible_v<Observation, tt_niu_item_witness_receipt>));
+        EXPECT_FALSE((std::is_constructible_v<Observation, tt_niu_item_witness_acknowledgement>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Invocation&>().acknowledge_item(
+                                       std::declval<const Observation&>())), Status>));
+        EXPECT_FALSE((accepts_item_acknowledgement<Invocation, tt_niu_item_witness_receipt>));
+        EXPECT_FALSE((accepts_item_acknowledgement<Invocation, tt_niu_item_witness_acknowledgement>));
+        EXPECT_FALSE((accepts_item_acknowledgement<Invocation, tt_niu_item_witness_request>));
+        EXPECT_FALSE((accepts_item_acknowledgement<Invocation, bool>));
+        EXPECT_NE(Status::Acknowledged, Status::Pending);
+        EXPECT_NE(Status::Acknowledged, Status::Invalidated);
+        EXPECT_NE(Status::Acknowledged, Status::Rejected);
+        EXPECT_NE(Status::Acknowledged, Status::IoFailure);
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ItemAcknowledgementRequiresOriginalOpaqueObservation) {
+    check_item_acknowledgement_owner_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+void check_item_series_terminal_contract() {
+    if constexpr (requires(const typename Invocation::ItemWitnessResult& result) {
+                      typename Invocation::ItemSeriesObservation;
+                      Invocation::ItemWitnessStatus::NotExecuted;
+                      Invocation::ItemWitnessStatus::Finished;
+                      result.series;
+                  }) {
+        using Series = typename Invocation::ItemSeriesObservation;
+        using Round = typename Invocation::ItemWitnessObservation;
+        using Status = typename Invocation::ItemWitnessStatus;
+        using Result = typename Invocation::ItemWitnessResult;
+        EXPECT_FALSE(std::is_default_constructible_v<Series>);
+        EXPECT_FALSE(std::is_aggregate_v<Series>);
+        EXPECT_FALSE((std::is_constructible_v<Series, uint64_t>));
+        EXPECT_FALSE((std::is_constructible_v<Series, tt_niu_item_witness_receipt>));
+        EXPECT_FALSE((std::is_constructible_v<Series, Round>));
+        EXPECT_FALSE((std::is_convertible_v<Series, Round>));
+        EXPECT_FALSE((accepts_item_acknowledgement<Invocation, Series>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Result&>().series), std::optional<Series>>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Series&>().final_count()), uint64_t>));
+        EXPECT_TRUE(
+            (std::is_same_v<decltype(std::declval<const Series&>().request()), const tt_niu_item_witness_request&>));
+        EXPECT_TRUE((std::is_same_v<decltype(std::declval<const Series&>().niu()), detail::NiuKey>));
+        EXPECT_NE(Status::NotExecuted, Status::Pending);
+        EXPECT_NE(Status::NotExecuted, Status::Complete);
+        EXPECT_NE(Status::Finished, Status::Complete);
+        EXPECT_NE(Status::Finished, Status::NotExecuted);
+        const Result pending{Status::Pending, std::nullopt};
+        EXPECT_FALSE(pending.observation);
+        EXPECT_FALSE(pending.series) << "No item or source End may be fabricated by a status-only result";
+    } else {
+        ADD_FAILURE() << "Managed invocation loses source-series End or aliases it to item completion";
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, SeriesEndIsAnOriginalOwnedObservationDistinctFromItemCompletion) {
+    check_item_series_terminal_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Status>
+concept exposes_retired_resource_status = requires { Status::Retired; };
+
+template <class Invocation>
+void check_resource_retirement_contract() {
+    if constexpr (requires {
+                      typename Invocation::ResourceRetirementReception;
+                      typename Invocation::ResourceRetirementReception::Status;
+                  }) {
+        using Status = typename Invocation::ResourceRetirementReception::Status;
+        EXPECT_FALSE(exposes_retired_resource_status<Status>);
+        EXPECT_FALSE((std::is_convertible_v<Status, bool>));
+        EXPECT_NE(Status::Pending, Status::Ready);
+        EXPECT_NE(Status::Rejected, Status::Ready);
+        EXPECT_NE(Status::Invalidated, Status::Ready);
+    } else {
+        ADD_FAILURE() << "Managed invocation has no read-only native resource retirement prerequisites";
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ResourceRetirementReceptionCannotPublishNativeResourceTerminal) {
+    check_resource_retirement_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+concept exposes_native_resource_retirement = requires(const Invocation& invocation) {
+    invocation.retire_native_resources();
+};
+
+template <class Invocation>
+concept accepts_native_retirement_claim = requires(const Invocation& invocation) {
+    invocation.retire_native_resources(true);
+};
+
+template <class Invocation, class Argument>
+concept accepts_native_retirement_argument = requires(const Invocation& invocation, Argument argument) {
+    invocation.retire_native_resources(argument);
+};
+
+template <class Invocation>
+concept exposes_native_retirement_status = requires {
+    typename Invocation::NativeResourceRetirementStatus;
+};
+
+template <class Invocation>
+concept accepts_native_retirement_observation = requires(
+    const Invocation& invocation,
+    const typename Invocation::ItemWitnessObservation& item,
+    const typename Invocation::ItemSeriesObservation& series) {
+    invocation.retire_native_resources(item);
+    invocation.retire_native_resources(series);
+};
+
+template <class Invocation>
+void check_native_resource_retirement_contract() {
+    if constexpr (!exposes_native_resource_retirement<Invocation> ||
+                  !exposes_native_retirement_status<Invocation>) {
+        ADD_FAILURE() << "Managed invocation has no normal native-resource retirement receiver";
+    } else {
+        using ExpectedStatus = typename Invocation::NativeResourceRetirementStatus;
+        using Status = decltype(std::declval<Invocation&>().retire_native_resources());
+        // Retirement is an original-owner action, not caller-supplied proof.
+        // A bool cannot distinguish pending, invalidated, and completed work.
+        EXPECT_TRUE((std::is_same_v<Status, ExpectedStatus>));
+        EXPECT_TRUE(std::is_enum_v<Status>);
+        EXPECT_FALSE((std::is_same_v<Status, bool>));
+        EXPECT_FALSE((std::is_convertible_v<Status, bool>));
+        EXPECT_NE(Status::Pending, Status::Retired);
+        EXPECT_NE(Status::Rejected, Status::Retired);
+        EXPECT_NE(Status::Invalidated, Status::Retired);
+        EXPECT_FALSE(accepts_native_retirement_claim<Invocation>);
+        EXPECT_FALSE(accepts_native_retirement_observation<Invocation>);
+        EXPECT_FALSE((accepts_native_retirement_argument<Invocation, uint64_t>));
+        EXPECT_FALSE((accepts_native_retirement_argument<Invocation, NiuAdmission::Token>));
+        EXPECT_FALSE((accepts_native_retirement_argument<Invocation, NiuAdmission::Boots>));
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, NativeResourceRetirementIsTypedAndHasNoCallerProofInput) {
+    check_native_resource_retirement_contract<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+concept exposes_native_backing_terminal = requires {
+    typename Invocation::NativeBackingTerminal;
+};
+
+TEST(NiuManagedInvocationContractTest, NativeBackingTerminalCannotBeMintedFromItemOrEndEvidence) {
+    // The sealed terminal is intentionally private to ProgramExecution. Its
+    // public consumer is the no-argument typed retirement method above; item
+    // completion and source End observations cannot be passed as a substitute.
+    EXPECT_FALSE((exposes_native_backing_terminal<detail::ProgramExecution::ManagedInvocation>));
+    EXPECT_FALSE((exposes_native_backing_terminal<detail::ProgramExecution>));
+}
+
+template <class Admission>
+concept exposes_clean_terminal = requires { typename Admission::CleanTerminal; };
+
+TEST(NiuManagedInvocationContractTest, NativeCleanTerminalCannotBeMintedFromPublicLedgerOrToken) {
+    EXPECT_FALSE((exposes_clean_terminal<NiuAdmission>));
+}
+
+template <class Invocation>
+concept exposes_resource_retirement_reception = requires(
+    const detail::ProgramPreparation& preparation,
+    std::span<const detail::NiuHandoffReceiver::ItemReception* const> series) {
+    typename Invocation::ResourceRetirementReception;
+    typename Invocation::ResourceRetirementReception::Status;
+    typename Invocation::ResourceRetirementReception::Identity;
+    typename Invocation::ResourceRetirementReception::Inventory;
+    Invocation::ResourceRetirementReception::receive(
+        Invocation::ResourceRetirementReception::Identity::Current,
+        preparation,
+        series,
+        Invocation::ResourceRetirementReception::Inventory::RequireSeries);
+};
+
+// Bytes exercise the actual SDK item decoder and ACK transport/readback. This
+// fixture cannot create a firmware boot, a managed invocation, a live Device
+// epoch, or resource-release authority. Ready below is reception only.
+struct ResourceRetirementMailbox {
+    using Receiver = detail::NiuHandoffReceiver;
+    using Reception = Receiver::ItemReception;
+    Receiver::ItemWitnessRegion region{};
+    const Receiver::ItemWitnessRequest original;
+
+    explicit ResourceRetirementMailbox(uint64_t item = 11) :
+        original{TT_NIU_ITEM_WITNESS_VERSION, 7, 3, 5, item, 13, 1, 2, 1, 15, 2, 2, 0} {
+        region.request = region.receipt.request = original;
+    }
+    detail::NiuHandoffIoStatus read(uint32_t offset, std::span<std::byte> bytes) const {
+        if (offset > sizeof(region) || bytes.size() > sizeof(region) - offset) {
+            return detail::NiuHandoffIoStatus::Failed;
+        }
+        std::memcpy(bytes.data(), reinterpret_cast<const std::byte*>(&region) + offset, bytes.size());
+        return detail::NiuHandoffIoStatus::Complete;
+    }
+    detail::NiuItemWitnessReadResult observe() const {
+        return Receiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) { return read(offset, bytes); });
+    }
+    void closed() {
+        region.receipt = {};
+        region.receipt.request = original;
+        region.receipt.publish_sequence = 8;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_CLOSED;
+        region.receipt.item.issued_occurrence = region.receipt.item.closed_occurrence = 1;
+    }
+    void end(uint64_t count) {
+        region.receipt = {};
+        region.receipt.request = original;
+        region.receipt.publish_sequence = count ? 10 : 4;
+        region.receipt.state = TT_NIU_ITEM_WITNESS_SERIES_END;
+        region.receipt.series.final_count = count;
+        region.receipt.series.closed_sequence = count ? 8 : 0;
+        region.receipt.series.acknowledgement_sequence = count ? 2 : 0;
+    }
+    bool acknowledge(Reception& reception) {
+        const auto ack = reception.acknowledgement();
+        if (!ack) {
+            return false;
+        }
+        const auto status = Receiver::write_item_acknowledgement(
+            [&](uint32_t offset, std::span<const std::byte> bytes) {
+                if (offset > sizeof(region) || bytes.size() > sizeof(region) - offset) {
+                    return detail::NiuHandoffIoStatus::Failed;
+                }
+                std::memcpy(reinterpret_cast<std::byte*>(&region) + offset, bytes.data(), bytes.size());
+                return detail::NiuHandoffIoStatus::Complete;
+            },
+            [&](uint32_t offset, std::span<std::byte> bytes) { return read(offset, bytes); },
+            *ack);
+        return status == detail::NiuHandoffWriteStatus::Published && reception.acknowledge(*ack);
+    }
+};
+
+template <class Invocation>
+void check_resource_retirement_inventory() {
+    if constexpr (!exposes_resource_retirement_reception<Invocation>) {
+        ADD_FAILURE() << "Native resource retirement has no actual SDK reception seam";
+    } else {
+        using Receiver = typename Invocation::ResourceRetirementReception;
+        using Status = typename Receiver::Status;
+        using Identity = typename Receiver::Identity;
+        using Inventory = typename Receiver::Inventory;
+        using Reception = detail::NiuHandoffReceiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        ResourceRetirementMailbox mailbox;
+        Reception reception(mailbox.original);
+        mailbox.end(0);
+        ASSERT_EQ(
+            reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Reception::Status::NotExecuted);
+        detail::ProgramPreparation preparation;
+        const std::array<const Reception*, 1> null_series{nullptr};
+        const std::array<const Reception*, 2> duplicated{&reception, &reception};
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, {}, Inventory::RequireSeries), Status::Rejected);
+        // Selector cleaning already supports invocations with no registered
+        // source series. This profile waives only the nonempty obligation.
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, {}, Inventory::AllowEmpty), Status::Ready);
+        ASSERT_TRUE(preparation.acquire());
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, {}, Inventory::AllowEmpty), Status::Pending);
+        EXPECT_TRUE(preparation.owned());
+        preparation.release();
+        EXPECT_EQ(
+            Receiver::receive(Identity::Invalidated, preparation, {}, Inventory::AllowEmpty), Status::Invalidated);
+        EXPECT_EQ(
+            Receiver::receive(Identity::Current, preparation, null_series, Inventory::RequireSeries), Status::Rejected);
+        EXPECT_EQ(
+            Receiver::receive(Identity::Current, preparation, null_series, Inventory::AllowEmpty), Status::Rejected);
+        EXPECT_EQ(
+            Receiver::receive(Identity::Current, preparation, duplicated, Inventory::RequireSeries), Status::Rejected);
+        EXPECT_EQ(
+            Receiver::receive(Identity::Current, preparation, duplicated, Inventory::AllowEmpty), Status::Rejected);
+        EXPECT_FALSE(preparation.occupied());
+        EXPECT_FALSE(preparation.cancelled());
+        ASSERT_TRUE(reception.terminal());
+        EXPECT_EQ(reception.terminal()->final_count(), 0u);
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_EQ(reception.closed_prefix(), 0u);
+        EXPECT_EQ(reception.acknowledged_prefix(), 0u);
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ResourceRetirementRejectsEmptyNullAndDuplicateSeriesWithoutMutation) {
+    check_resource_retirement_inventory<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+void check_resource_retirement_requires_end() {
+    if constexpr (!exposes_resource_retirement_reception<Invocation>) {
+        ADD_FAILURE() << "Native resource retirement has no actual SDK reception seam";
+    } else {
+        using Receiver = typename Invocation::ResourceRetirementReception;
+        using Status = typename Receiver::Status;
+        using Identity = typename Receiver::Identity;
+        using Inventory = typename Receiver::Inventory;
+        using Reception = detail::NiuHandoffReceiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        ResourceRetirementMailbox mailbox;
+        Reception reception(mailbox.original);
+        const std::array<const Reception*, 1> series{&reception};
+        detail::ProgramPreparation preparation;
+        mailbox.closed();
+        ASSERT_EQ(reception.receive(Issuer::Issued, Issuer::Issued, mailbox.observe()), Reception::Status::Complete);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Pending);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Pending);
+        ASSERT_TRUE(reception.accepted());
+        EXPECT_EQ(reception.closed_prefix(), 1u);
+        EXPECT_EQ(reception.acknowledged_prefix(), 0u);
+        ASSERT_TRUE(mailbox.acknowledge(reception));
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Pending);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Pending);
+        EXPECT_FALSE(reception.accepted());
+        EXPECT_FALSE(reception.terminal());
+        EXPECT_EQ(reception.closed_prefix(), 1u);
+        EXPECT_EQ(reception.acknowledged_prefix(), 1u);
+        EXPECT_FALSE(preparation.occupied());
+        EXPECT_FALSE(preparation.cancelled());
+        mailbox.end(1);
+        ASSERT_EQ(reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Reception::Status::Finished);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Ready);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Ready);
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ResourceRetirementCannotReplaceSourceEndWithClosedAndAcknowledgement) {
+    check_resource_retirement_requires_end<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+void check_resource_retirement_requires_all_series() {
+    if constexpr (!exposes_resource_retirement_reception<Invocation>) {
+        ADD_FAILURE() << "Native resource retirement has no actual SDK reception seam";
+    } else {
+        using Receiver = typename Invocation::ResourceRetirementReception;
+        using Status = typename Receiver::Status;
+        using Identity = typename Receiver::Identity;
+        using Inventory = typename Receiver::Inventory;
+        using Reception = detail::NiuHandoffReceiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        ResourceRetirementMailbox first(11), second(12);
+        Reception first_reception(first.original), second_reception(second.original);
+        const std::array<const Reception*, 2> series{&first_reception, &second_reception};
+        detail::ProgramPreparation preparation;
+        first.end(0);
+        ASSERT_EQ(
+            first_reception.receive(Issuer::Stopped, Issuer::Stopped, first.observe()), Reception::Status::NotExecuted);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Pending);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Pending);
+        second.end(0);
+        ASSERT_EQ(
+            second_reception.receive(Issuer::Issued, Issuer::Stopped, second.observe()), Reception::Status::Pending);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Pending);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Pending);
+        EXPECT_FALSE(second_reception.terminal());
+        ASSERT_TRUE(first_reception.terminal());
+        EXPECT_FALSE(preparation.occupied());
+        ASSERT_EQ(
+            second_reception.receive(Issuer::Stopped, Issuer::Stopped, second.observe()),
+            Reception::Status::NotExecuted);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Ready);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Ready);
+        EXPECT_EQ(first_reception.terminal()->final_count(), 0u);
+        EXPECT_EQ(second_reception.terminal()->final_count(), 0u);
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ResourceRetirementRequiresFreshStoppedEndForEveryRegisteredSeries) {
+    check_resource_retirement_requires_all_series<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+void check_resource_retirement_preparation() {
+    if constexpr (!exposes_resource_retirement_reception<Invocation>) {
+        ADD_FAILURE() << "Native resource retirement has no actual SDK reception seam";
+    } else {
+        using Receiver = typename Invocation::ResourceRetirementReception;
+        using Status = typename Receiver::Status;
+        using Identity = typename Receiver::Identity;
+        using Inventory = typename Receiver::Inventory;
+        using Reception = detail::NiuHandoffReceiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        ResourceRetirementMailbox mailbox;
+        Reception reception(mailbox.original);
+        mailbox.end(0);
+        ASSERT_EQ(
+            reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Reception::Status::NotExecuted);
+        const std::array<const Reception*, 1> series{&reception};
+        detail::ProgramPreparation preparation;
+        ASSERT_TRUE(preparation.acquire());
+        ASSERT_TRUE(preparation.acquire());
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Pending);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Pending);
+        EXPECT_TRUE(preparation.owned());
+        EXPECT_FALSE(preparation.cancelled());
+        preparation.release();
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Pending);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Pending);
+        EXPECT_TRUE(preparation.owned());
+        preparation.release();
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Ready);
+        EXPECT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Ready);
+        EXPECT_FALSE(preparation.occupied());
+        ASSERT_TRUE(reception.terminal());
+        EXPECT_EQ(reception.terminal()->final_count(), 0u);
+        preparation.cancel();
+        EXPECT_EQ(
+            Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Invalidated);
+        EXPECT_EQ(
+            Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Invalidated);
+        EXPECT_TRUE(preparation.ready_to_cancel());
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ResourceRetirementDefersUntilLastPreparationBorrowWithoutCancellingIt) {
+    check_resource_retirement_preparation<detail::ProgramExecution::ManagedInvocation>();
+}
+
+template <class Invocation>
+void check_resource_retirement_identity_revalidation() {
+    if constexpr (!exposes_resource_retirement_reception<Invocation>) {
+        ADD_FAILURE() << "Native resource retirement has no actual SDK reception seam";
+    } else {
+        using Receiver = typename Invocation::ResourceRetirementReception;
+        using Status = typename Receiver::Status;
+        using Identity = typename Receiver::Identity;
+        using Inventory = typename Receiver::Inventory;
+        using Reception = detail::NiuHandoffReceiver::ItemReception;
+        using Issuer = typename Reception::IssuerState;
+        ResourceRetirementMailbox mailbox;
+        Reception reception(mailbox.original);
+        mailbox.end(0);
+        ASSERT_EQ(
+            reception.receive(Issuer::Stopped, Issuer::Stopped, mailbox.observe()), Reception::Status::NotExecuted);
+        const std::array<const Reception*, 1> series{&reception};
+        detail::ProgramPreparation preparation;
+        ASSERT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::RequireSeries), Status::Ready);
+        ASSERT_EQ(Receiver::receive(Identity::Current, preparation, series, Inventory::AllowEmpty), Status::Ready);
+        // The actual invocation must freshly derive this input from original
+        // owner/boot/epoch validation. Cached End cannot overrule its failure;
+        // these CPU observations do not prove a real boot or native release.
+        EXPECT_EQ(
+            Receiver::receive(Identity::Invalidated, preparation, series, Inventory::RequireSeries),
+            Status::Invalidated);
+        EXPECT_EQ(
+            Receiver::receive(Identity::Invalidated, preparation, series, Inventory::AllowEmpty), Status::Invalidated);
+        EXPECT_FALSE(preparation.occupied());
+        EXPECT_FALSE(preparation.cancelled());
+        ASSERT_TRUE(reception.terminal());
+        EXPECT_EQ(reception.terminal()->final_count(), 0u);
+        EXPECT_EQ(reception.closed_prefix(), 0u);
+        EXPECT_EQ(reception.acknowledged_prefix(), 0u);
+    }
+}
+
+TEST(NiuManagedInvocationContractTest, ResourceRetirementReceptionRejectsInvalidatedIdentityDespiteCachedEnd) {
+    check_resource_retirement_identity_revalidation<detail::ProgramExecution::ManagedInvocation>();
 }
 
 template <class Invocation>
@@ -673,6 +1192,394 @@ protected:
     std::optional<ContextId> context_id;
     MetalContext* context = nullptr;
 };
+
+// These are real SDK allocation/lifetime checks on the existing CPU-only
+// MeshDevice fixture. No firmware boot, handoff transport or GO is fabricated.
+class ScopedHybridAllocatorMode {
+public:
+    ScopedHybridAllocatorMode() {
+        if (const auto* value = std::getenv("TT_METAL_ALLOCATOR_MODE_HYBRID")) {
+            previous = value;
+        }
+        setenv("TT_METAL_ALLOCATOR_MODE_HYBRID", "1", 1);
+    }
+    ~ScopedHybridAllocatorMode() {
+        if (previous) {
+            setenv("TT_METAL_ALLOCATOR_MODE_HYBRID", previous->c_str(), 1);
+        } else {
+            unsetenv("TT_METAL_ALLOCATOR_MODE_HYBRID");
+        }
+    }
+
+private:
+    std::optional<std::string> previous;
+};
+
+BufferShardingArgs l1_pin_sharding() {
+    BufferShardingArgs args(
+        ShardSpecBuffer(
+            CoreRangeSet(CoreRange(CoreCoord(0, 0), CoreCoord(1, 0))),
+            {1, 1},
+            ShardOrientation::ROW_MAJOR,
+            {1, 1},
+            {2, 1}),
+        TensorMemoryLayout::HEIGHT_SHARDED);
+    experimental::per_core_allocation::set_per_core_allocation(args, true);
+    return args;
+}
+
+class L1AllocationPinTest : public NiuExecutionMeshTest {
+protected:
+    void SetUp() override {
+        ScopedHybridAllocatorMode option;
+        NiuExecutionMeshTest::SetUp();
+    }
+
+    BufferShardingArgs sharding() { return l1_pin_sharding(); }
+
+    std::shared_ptr<Buffer> allocate(IDevice* device) {
+        return BufferImpl::create(device, 2048, 1024, BufferType::L1, sharding());
+    }
+};
+
+// Closing a physical Device is tested without a parent MeshDevice owner, whose
+// separate close would intentionally try to close that physical Device again.
+class L1AllocationPinWithdrawalTest : public NiuInfrastructureTest {
+protected:
+    void SetUp() override {
+        ScopedHybridAllocatorMode option;
+        NiuInfrastructureTest::SetUp();
+        ASSERT_NO_FATAL_FAILURE(open_device());
+    }
+    std::shared_ptr<Buffer> allocate(IDevice* device) {
+        return BufferImpl::create(device, 2048, 1024, BufferType::L1, l1_pin_sharding());
+    }
+};
+
+TEST_F(L1AllocationPinTest, PinnedAllocationRejectsExplicitAndGlobalReleaseWithoutPartialEffects) {
+    auto* device = mesh->get_devices().front();
+    auto buffer = allocate(device);
+    auto unrelated = allocate(device);
+    auto& allocator = *device->allocator_impl();
+    auto pin = allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{64, 128});
+    const auto before = allocator.get_allocated_buffers();
+    EXPECT_THROW(buffer->impl().deallocate(*buffer), std::runtime_error);
+    EXPECT_THROW(allocator.deallocate_buffer(buffer.get()), std::runtime_error);
+    EXPECT_THROW(allocator.deallocate_buffers(), std::runtime_error);
+    EXPECT_THROW(allocator.clear(), std::runtime_error);
+    EXPECT_EQ(allocator.get_allocated_buffers(), before);
+    EXPECT_TRUE(buffer->is_allocated());
+    EXPECT_TRUE(unrelated->is_allocated());
+    EXPECT_NO_THROW(unrelated->impl().deallocate(*unrelated));
+    EXPECT_FALSE(unrelated->is_allocated());
+    EXPECT_TRUE(pin.live());
+}
+
+TEST_F(L1AllocationPinTest, ExactAllocationCoreAndSubrangeSurviveMovesUntilLastPin) {
+    auto* device = mesh->get_devices().front();
+    auto buffer = allocate(device);
+    const auto base = experimental::per_core_allocation::get_per_core_address(*buffer, {1, 0});
+    auto& allocator = *device->allocator_impl();
+    using Pin = decltype(allocator.pin_l1(buffer, CoreCoord{1, 0}, BufferRegion{64, 128}));
+    EXPECT_FALSE(std::is_default_constructible_v<Pin>);
+    EXPECT_FALSE(std::is_copy_constructible_v<Pin>);
+    EXPECT_TRUE(std::is_nothrow_move_constructible_v<Pin>);
+    EXPECT_TRUE(std::is_nothrow_destructible_v<Pin>);
+    std::optional<Pin> first(allocator.pin_l1(buffer, CoreCoord{1, 0}, BufferRegion{64, 128}));
+    std::optional<Pin> second(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}));
+    EXPECT_EQ(&first->buffer(), buffer.get());
+    EXPECT_EQ(first->allocation_id(), buffer->unique_id());
+    EXPECT_EQ(first->device(), device);
+    EXPECT_EQ(first->core(), CoreCoord(1, 0));
+    EXPECT_EQ(first->begin(), base + 64);
+    EXPECT_EQ(first->end(), base + 192);
+    std::optional<Pin> moved(std::move(*first));
+    first.reset();
+    second.reset();
+    EXPECT_THROW(buffer->impl().deallocate(*buffer), std::runtime_error);
+    EXPECT_TRUE(moved->live());
+    EXPECT_NO_THROW(moved.reset());
+    EXPECT_NO_THROW(buffer->impl().deallocate(*buffer));
+    EXPECT_FALSE(buffer->is_allocated());
+}
+
+TEST_F(L1AllocationPinTest, LastPinRetainsAndDestroysOriginalBufferOutsideAllocatorLock) {
+    auto* device = mesh->get_devices().front();
+    auto buffer = allocate(device);
+    const auto before = device->allocator_impl()->get_num_allocated_buffers();
+    std::weak_ptr<Buffer> retained = buffer;
+    auto& allocator = *device->allocator_impl();
+    using Pin = decltype(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}));
+    std::optional<Pin> pin(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}));
+    buffer.reset();
+    EXPECT_FALSE(retained.expired());
+    EXPECT_TRUE(retained.lock()->is_allocated());
+    EXPECT_EQ(allocator.get_num_allocated_buffers(), before);
+    EXPECT_NO_THROW(pin.reset());
+    EXPECT_TRUE(retained.expired());
+    EXPECT_EQ(allocator.get_num_allocated_buffers(), before - 1);
+}
+
+TEST_F(L1AllocationPinTest, PinRetainsTheSdkOwnerWhenTheCallerSuppliesAnotherControlBlock) {
+    auto* device = mesh->get_devices().front();
+    auto buffer = allocate(device);
+    const auto original_owners = buffer.use_count();
+    // Keep the same actual registered object, but do not grant this caller's
+    // unrelated control block authority over the SDK allocation's lifetime.
+    std::shared_ptr<Buffer> caller(buffer.get(), [](Buffer*) {});
+    auto pin = device->allocator_impl()->pin_l1(caller, CoreCoord{0, 0}, BufferRegion{0, 32});
+    EXPECT_EQ(&pin.buffer(), buffer.get());
+    EXPECT_EQ(pin.allocation_id(), buffer->unique_id());
+    EXPECT_EQ(buffer.use_count(), original_owners + 1);
+    caller.reset();
+    EXPECT_TRUE(pin.live());
+}
+
+TEST_F(L1AllocationPinWithdrawalTest, AllocatorWithdrawalWaitsForTheLastPinsOriginalBufferDeallocation) {
+    IDevice* device = this->device.get();
+    auto buffer = allocate(device);
+    auto* original = buffer.get();
+    std::weak_ptr<Buffer> retained = buffer;
+    auto& allocator = *device->allocator_impl();
+    using Pin = decltype(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}));
+    std::optional<Pin> pin(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}));
+
+    struct FinalDeallocationGate final : IGraphProcessor, IGraphHooks {
+        explicit FinalDeallocationGate(Buffer* original) : original(original), resume(resumed.get_future().share()) {}
+        bool is_capture_processor() const override { return false; }
+        void track_deallocate(Buffer* buffer) override {
+            if (buffer == original) {
+                entered.set_value();
+                timed_out.store(
+                    resume.wait_for(std::chrono::seconds(5)) != std::future_status::ready,
+                    std::memory_order_release);
+            }
+        }
+        bool hook_allocate(const Buffer*) override { return false; }
+        bool hook_program(Program*) override { return false; }
+        bool hook_write_to_device(const Buffer*) override { return false; }
+        bool hook_read_from_device(Buffer*) override { return false; }
+        bool hook_read_from_device(const distributed::MeshBuffer*) override { return false; }
+        bool hook_write_to_device(const distributed::MeshBuffer*) override { return false; }
+        bool hook_deallocate(Buffer* buffer) override {
+            // Only the failing candidate can finish withdrawal while the real
+            // Buffer destructor is paused. Protect that RED run from calling
+            // its already-destroyed allocator. A correct implementation takes
+            // the ordinary, actual allocator deallocation path below.
+            const bool unsafe = withdrawal_passed.load(std::memory_order_acquire) ||
+                                timed_out.load(std::memory_order_acquire);
+            if (buffer == original && unsafe) {
+                bypass_used.store(true, std::memory_order_release);
+                return true;
+            }
+            return false;
+        }
+        Buffer* const original;
+        std::promise<void> entered;
+        std::promise<void> resumed;
+        const std::shared_future<void> resume;
+        std::atomic<bool> withdrawal_passed{false};
+        std::atomic<bool> timed_out{false};
+        std::atomic<bool> bypass_used{false};
+    };
+    auto gate = std::make_shared<FinalDeallocationGate>(original);
+    auto entered = gate->entered.get_future();
+    buffer.reset();
+    auto released = std::async(std::launch::async, [pin = std::move(pin), gate]() mutable {
+        auto& tracker = GraphTracker::instance();
+        tracker.push_processor(gate);
+        EXPECT_TRUE(tracker.add_hook(gate));
+        pin.reset();
+        tracker.clear_hook();
+        tracker.pop_processor();
+    });
+    const auto entered_status = entered.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(entered_status, std::future_status::ready);
+    if (entered_status != std::future_status::ready) {
+        gate->resumed.set_value();
+        EXPECT_EQ(released.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        return;
+    }
+    auto withdrawn = std::async(std::launch::async, [&] { return device->close(); });
+    const auto withdrawal_status = withdrawn.wait_for(std::chrono::milliseconds(100));
+    gate->withdrawal_passed.store(withdrawal_status == std::future_status::ready, std::memory_order_release);
+    EXPECT_EQ(withdrawal_status, std::future_status::timeout);
+    gate->resumed.set_value();
+    EXPECT_EQ(released.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_NO_THROW(released.get());
+    EXPECT_EQ(withdrawn.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_TRUE(withdrawn.get());
+    EXPECT_FALSE(gate->timed_out.load(std::memory_order_acquire));
+    EXPECT_FALSE(gate->bypass_used.load(std::memory_order_acquire));
+    EXPECT_TRUE(retained.expired());
+}
+
+TEST_F(L1AllocationPinTest, RejectsViewsForeignAllocationsMissingCoresAndInvalidSubranges) {
+    auto* device = mesh->get_devices().front();
+    auto buffer = allocate(device);
+    auto foreign = allocate(mesh->get_devices().back());
+    auto dram = BufferImpl::create(device, 1024, 1024, BufferType::DRAM);
+    auto view = BufferImpl::create(device, buffer->address(), 1024, 1024, BufferType::L1);
+    auto& allocator = *device->allocator_impl();
+    const auto before = allocator.get_allocated_buffers();
+    EXPECT_THROW(allocator.pin_l1(view, CoreCoord{0, 0}, BufferRegion{0, 32}), std::runtime_error);
+    EXPECT_THROW(allocator.pin_l1(foreign, CoreCoord{0, 0}, BufferRegion{0, 32}), std::runtime_error);
+    EXPECT_THROW(allocator.pin_l1(dram, CoreCoord{0, 0}, BufferRegion{0, 32}), std::runtime_error);
+    EXPECT_THROW(allocator.pin_l1(buffer, CoreCoord{2, 0}, BufferRegion{0, 32}), std::runtime_error);
+    EXPECT_THROW(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 0}), std::runtime_error);
+    EXPECT_THROW(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{1024, 1}), std::runtime_error);
+    EXPECT_THROW(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{UINT64_MAX, 2}), std::runtime_error);
+    EXPECT_THROW(allocator.pin_l1(std::shared_ptr<Buffer>{}, CoreCoord{0, 0}, BufferRegion{0, 32}), std::runtime_error);
+    EXPECT_EQ(allocator.get_allocated_buffers(), before);
+    EXPECT_NO_THROW(buffer->impl().deallocate(*buffer));
+}
+
+TEST_F(L1AllocationPinTest, RejectsMeshDeviceProxyBeforePinningItsRegisteredAllocation) {
+    // A MeshDevice's allocator owns proxy bookkeeping, rather than one
+    // physical device reservation. Its manager teardown clears that allocator
+    // before the allocator withdrawal boundary, so it cannot issue a physical
+    // allocation pin even when this is an original registered Buffer.
+    auto buffer = allocate(mesh.get());
+    auto& allocator = *mesh->allocator_impl();
+    const auto before = allocator.get_allocated_buffers();
+    EXPECT_THROW(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}), std::runtime_error);
+    EXPECT_EQ(allocator.get_allocated_buffers(), before);
+    EXPECT_TRUE(buffer->is_allocated());
+    EXPECT_NO_THROW(buffer->impl().deallocate(*buffer));
+}
+
+TEST_F(L1AllocationPinTest, MeshPinRetainsExactDeviceWithoutSharedBackingAndRejectsDestructiveMutation) {
+    distributed::DeviceLocalBufferConfig local;
+    local.page_size = 1024;
+    local.buffer_type = BufferType::L1;
+    local.sharding_args = sharding();
+    auto allocation = distributed::MeshBuffer::create(distributed::ReplicatedBufferConfig{2048}, local, mesh.get());
+    ASSERT_EQ(allocation->get_backing_buffer(), nullptr);
+    const distributed::MeshCoordinate coordinate{0, 1};
+    auto* device = mesh->impl().get_device(coordinate);
+    auto* child = allocation->get_device_buffer(coordinate);
+    auto* other = allocation->get_device_buffer(distributed::MeshCoordinate{0, 0});
+    const auto base = experimental::per_core_allocation::get_per_core_address(*child, {0, 0});
+    std::weak_ptr<distributed::MeshBuffer> retained = allocation;
+    auto& allocator = *device->allocator_impl();
+    using Pin = decltype(allocator.pin_l1(allocation, coordinate, CoreCoord{0, 0}, BufferRegion{32, 64}));
+    std::optional<Pin> pin(allocator.pin_l1(allocation, coordinate, CoreCoord{0, 0}, BufferRegion{32, 64}));
+    EXPECT_EQ(&pin->buffer(), child);
+    EXPECT_EQ(pin->device(), device);
+    EXPECT_EQ(pin->begin(), base + 32);
+    EXPECT_EQ(pin->end(), base + 96);
+    EXPECT_THROW(allocation->deallocate(), std::runtime_error);
+    EXPECT_THROW({ distributed::MeshBuffer moved(std::move(*allocation)); }, std::runtime_error);
+    EXPECT_TRUE(allocation->is_allocated());
+    EXPECT_TRUE(child->is_allocated());
+    EXPECT_TRUE(other->is_allocated());
+    allocation.reset();
+    EXPECT_FALSE(retained.expired());
+    EXPECT_TRUE(pin->live());
+    EXPECT_NO_THROW(pin.reset());
+    EXPECT_TRUE(retained.expired());
+}
+
+TEST_F(L1AllocationPinTest, MeshPinRetainsTheSdkOwnerFromBothFactoriesWithAnotherCallerControlBlock) {
+    const distributed::MeshCoordinate coordinate{0, 1};
+    auto* device = mesh->impl().get_device(coordinate);
+    distributed::DeviceLocalBufferConfig local;
+    local.page_size = 1024;
+    local.buffer_type = BufferType::L1;
+    local.sharding_args = sharding();
+    for (const bool single_device : {false, true}) {
+        SCOPED_TRACE(single_device);
+        auto allocation = single_device
+                              ? experimental::per_core_allocation::create_on_single_device(
+                                    distributed::ReplicatedBufferConfig{2048}, local, mesh.get(), coordinate)
+                              : distributed::MeshBuffer::create(
+                                    distributed::ReplicatedBufferConfig{2048}, local, mesh.get());
+        auto* original_child = allocation->get_device_buffer(coordinate);
+        const auto original_owners = allocation.use_count();
+        std::shared_ptr<distributed::MeshBuffer> caller(allocation.get(), [](distributed::MeshBuffer*) {});
+        auto pin = device->allocator_impl()->pin_l1(caller, coordinate, CoreCoord{0, 0}, BufferRegion{0, 32});
+        EXPECT_EQ(&pin.buffer(), original_child);
+        EXPECT_EQ(pin.allocation_id(), original_child->unique_id());
+        EXPECT_EQ(allocation.use_count(), original_owners + 1);
+        caller.reset();
+        EXPECT_TRUE(pin.live());
+    }
+}
+
+TEST_F(L1AllocationPinTest, MeshPinRejectsAnUnregisteredMovedObjectWithoutChangingItsAllocation) {
+    distributed::DeviceLocalBufferConfig local;
+    local.page_size = 1024;
+    local.buffer_type = BufferType::L1;
+    local.sharding_args = sharding();
+    auto allocation = distributed::MeshBuffer::create(distributed::ReplicatedBufferConfig{2048}, local, mesh.get());
+    const distributed::MeshCoordinate coordinate{0, 1};
+    auto* child = allocation->get_device_buffer(coordinate);
+    auto moved = std::make_shared<distributed::MeshBuffer>(std::move(*allocation));
+    auto& allocator = *mesh->impl().get_device(coordinate)->allocator_impl();
+    const auto before = allocator.get_allocated_buffers();
+    // Moving an allocation is supported, but a caller-created control block
+    // does not become an SDK factory lifetime owner capable of issuing pins.
+    EXPECT_FALSE(allocation->is_allocated());
+    EXPECT_TRUE(moved->is_allocated());
+    EXPECT_THROW(allocator.pin_l1(moved, coordinate, CoreCoord{0, 0}, BufferRegion{0, 32}), std::runtime_error);
+    EXPECT_EQ(allocator.get_allocated_buffers(), before);
+    EXPECT_EQ(moved->get_device_buffer(coordinate), child);
+    EXPECT_TRUE(child->is_allocated());
+    EXPECT_NO_THROW(moved->deallocate());
+}
+
+TEST_F(L1AllocationPinTest, MeshMoveAssignmentRetainsTheFactoryDestinationLifetimeOwner) {
+    distributed::DeviceLocalBufferConfig local;
+    local.page_size = 1024;
+    local.buffer_type = BufferType::L1;
+    local.sharding_args = sharding();
+    auto destination = distributed::MeshBuffer::create(distributed::ReplicatedBufferConfig{2048}, local, mesh.get());
+    auto source = distributed::MeshBuffer::create(distributed::ReplicatedBufferConfig{2048}, local, mesh.get());
+    const distributed::MeshCoordinate coordinate{0, 1};
+    auto* child = source->get_device_buffer(coordinate);
+    *destination = std::move(*source);
+    const auto destination_owners = destination.use_count();
+    EXPECT_FALSE(source->is_allocated());
+    EXPECT_EQ(destination->get_device_buffer(coordinate), child);
+    auto pin = mesh->impl().get_device(coordinate)->allocator_impl()->pin_l1(
+        destination, coordinate, CoreCoord{0, 0}, BufferRegion{0, 32});
+    EXPECT_EQ(&pin.buffer(), child);
+    EXPECT_EQ(destination.use_count(), destination_owners + 1);
+    EXPECT_TRUE(pin.live());
+}
+
+TEST_F(L1AllocationPinWithdrawalTest, OriginalAllocatorWithdrawalInvalidatesPinAndLeavesNoThrowingLateDestructor) {
+    IDevice* device = this->device.get();
+    auto buffer = allocate(device);
+    auto& allocator = *device->allocator_impl();
+    using Pin = decltype(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}));
+    std::optional<Pin> pin(allocator.pin_l1(buffer, CoreCoord{0, 0}, BufferRegion{0, 32}));
+    ASSERT_TRUE(pin->live());
+    EXPECT_TRUE(device->close());
+    EXPECT_FALSE(pin->live());
+    EXPECT_FALSE(buffer->is_allocated());
+    EXPECT_NO_THROW(pin.reset());
+    EXPECT_NO_THROW(buffer.reset());
+}
+
+TEST_F(L1AllocationPinTest, DirectChildPinRejectsWholeMeshReleaseBeforeAnyOtherDeviceAllocationIsDropped) {
+    distributed::DeviceLocalBufferConfig local;
+    local.page_size = 1024;
+    local.buffer_type = BufferType::L1;
+    local.sharding_args = sharding();
+    auto allocation = distributed::MeshBuffer::create(distributed::ReplicatedBufferConfig{2048}, local, mesh.get());
+    const distributed::MeshCoordinate coordinate{0, 1};
+    auto* device = mesh->impl().get_device(coordinate);
+    auto child = allocation->get_device_buffer(coordinate)->shared_from_this();
+    auto* other = allocation->get_device_buffer(distributed::MeshCoordinate{0, 0});
+    auto& allocator = *device->allocator_impl();
+    auto pin = allocator.pin_l1(child, CoreCoord{0, 0}, BufferRegion{0, 32});
+    EXPECT_THROW(allocation->deallocate(), std::runtime_error);
+    EXPECT_TRUE(allocation->is_allocated());
+    EXPECT_TRUE(child->is_allocated());
+    EXPECT_TRUE(other->is_allocated());
+    EXPECT_TRUE(pin.live());
+}
 
 TEST_F(NiuExecutionMeshTest, EventAllocationRejectsExhaustionWithoutReusingZero) {
     auto& manager = mesh->get_devices().front()->sysmem_manager();

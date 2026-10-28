@@ -55,12 +55,14 @@
 
 /////////////
 // Firmware/kernel code holes
-#define MEM_BRISC_FIRMWARE_SIZE (6 * 1024 + 1568)
+// Share the existing 14368-byte firmware interval between all five roles,
+// including their Program-profiler builds, without moving the NoC counters.
+#define MEM_BRISC_FIRMWARE_SIZE 6528
 // TODO: perhaps put NCRISC FW in the scratch area and free 1.5K after init (GS/WH)
-#define MEM_NCRISC_FIRMWARE_SIZE 2048
-#define MEM_TRISC0_FIRMWARE_SIZE 1536
-#define MEM_TRISC1_FIRMWARE_SIZE 1536
-#define MEM_TRISC2_FIRMWARE_SIZE 1536
+#define MEM_NCRISC_FIRMWARE_SIZE 2432
+#define MEM_TRISC0_FIRMWARE_SIZE 2144
+#define MEM_TRISC1_FIRMWARE_SIZE 1184
+#define MEM_TRISC2_FIRMWARE_SIZE 2080
 
 // Wormhole Architecture - BRISC, TRISC0/1/2 have no IRAM constraints
 // Only NCRISC is IRAM constrained

@@ -204,6 +204,11 @@ void RealtimeProfilerTracyHandler::MaybeEmitSkippedZoneSummaryLocked() {
 }
 
 void RealtimeProfilerTracyHandler::HandleRecord(const tt::ProgramRealtimeRecord& record) {
+    // Qualified dispatch ticks have their own counter owner and no calibrated
+    // frequency. The legacy Tracy clock context cannot convert that interval.
+    if (record.boundary != experimental::ProgramRealtimeBoundary::Legacy) {
+        return;
+    }
     if (record.end_timestamp < record.start_timestamp) {
         auto delta = static_cast<int64_t>(record.end_timestamp) - static_cast<int64_t>(record.start_timestamp);
         constexpr int64_t kStartupRaceThreshold = -100000;

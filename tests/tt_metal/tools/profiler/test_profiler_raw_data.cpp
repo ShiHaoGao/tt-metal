@@ -5,6 +5,7 @@
 // Host-only classic profiler wire decoding. No SDK context or device is used.
 #include <tt-metalium/profiler_raw_data.hpp>
 #include "hostdev/profiler_common.h"
+#include "hostdevcommon/dispatch_timing.hpp"
 
 #include <cstdio>
 #include <exception>
@@ -56,6 +57,42 @@ void test(const char* name, F body) {
 }  // namespace
 
 int main() {
+    test("dispatch timing seals only the matching worker completion", [] {
+        realtime_profiler_msg_t msg{};
+        check(tt::dispatch_timing::begin(msg, 99, 17, 48, 12, 1000), "GO occurrence admitted");
+        check(!tt::dispatch_timing::complete(msg, 47, 12, 1200), "another stream cannot finish the occurrence");
+        check(!tt::dispatch_timing::complete(msg, 48, 11, 1200), "partial workers cannot finish the occurrence");
+        check(tt::dispatch_timing::complete(msg, 48, 12, 1300), "all matching workers finish the occurrence");
+        const auto result = tt::dispatch_timing::decode(msg.dispatch_timing_records[0]);
+        check(result.valid && result.runtime_id == 99 && result.occurrence_id == 17 &&
+                  result.start == 1000 && result.end == 1300, "exact GO and completion survive the 64-byte wire");
+    });
+    test("dispatch timing rejects completion observed after its exact count", [] {
+        realtime_profiler_msg_t msg{};
+        check(tt::dispatch_timing::begin(msg, 99, 17, 48, 12, 1000), "GO admitted");
+        check(tt::dispatch_timing::complete(msg, 48, 13, 1300), "superseded occurrence is retired");
+        check(!tt::dispatch_timing::decode(msg.dispatch_timing_records[0]).valid,
+              "later worker completions cannot supply an earlier occurrence's end");
+    });
+    test("dispatch timing never overwrites an unconsumed bounded slot", [] {
+        realtime_profiler_msg_t msg{};
+        for (uint32_t i = 0; i < tt::dispatch_timing::capacity; ++i) {
+            check(tt::dispatch_timing::begin(msg, 99, i + 1, 48, i + 1, 1000 + i), "ring admits capacity");
+        }
+        check(!tt::dispatch_timing::begin(msg, 99, 100, 48, 100, 2000) && msg.dispatch_timing_dropped == 1,
+              "overflow must be explicit");
+        check(msg.dispatch_timing_records[0].occurrence_lo == 1, "overflow preserves unconsumed identity");
+    });
+    test("dispatch timing rejects unqualified or inverted pages", [] {
+        realtime_profiler_msg_t msg{};
+        check(!tt::dispatch_timing::decode(msg.dispatch_timing_records[0]).valid, "legacy zero page is unqualified");
+        check(!tt::dispatch_timing::begin(msg, 99, 0, 48, 12, 1000), "zero is not an invocation occurrence");
+        check(!tt::dispatch_timing::begin(msg, 0x10000, 17, 48, 12, 1000), "runtime identity cannot truncate");
+        check(tt::dispatch_timing::begin(msg, 99, 17, 48, 12, 1000), "qualified GO admitted");
+        tt::dispatch_timing::complete(msg, 48, 12, 999);
+        check(!tt::dispatch_timing::decode(msg.dispatch_timing_records[0]).valid, "end must follow start");
+        check(sizeof(realtime_profiler_dispatch_timing_t) == 64, "wire is exactly one D2H page");
+    });
     test("control vector contains every processor's reset address", [] {
         std::vector<uint32_t> control(kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE);
         check(kernel_profiler::DRAM_PROFILER_ADDRESS_T2_0 < control.size(),

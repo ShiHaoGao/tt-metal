@@ -389,6 +389,12 @@ void process_go_signal_mcast_cmd() {
     uint32_t num_unicasts = cmd->mcast.num_unicast_txns;
     uint32_t wait_count = load_aligned<uint32_t>(&cmd->mcast.wait_count);
     uint32_t wait_stream = load_aligned<uint32_t>(&cmd->mcast.wait_stream);
+#ifndef ARCH_QUASAR
+    const auto timing_program = rt_profiler_enabled ? pop_dispatch_timing_program(rt_profiler_msg) : DispatchTimingProgram{};
+    const bool qualified_timing = timing_program.occurrence != 0 && timing_program.workers != 0;
+    uint64_t timing_start = 0;
+    if (rt_profiler_enabled) write_buffer_id(rt_profiler_msg, timing_program.runtime_id);
+#endif
 
     if (multicast_go_offset != CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET) {
         // Setup registers before waiting for workers so only the NOC_CMD_CTRL register needs to be touched after.
@@ -423,6 +429,9 @@ void process_go_signal_mcast_cmd() {
 #if !DEVICE_PRINT_DISPATCH_ENABLED
         wait_for_workers(wait_count, wait_stream);
 #endif
+#ifndef ARCH_QUASAR
+        if (qualified_timing) timing_start = dispatch_timing_timestamp();
+#endif
         cq_noc_async_write_with_state<CQ_NOC_sndl, CQ_NOC_wait>(0, 0, 0, num_dests);
         noc_increment_nonposted_writes_issued(noc_index, 1);
     } else {
@@ -456,9 +465,22 @@ void process_go_signal_mcast_cmd() {
 
     for (uint32_t i = 0; i < num_unicasts; ++i) {
         uint64_t dst = get_noc_addr_helper(go_signal_noc_data[go_signal_noc_data_idx++], unicast_go_signal_addr);
+#ifndef ARCH_QUASAR
+        if (qualified_timing && timing_start == 0) timing_start = dispatch_timing_timestamp();
+#endif
         noc_async_write_one_packet(
             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(aligned_go_signal_storage)), dst, sizeof(uint32_t));
     }
+#ifndef ARCH_QUASAR
+    if (qualified_timing) {
+        // Publish after issuing GO so the completion observer cannot sample a
+        // pending row whose workers have not been launched. The retained start
+        // was sampled immediately before the first actual GO transaction.
+        tt::dispatch_timing::begin(*rt_profiler_msg, timing_program.runtime_id, timing_program.occurrence,
+                                   wait_stream, (wait_count + timing_program.workers) & ((1u << MEM_WORD_ADDR_WIDTH) - 1),
+                                   timing_start);
+    }
+#endif
 
     if (telemetry_enabled) {
         static uint32_t local_launch_seq_counter = 0;
@@ -632,10 +654,8 @@ void kernel_main() {
     while (!done) {
         DeviceZoneScopedN("CQ-DISPATCH-SUBORDINATE");
         rt_profiler_enabled = (rt_profiler_msg->realtime_profiler_core_noc_xy != 0);
-        uint32_t popped_pid = 0;
         if (rt_profiler_enabled) {
             record_realtime_timestamp(rt_profiler_msg, true);
-            popped_pid = pop_program_id(rt_profiler_msg);
         }
 #if DEVICE_PRINT_DISPATCH_ENABLED
         device_print_dispatcher.execute();
@@ -650,11 +670,7 @@ void kernel_main() {
         volatile CQDispatchCmd tt_l1_ptr* cmd = reinterpret_cast<volatile CQDispatchCmd tt_l1_ptr*>(cmd_ptr);
         DeviceTimestampedData("process_cmd_d_dispatch_subordinate", (uint32_t)cmd->base.cmd_id);
         if (rt_profiler_enabled) {
-            const bool is_profiled_cmd = cmd->base.cmd_id == CQ_DISPATCH_CMD_SEND_GO_SIGNAL ||
-                                         cmd->base.cmd_id == CQ_DISPATCH_CMD_RT_PROFILER_FLUSH;
-            write_buffer_id(
-                rt_profiler_msg,
-                is_profiled_cmd ? popped_pid : static_cast<uint32_t>(REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID));
+            write_buffer_id(rt_profiler_msg, REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID);
         }
         switch (cmd->base.cmd_id) {
             case CQ_DISPATCH_CMD_SEND_GO_SIGNAL:

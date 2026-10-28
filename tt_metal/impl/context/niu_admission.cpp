@@ -619,15 +619,68 @@ bool NiuAdmission::validate_managed_locked(const Guard& guard, const Token& toke
                                     detail::NiuLedger::State::Issued, error);
 }
 
-bool NiuAdmission::record_clean_locked(const Token& token, const Boots& boots, std::string& error) {
+std::shared_ptr<const NiuAdmission::CleanTerminal> NiuAdmission::record_clean_locked(
+    const Guard& guard, const Token& token, const Boots& boots,
+    const std::map<ChipId, uint64_t>& epochs, std::string& error) {
+    validate_guard(guard);
     auto* record = find_locked(token, error);
-    if (!record) return false;
-    if (record->state != State::Stopped)
-        return detail::reject(error, "NIU clean handoff requires its stopped admission");
-    if (!validate_boots_locked(*record, boots, error)) return false;
-    if (!validate_bindings_locked(*record, detail::NiuLedger::State::Stopped, error)) return false;
-    for (auto& [chip, binding] : record->bindings) binding.boot.ledger->record_clean(binding.token, error);
+    if (!record) return nullptr;
+    if (record->kind != Kind::Managed || record->state != State::Stopped) {
+        detail::reject(error, "NIU clean handoff requires its stopped managed admission");
+        return nullptr;
+    }
+    if (!validate_boots_locked(*record, boots, error) ||
+        !validate_bindings_locked(*record, detail::NiuLedger::State::Stopped, error)) return nullptr;
+    if (epochs.size() != boots.size()) {
+        detail::reject(error, "NIU clean handoff requires its complete Device epochs");
+        return nullptr;
+    }
+    for (const auto& [chip, boot] : boots) {
+        const auto frozen = epochs.find(chip);
+        const auto current = device_epochs_.find(chip);
+        if (frozen == epochs.end() || frozen->second != (current == device_epochs_.end() ? 0 : current->second)) {
+            detail::reject(error, "NIU clean handoff belongs to another Device epoch");
+            return nullptr;
+        }
+    }
+    // Allocate and capture every owner before the first ledger transition.
+    // Only the successful original transition publishes this sealed value.
+    auto terminal = std::shared_ptr<const CleanTerminal>(new CleanTerminal(token, boots, epochs));
+    for (auto& [chip, binding] : record->bindings) {
+        if (!binding.boot.ledger->record_clean(binding.token, error)) return nullptr;
+    }
     records_.erase(token.id_);
+    error.clear();
+    return terminal;
+}
+
+bool NiuAdmission::validate_clean_terminal_locked(
+    const Guard& guard, const CleanTerminal& terminal, const Token& token, const Boots& boots,
+    const std::map<ChipId, uint64_t>& epochs, std::string& error) const {
+    validate_guard(guard);
+    const auto& original = terminal.token_;
+    if (token.owner_ != owner_ || !token.lease_ || original.owner_ != token.owner_ ||
+        original.lease_ != token.lease_ || original.id_ != token.id_ ||
+        original.owner_.owner_before(token.owner_) || token.owner_.owner_before(original.owner_) ||
+        original.lease_.owner_before(token.lease_) || token.lease_.owner_before(original.lease_))
+        return detail::reject(error, "NIU clean terminal belongs to another original admission token");
+    if (terminal.boots_.size() != boots.size() || boots.empty() || epochs != terminal.epochs_ ||
+        epochs.size() != boots.size())
+        return detail::reject(error, "NIU clean terminal lost its original boot or Device epoch set");
+    for (const auto& [chip, boot] : boots) {
+        const auto sealed = terminal.boots_.find(chip);
+        const auto current = boots_.find(chip);
+        const auto epoch = device_epochs_.find(chip);
+        const auto frozen = epochs.find(chip);
+        if (!boot || !boot->live() || sealed == terminal.boots_.end() || current == boots_.end() ||
+            !same_boot(boot, sealed->second) || !same_boot(boot, current->second.firmware) ||
+            frozen == epochs.end() || frozen->second != (epoch == device_epochs_.end() ? 0 : epoch->second))
+            return detail::reject(error, "NIU clean terminal belongs to a withdrawn boot or Device epoch");
+    }
+    // Defensive consistency only: the sealed successful transition above,
+    // rather than absence from this map, is the source of clean authority.
+    if (records_.contains(token.id_))
+        return detail::reject(error, "NIU clean terminal still has an active admission record");
     error.clear();
     return true;
 }

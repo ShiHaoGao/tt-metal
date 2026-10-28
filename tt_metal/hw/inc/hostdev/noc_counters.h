@@ -19,7 +19,8 @@ constexpr uint32_t DYNAMIC_NOC_BRISC_WR_REG_CMD_BUF = 0;
 constexpr uint32_t DYNAMIC_NOC_BRISC_AT_CMD_BUF = 1;
 constexpr uint32_t DYNAMIC_NOC_BRISC_RD_CMD_BUF = 1;
 
-// The same physical counter layout is consumed by firmware and by host-side
+// Blackhole and Wormhole share this software counter layout; their NoC MMIO
+// register addresses remain architecture-specific. The layout is consumed by firmware and by host-side
 // native support publication. Do not pull device operations or RVTT pointers
 // into host layout projection.
 #ifdef HAL_BUILD

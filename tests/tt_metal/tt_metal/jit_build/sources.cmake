@@ -18,4 +18,5 @@ set(UNIT_TESTS_JIT_BUILD_SRC
     test_sync_build_steps.cpp
     test_trisc2_rvv.cpp
     test_worker_firmware_build.cpp
+    test_wormhole_firmware_layout.cpp
 )

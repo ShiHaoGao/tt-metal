@@ -554,7 +554,7 @@ std::shared_ptr<Buffer> BufferImpl::create(
         device, size, page_size, buffer_type, sharding_args, bottom_up, sub_device_id, true /* owns data */));
 
     if (buffer->impl().size_ == 0) {
-        buffer->impl().allocation_status_ = BufferImpl::AllocationStatus::ALLOCATED;
+        buffer->impl().lifetime_->allocation_status = BufferImpl::AllocationStatus::ALLOCATED;
         return buffer;
     }
 
@@ -589,7 +589,7 @@ std::shared_ptr<Buffer> BufferImpl::create(
         device, size, page_size, buffer_type, sharding_args, bottom_up, sub_device_id, false /* owns data */));
 
     buffer->impl().address_ = address;
-    buffer->impl().allocation_status_ = BufferImpl::AllocationStatus::ALLOCATED;
+    buffer->impl().lifetime_->allocation_status = BufferImpl::AllocationStatus::ALLOCATED;
 
     // Explicit-address (non-owning) buffers skip allocate_impl(), so register their
     // extent here (removed in deallocate()): per-core for L1 (SANITIZER_CHECKS.md §4),
@@ -704,7 +704,7 @@ void BufferImpl::allocate_impl(Buffer& self) {
     }
 
     // Important! Graph tracker must called after the allocation status is updated.
-    allocation_status_ = AllocationStatus::ALLOCATED;
+    lifetime_->allocation_status = AllocationStatus::ALLOCATED;
 
     GraphTracker::instance().track_allocate(&self);
 }
@@ -715,14 +715,14 @@ void BufferImpl::deallocate(Buffer& self) {
         if (emule_device_seen.load(std::memory_order_relaxed)) {
             // Mirror the Buffer::create registration; non-owning buffers skip deallocate_impl().
             // Guard on status: the explicit-call + destructor double-deallocate must remove once.
-            if (allocation_status_ == AllocationStatus::ALLOCATED && size_ != 0) {
+            if (lifetime_->allocation_status == AllocationStatus::ALLOCATED && size_ != 0) {
                 if (buffer_type_ == BufferType::L1 || buffer_type_ == BufferType::L1_SMALL) {
                     tt::tt_metal::emule::LiveL1Ranges::remove(device_->id(), unique_id_);
                 } else if (buffer_type_ == BufferType::DRAM) {
                     tt::tt_metal::emule::LiveDramRanges::remove(device_->id(), unique_id_);
                 }
             }
-            allocation_status_ = AllocationStatus::DEALLOCATED;
+            lifetime_->allocation_status = AllocationStatus::DEALLOCATED;
         }
         return;
     }
@@ -730,7 +730,11 @@ void BufferImpl::deallocate(Buffer& self) {
 }
 
 void BufferImpl::deallocate_impl(Buffer& self) {
-    if (allocation_status_ != AllocationStatus::ALLOCATED) {
+    std::lock_guard lifetime_lock(lifetime_->mutex);
+    TT_FATAL(
+        lifetime_->l1_pins.load(std::memory_order_acquire) == 0,
+        "Cannot deallocate an original Buffer with live L1 pins");
+    if (lifetime_->allocation_status != AllocationStatus::ALLOCATED) {
         return;
     }
 
@@ -764,13 +768,13 @@ void BufferImpl::deallocate_impl(Buffer& self) {
         LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureBufferDeallocate, self);
     }
 
-    allocation_status_ = AllocationStatus::DEALLOCATED;
+    lifetime_->allocation_status = AllocationStatus::DEALLOCATED;
 }
 
 Buffer::~Buffer() {
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
     LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureBufferDelete, *this);
-    if (impl_ && impl_->allocation_status_ != BufferImpl::AllocationStatus::DEALLOCATED) {
+    if (impl_ && impl_->lifetime_->allocation_status != BufferImpl::AllocationStatus::DEALLOCATED) {
         impl_->deallocate(*this);
     }
 }
@@ -785,7 +789,7 @@ size_t Buffer::unique_id() const { return impl_->unique_id_; }
 
 uint32_t Buffer::address() const {
     TT_FATAL(
-        impl_->allocation_status_ != BufferImpl::AllocationStatus::ALLOCATION_REQUESTED,
+        impl_->lifetime_->allocation_status != BufferImpl::AllocationStatus::ALLOCATION_REQUESTED,
         "Can only query the address of a buffer that has been allocated");
     return impl_->address_;
 }

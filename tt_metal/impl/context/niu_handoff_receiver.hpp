@@ -5,8 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/device_types.hpp>
@@ -77,9 +79,72 @@ struct NiuItemWitnessReadResult {
 };
 
 class NiuHandoffReceiver final {
+    struct ItemAcknowledgementState;
+
 public:
     using ItemWitnessRequest = tt_niu_item_witness_request;
     using ItemWitnessRegion = tt_niu_item_witness_region;
+    using ItemWitnessAcknowledgement = tt_niu_item_witness_acknowledgement;
+    class ItemReception;
+    // An immutable snapshot bound to one reception and one accepted round.
+    // Only successful transport/readback authorizes the local acknowledge.
+    class ItemAcknowledgement final {
+    public:
+        const ItemWitnessAcknowledgement& wire() const;
+
+    private:
+        friend class NiuHandoffReceiver;
+        friend class ItemReception;
+        explicit ItemAcknowledgement(std::shared_ptr<ItemAcknowledgementState> state) : state_(std::move(state)) {}
+        std::shared_ptr<ItemAcknowledgementState> state_;
+    };
+    // Serialized by the original invocation's admission guard. This owns
+    // reception state only; it cannot mint a boot, managed lease or visibility
+    // proof. The caller must validate the original issuer before each receive.
+    class ItemReception final {
+    public:
+        enum class IssuerState { Reserved, Issued, Stopped };
+        enum class Status { Pending, Complete, NotExecuted, Finished, Rejected, Invalidated, IoFailure };
+        // Distinct from a physical item completion. Only an explicit source
+        // End, received after its original writer stopped, creates this proof.
+        class SeriesTerminal final {
+        public:
+            uint64_t final_count() const { return observation_.wire().receipt.series.final_count; }
+            const NiuItemWitnessObservation& observation() const { return observation_; }
+
+        private:
+            friend class ItemReception;
+            explicit SeriesTerminal(NiuItemWitnessObservation observation) : observation_(std::move(observation)) {}
+            NiuItemWitnessObservation observation_;
+        };
+        explicit ItemReception(ItemWitnessRequest request);
+        ~ItemReception();
+        ItemReception(const ItemReception&) = delete;
+        ItemReception& operator=(const ItemReception&) = delete;
+        const ItemWitnessRequest& request() const { return request_; }
+        const std::optional<NiuItemWitnessObservation>& accepted() const { return accepted_; }
+        // Established only by a fresh End read bracketed by the original SDK
+        // leaf's stopped state. Closed and receipt ACK never imply source End.
+        const std::optional<SeriesTerminal>& terminal() const { return terminal_; }
+        uint64_t closed_prefix() const { return closed_prefix_; }
+        uint64_t acknowledged_prefix() const { return acknowledged_prefix_; }
+        std::optional<ItemAcknowledgement> acknowledgement() const;
+        bool acknowledge(const ItemAcknowledgement& acknowledgement);
+        Status receive(IssuerState sampled, IssuerState current, const NiuItemWitnessReadResult& observed);
+
+    private:
+        const ItemWitnessRequest request_;
+        Status status_ = Status::Pending;
+        std::optional<NiuItemWitnessObservation> accepted_;
+        std::optional<NiuItemWitnessObservation> observed_;
+        std::optional<NiuItemWitnessObservation> acknowledged_;
+        std::optional<SeriesTerminal> terminal_;
+        uint64_t closed_prefix_ = 0;
+        uint64_t acknowledged_prefix_ = 0;
+        ItemWitnessAcknowledgement last_acknowledgement_{};
+        std::shared_ptr<ItemAcknowledgementState> acknowledgement_;
+    };
+    enum class ItemWitnessCheck { Match, Pending, Rejected, InvalidRequest, RequestMismatch, OccurrenceMismatch };
     // Offsets are relative to the mailbox. This byte decoder neither chooses
     // the device endpoint nor establishes owner/boot lifetime.
     using Read = std::function<NiuHandoffIoStatus(uint32_t, std::span<std::byte>)>;
@@ -116,7 +181,13 @@ public:
     // The complete gen0 region is verified before the generation is exposed.
     static NiuHandoffWriteStatus write_item_request(
         const Write&, const Read&, const ItemWitnessRequest&);
+    // The original invocation owner supplies real slot IO under its admission
+    // guard. ACK releases only the receipt slot, never payload backing.
+    static NiuHandoffWriteStatus write_item_acknowledgement(
+        const Write&, const Read&, const ItemAcknowledgement&);
     static NiuItemWitnessReadResult read_item(const Read& read);
+    static ItemWitnessCheck check_item(
+        const NiuItemWitnessObservation& observation, const ItemWitnessRequest& expected);
     static bool closed_item(
         const NiuItemWitnessObservation& observation, const ItemWitnessRequest& expected);
 };

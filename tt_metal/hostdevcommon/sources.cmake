@@ -1,6 +1,7 @@
 set(HOSTDEVCOMMON_JIT_API_HEADERS
     api/hostdev/native_kernel_contract.h
     api/hostdev/niu_handoff_contract.h
+    api/hostdev/niu_item_witness_contract.h
     api/hostdev/niu_handoff_layout.h
     api/hostdevcommon/common_values.hpp
     api/hostdevcommon/dispatch_telemetry_types.hpp

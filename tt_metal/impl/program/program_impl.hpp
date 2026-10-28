@@ -236,6 +236,8 @@ public:
 
     void set_runtime_id(ProgramId id);
     ProgramId get_runtime_id() const;
+    void set_dispatch_timing_occurrence(uint64_t occurrence);
+    uint64_t get_dispatch_timing_occurrence() const { return dispatch_timing_occurrence_; }
     ProgramId get_id() const;
     void set_worker_stream_state_owner(tt::worker_stream_state::Owner owner);
     tt::worker_stream_state::Owner get_worker_stream_state_owner() const {
@@ -559,6 +561,8 @@ public:
 
     // Deallocate circular buffers and unregister from devices
     void deallocate_circular_buffers();
+    // Retire this physical device without disturbing registrations on others.
+    void deallocate_circular_buffers(const IDevice* device);
 
     // CB tracking for SHM memory reporting
     // Merge exact core-range unions before expanding to individual cores.
@@ -740,6 +744,7 @@ private:
     uint32_t max_cbs_;  // Architecture-specific max CBs
     uint64_t id;        // Need to make non-const due to move constructor
     uint64_t runtime_id{0};
+    uint64_t dispatch_timing_occurrence_{0};
     static std::atomic<uint64_t> program_counter;
     // Programmable core type index -> KernelHandle -> Kernel
     std::vector<std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>> kernels_;

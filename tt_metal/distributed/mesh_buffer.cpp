@@ -174,6 +174,25 @@ void validate_mesh_buffer_config(const MeshBufferConfig& config, const MeshDevic
         mesh_device.num_devices());
 }
 
+void sort_unique_buffers(std::vector<std::shared_ptr<Buffer>>& buffers) {
+    std::sort(buffers.begin(), buffers.end(), [](const auto& lhs, const auto& rhs) {
+        return std::less<Buffer*>{}(lhs.get(), rhs.get());
+    });
+    buffers.erase(std::unique(buffers.begin(), buffers.end()), buffers.end());
+}
+
+std::vector<std::unique_lock<std::mutex>> lock_unpinned_buffers(const std::vector<std::shared_ptr<Buffer>>& buffers) {
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(buffers.size());
+    for (const auto& buffer : buffers) {
+        locks.emplace_back(buffer->impl().lifetime_->mutex);
+        TT_FATAL(
+            buffer->impl().lifetime_->l1_pins.load(std::memory_order_acquire) == 0,
+            "Cannot release or move a MeshBuffer with live L1 allocation pins");
+    }
+    return locks;
+}
+
 }  // namespace
 
 uint32_t ShardedBufferConfig::compute_datum_size_bytes() const {
@@ -210,6 +229,7 @@ std::shared_ptr<MeshBuffer> MeshBuffer::create(
         auto mesh_buffer =
             std::shared_ptr<MeshBuffer>(new MeshBuffer(mesh_buffer_config, device_local_config, 0, 0, mesh_device));
         mesh_buffer->initialize_device_buffers();
+        mesh_buffer->lifetime_owner_ = mesh_buffer;
         Inspector::mesh_buffer_allocated(mesh_buffer.get());
         return mesh_buffer;
     }
@@ -290,6 +310,7 @@ std::shared_ptr<MeshBuffer> MeshBuffer::create(
         mesh_buffer->initialize_device_buffers();
     }
 
+    mesh_buffer->lifetime_owner_ = mesh_buffer;
     Inspector::mesh_buffer_allocated(mesh_buffer.get());
     return mesh_buffer;
 }
@@ -354,25 +375,69 @@ bool MeshBuffer::is_allocated() const {
     return true;
 }
 
-MeshBuffer::~MeshBuffer() { deallocate(); }
+MeshBuffer::~MeshBuffer() {
+    // A mesh pin retains this object. A direct child pin retains the original
+    // child allocation instead, so implicit teardown may drop mesh ownership
+    // without explicitly releasing that still-pinned child.
+    deallocate_locked();
+}
 
-MeshBuffer::MeshBuffer(MeshBuffer&& other) noexcept :
-    config_((Inspector::mesh_buffer_deallocated(&other), other.config_)),
-    device_local_config_(std::move(other.device_local_config_)),
-    mesh_device_(std::move(other.mesh_device_)),
-    address_(other.address_),
-    device_local_size_(other.device_local_size_),
-    buffers_(std::move(other.buffers_)),
-    state_(std::move(other.state_)) {
-    other.state_ = DeallocatedState{};
-    other.address_ = 0;
-    other.device_local_size_ = 0;
+std::vector<std::shared_ptr<Buffer>> MeshBuffer::retain_buffers_locked() const {
+    std::vector<std::shared_ptr<Buffer>> retained;
+    retained.reserve(buffers_.values().size() + 1);
+    for (const auto& buffer : buffers_.values()) {
+        if (buffer.is_local() && buffer.value()) {
+            retained.push_back(buffer.value());
+        }
+    }
+    if (const auto* owned = std::get_if<OwnedBufferState>(&state_); owned && owned->backing_buffer) {
+        retained.push_back(owned->backing_buffer);
+    }
+    sort_unique_buffers(retained);
+    return retained;
+}
+
+struct MeshBuffer::MoveGuard {
+    explicit MoveGuard(MeshBuffer& source) : source(source), mesh_lock(source.lifetime_mutex_) {
+        TT_FATAL(source.l1_pins_ == 0, "Cannot move a MeshBuffer with live L1 pins");
+        retained = source.retain_buffers_locked();
+        buffer_locks = lock_unpinned_buffers(retained);
+    }
+    MeshBuffer& source;
+    std::unique_lock<std::mutex> mesh_lock;
+    std::vector<std::shared_ptr<Buffer>> retained;
+    std::vector<std::unique_lock<std::mutex>> buffer_locks;
+};
+
+MeshBuffer::MeshBuffer(MeshBuffer&& other) : MeshBuffer(MoveGuard(other)) {}
+
+MeshBuffer::MeshBuffer(MoveGuard guard) :
+    config_((Inspector::mesh_buffer_deallocated(&guard.source), guard.source.config_)),
+    device_local_config_(std::move(guard.source.device_local_config_)),
+    mesh_device_(std::move(guard.source.mesh_device_)),
+    address_(guard.source.address_),
+    device_local_size_(guard.source.device_local_size_),
+    buffers_(std::move(guard.source.buffers_)),
+    state_(std::move(guard.source.state_)) {
+    guard.source.state_ = DeallocatedState{};
+    guard.source.address_ = 0;
+    guard.source.device_local_size_ = 0;
     Inspector::mesh_buffer_allocated(this);
 }
 
-MeshBuffer& MeshBuffer::operator=(MeshBuffer&& other) noexcept {
+MeshBuffer& MeshBuffer::operator=(MeshBuffer&& other) {
     if (this != &other) {
-        deallocate();
+        // Retain originals until every mesh/Buffer lock has been released;
+        // their final normal deallocation takes the Buffer/allocator locks.
+        std::vector<std::shared_ptr<Buffer>> retained;
+        std::scoped_lock mesh_locks(lifetime_mutex_, other.lifetime_mutex_);
+        TT_FATAL(l1_pins_ == 0 && other.l1_pins_ == 0, "Cannot move a MeshBuffer with live L1 pins");
+        retained = retain_buffers_locked();
+        auto other_retained = other.retain_buffers_locked();
+        retained.insert(retained.end(), other_retained.begin(), other_retained.end());
+        sort_unique_buffers(retained);
+        auto buffer_locks = lock_unpinned_buffers(retained);
+        deallocate_locked();
         Inspector::mesh_buffer_deallocated(&other);
         config_ = other.config_;
         device_local_config_ = std::move(other.device_local_config_);
@@ -391,6 +456,18 @@ MeshBuffer& MeshBuffer::operator=(MeshBuffer&& other) noexcept {
 }
 
 void MeshBuffer::deallocate() {
+    // Check every actual allocation before dropping even the first device's
+    // ownership. Direct child pins must have the same atomic protection as
+    // pins acquired through the MeshBuffer overload.
+    std::vector<std::shared_ptr<Buffer>> retained;
+    std::lock_guard mesh_lock(lifetime_mutex_);
+    TT_FATAL(l1_pins_ == 0, "Cannot deallocate a MeshBuffer with live L1 pins");
+    retained = retain_buffers_locked();
+    auto buffer_locks = lock_unpinned_buffers(retained);
+    deallocate_locked();
+}
+
+void MeshBuffer::deallocate_locked() {
     // Guard against double reporting to Inspector if deallocate() was called explicitly and then again in the
     // destructor.
     if (!std::holds_alternative<DeallocatedState>(state_)) {

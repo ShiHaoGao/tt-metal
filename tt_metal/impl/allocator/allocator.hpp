@@ -10,7 +10,9 @@
 #include <unordered_set>
 
 #include <tt-metalium/allocator.hpp>
+#include <tt-metalium/buffer.hpp>
 #include <tt-metalium/device.hpp>
+#include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/mesh_trace_id.hpp>
 
 #include "impl/allocator/allocator_types.hpp"
@@ -21,11 +23,45 @@ namespace tt::tt_metal {
 
 namespace distributed {
 class MeshDeviceImpl;
-}
+class MeshBuffer;
+}  // namespace distributed
 
 // THREAD SAFETY: Allocator is thread safe.
 class AllocatorImpl {
+    struct L1PinOwner;
+
 public:
+    // Retains one original registered per-core L1 allocation and exact core
+    // subrange. This grants no issue, completion, visibility or retirement.
+    class L1AllocationPin final {
+    public:
+        L1AllocationPin(L1AllocationPin&&) noexcept;
+        L1AllocationPin& operator=(L1AllocationPin&&) noexcept;
+        ~L1AllocationPin() noexcept;
+        L1AllocationPin(const L1AllocationPin&) = delete;
+        L1AllocationPin& operator=(const L1AllocationPin&) = delete;
+        const Buffer& buffer() const;
+        size_t allocation_id() const;
+        IDevice* device() const;
+        CoreCoord core() const;
+        DeviceAddr begin() const;
+        DeviceAddr end() const;
+        // False after allocator withdrawal; never a normal-retirement receipt.
+        bool live() const noexcept;
+
+    private:
+        friend class AllocatorImpl;
+        struct State;
+        explicit L1AllocationPin(std::unique_ptr<State> state);
+        std::unique_ptr<State> state_;
+    };
+    L1AllocationPin pin_l1(std::shared_ptr<Buffer> buffer, CoreCoord core, BufferRegion region);
+    L1AllocationPin pin_l1(
+        std::shared_ptr<distributed::MeshBuffer> buffer,
+        const distributed::MeshCoordinate& device,
+        CoreCoord core,
+        BufferRegion region);
+
     // AllocatorConfig is not in the API directory, thus Allocator currently cannot be constructed publicly,
     // this is because we are in the middle of moving Allocator into implementation details.
     // This initiative is established from our analysis that Allocator is only used to query memory profiles
@@ -185,7 +221,10 @@ private:
     void clear_trace_allocation_state();
     bool in_corruptible_allocation_scope() const;
 
-    mutable std::mutex mutex_;
+    // The same allocator lock outlives withdrawal just long enough for opaque
+    // pins to release without calling through a destroyed allocator.
+    std::shared_ptr<L1PinOwner> l1_pin_owner_;
+    std::mutex& mutex_;
 
     std::unique_ptr<BankManager> dram_manager_;
     std::unique_ptr<BankManager> l1_manager_;

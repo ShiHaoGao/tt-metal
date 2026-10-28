@@ -223,13 +223,14 @@ set(HW_JIT_API_HEADERS
     inc/hostdev/debug_ring_buffer_common.h
     inc/hostdev/dev_msgs.h
     inc/hostdev/worker_stream_state_contract.h
-    inc/hostdev/blackhole_noc_counters.h
+    inc/hostdev/noc_counters.h
     inc/hostdev/device_print_common.h
     inc/hostdev/device_print_structures.h
     inc/hostdev/fabric_telemetry_msgs.h
     inc/hostdev/profiler_common.h
     inc/hostdev/profiler_zone_id.h
     inc/hostdev/realtime_profiler_msgs.h
+    inc/hostdevcommon/dispatch_timing.hpp
     inc/hostdev/remote_dfb_constants.h
     inc/hostdev/remote_dfb_config_layout.h
     inc/hostdev/streaming_profiler_common.h
@@ -284,6 +285,8 @@ set(HW_JIT_API_HEADERS
     inc/internal/tt-1xx/blackhole/eth_chan_noc_mapping.h
     inc/internal/tt-1xx/blackhole/eth_fw_api.h
     inc/internal/tt-1xx/blackhole/eth_l1_address_map.h
+    inc/internal/tt-1xx/blackhole/gddr_dma_regs.h
+    inc/internal/tt-1xx/blackhole/hw_counters.h
     inc/internal/tt-1xx/blackhole/noc/noc.h
     inc/internal/tt-1xx/blackhole/noc/noc_overlay_parameters.h
     inc/internal/tt-1xx/blackhole/noc/noc_parameters.h
@@ -355,6 +358,7 @@ set(HW_JIT_API_HEADERS
     inc/internal/tt-1xx/wormhole/eth_chan_noc_mapping.h
     inc/internal/tt-1xx/wormhole/eth_fw_api.h
     inc/internal/tt-1xx/wormhole/eth_l1_address_map.h
+    inc/internal/tt-1xx/wormhole/hw_counters.h
     inc/internal/tt-1xx/wormhole/noc/noc.h
     inc/internal/tt-1xx/wormhole/noc/noc_overlay_parameters.h
     inc/internal/tt-1xx/wormhole/noc/noc_parameters.h

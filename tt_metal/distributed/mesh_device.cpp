@@ -1770,6 +1770,10 @@ void MeshDeviceImpl::trigger_realtime_profiler_sync_check() {
 
 RealtimeProfilerManager* MeshDeviceImpl::get_realtime_profiler() const { return realtime_profiler_.get(); }
 
+std::optional<CoreCoord> MeshDeviceImpl::dispatch_timing_producer_core(uint32_t chip_id) const {
+    return realtime_profiler_ ? realtime_profiler_->dispatch_timing_producer_core(chip_id) : std::nullopt;
+}
+
 ::tt::tt_metal::DriscL1Arena& MeshDeviceImpl::drisc_l1_arena() {
     TT_FATAL(
         drisc_l1_arena_ != nullptr,
@@ -2232,6 +2236,9 @@ tt_fabric::FabricNodeId MeshDevice::get_fabric_node_id(const MeshCoordinate& coo
     return pimpl_->get_fabric_node_id(coord);
 }
 DeviceIds MeshDevice::get_device_ids() const { return pimpl_->get_device_ids(); }
+std::optional<CoreCoord> MeshDevice::dispatch_timing_producer_core(ChipId chip_id) const {
+    return pimpl_->dispatch_timing_producer_core(chip_id);
+}
 size_t MeshDevice::num_devices() const { return pimpl_->num_devices(); }
 size_t MeshDevice::num_rows() const { return pimpl_->num_rows(); }
 size_t MeshDevice::num_cols() const { return pimpl_->num_cols(); }

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -54,6 +55,7 @@
 #include "distributed/mesh_device_impl.hpp"
 #include "llrt/hal.hpp"
 #include "program/program_impl.hpp"
+#include "hostdevcommon/dispatch_timing.hpp"
 #include "tracy/Tracy.hpp"
 #include "tt_metal/impl/dispatch/data_collection.hpp"
 #include "tt_metal/impl/dispatch/data_collector.hpp"
@@ -341,6 +343,15 @@ uint32_t RealtimeProfilerManager::ring_full_wait_count() const {
     return peak;
 }
 
+std::optional<CoreCoord> RealtimeProfilerManager::dispatch_timing_producer_core(uint32_t chip_id) const {
+    for (const auto& dev_state : devices_) {
+        if (dev_state.chip_id == chip_id && dev_state.dispatch_timing_available) {
+            return dev_state.dispatch_timing_core;
+        }
+    }
+    return std::nullopt;
+}
+
 void RealtimeProfilerManager::publish_pages(
     const DeviceState& dev_state,
     const uint32_t* page_buf,
@@ -354,6 +365,23 @@ void RealtimeProfilerManager::publish_pages(
     const DataCollector* const data_collector = data_collector_;
     for (uint32_t page = 0; page < num_pages; ++page) {
         const uint32_t* rp = page_buf + page * kPageWords;
+        if (rp[3] == tt::dispatch_timing::marker) {
+            realtime_profiler_dispatch_timing_t wire{};
+            std::memcpy(&wire, rp, sizeof(wire));
+            const auto decoded = tt::dispatch_timing::decode(wire);
+            tt::ProgramRealtimeRecord record{
+                decoded.runtime_id, chip_id, decoded.start, decoded.end, 0.0, {}};
+            record.boundary = tt::tt_metal::experimental::ProgramRealtimeBoundary::DispatchGoToCompletion;
+            record.status = decoded.valid ? tt::tt_metal::experimental::ProgramRealtimeStatus::Complete
+                                          : tt::tt_metal::experimental::ProgramRealtimeStatus::Invalid;
+            record.occurrence_id = decoded.occurrence_id;
+            record.dispatch_core_x = dev_state.dispatch_timing_core.x;
+            record.dispatch_core_y = dev_state.dispatch_timing_core.y;
+            record.producer_dropped = decoded.dropped;
+            std::copy_n(rp, record.raw_words.size(), record.raw_words.begin());
+            records.push_back(std::move(record));
+            continue;
+        }
         if (!is_record(rp)) {
             continue;
         }
@@ -716,6 +744,8 @@ void RealtimeProfilerManager::initialize_devices(const std::shared_ptr<MeshDevic
                     CoreCoord(dispatch_s_cxy.x, dispatch_s_cxy.y), CoreType::WORKER);
                 dispatch_core_noc_x = dispatch_s_virtual.x;
                 dispatch_core_noc_y = dispatch_s_virtual.y;
+                dev_state.dispatch_timing_core = dispatch_s_virtual;
+                dev_state.dispatch_timing_available = true;
 
                 uint32_t kernel_start_a_offset = factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
                     realtime_profiler_msgs::realtime_profiler_msg_t::Field::kernel_start_a);
@@ -732,6 +762,15 @@ void RealtimeProfilerManager::initialize_devices(const std::shared_ptr<MeshDevic
             brisc_config.defines["DISPATCH_CORE_NOC_Y"] = std::to_string(dispatch_core_noc_y);
             brisc_config.defines["DISPATCH_DATA_ADDR_A"] = std::to_string(dispatch_data_addr_a);
             brisc_config.defines["DISPATCH_DATA_ADDR_B"] = std::to_string(dispatch_data_addr_b);
+            brisc_config.defines["DISPATCH_TIMING_COMPLETED_ADDR"] = std::to_string(
+                realtime_profiler_base_addr + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                    realtime_profiler_msgs::realtime_profiler_msg_t::Field::dispatch_timing_completed));
+            brisc_config.defines["DISPATCH_TIMING_CONSUMED_ADDR"] = std::to_string(
+                realtime_profiler_base_addr + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                    realtime_profiler_msgs::realtime_profiler_msg_t::Field::dispatch_timing_consumed));
+            brisc_config.defines["DISPATCH_TIMING_RECORDS_ADDR"] = std::to_string(
+                realtime_profiler_base_addr + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                    realtime_profiler_msgs::realtime_profiler_msg_t::Field::dispatch_timing_records));
             brisc_config.defines["RING_BUFFER_ADDR"] = std::to_string(ring_buffer_addr);
             brisc_config.defines["REALTIME_PROFILER_MSG_ADDR"] = std::to_string(realtime_profiler_base_addr);
             CreateKernel(

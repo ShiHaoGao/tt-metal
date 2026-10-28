@@ -58,7 +58,9 @@ void write_bytes(const fs::path& path, std::span<const std::byte> bytes) {
 
 void publish(const DeploymentPublishOptions& paths) {
     const auto input_bytes = read_bytes(paths.input, 1024 * 1024);
-    const auto expected_program = read_bytes(paths.program_record, 16 * 1024 * 1024);
+    std::vector<std::byte> expected_program;
+    if (!paths.program_record.empty())
+        expected_program = read_bytes(paths.program_record, 16 * 1024 * 1024);
     const auto facts = parse_deployment_input(std::string_view(
         reinterpret_cast<const char*>(input_bytes.data()), input_bytes.size()));
     Publication publication(paths.output);
@@ -91,7 +93,8 @@ void publish(const DeploymentPublishOptions& paths) {
     const experimental::catalog::Input input{sdk, chip, facts.device_id, host, facts.active_ethernet_channels};
     const auto actual = experimental::catalog::make_input(input, hal, options);
     const auto program = experimental::plan_dispatch_program(actual.program);
-    require_program_record(expected_program, program.canonical_record());
+    if (!expected_program.empty())
+        require_program_record(expected_program, program.canonical_record());
     SourceArchive sources(publication, sdk);
     nlohmann::json provenance = {{"format", "tt-metal-native-deployment-publication-v2"},
         {"sdk_source_root", sdk.string()}, {"profile", facts.profile},
@@ -138,7 +141,7 @@ void publish(const DeploymentPublishOptions& paths) {
     const auto staged_program = publication.cache() / "dispatch-program.record";
     write_bytes(staged, archive);
     write_bytes(staged_input, input_bytes);
-    write_bytes(staged_program, expected_program);
+    write_bytes(staged_program, program.canonical_record());
     publication.copy(staged, "deployment/published-deployment.v2");
     publication.copy(staged_input, "provenance/inputs.json");
     publication.copy(staged_program, "provenance/dispatch-program.record");

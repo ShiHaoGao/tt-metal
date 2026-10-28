@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <tt-metalium/cluster.hpp>
 #include <tt-metalium/experimental/published_deployment.hpp>
 #include <umd/device/types/arch.hpp>
 #include <tt-metalium/experimental/context/device_profiler_config.hpp>
@@ -50,6 +51,23 @@ public:
     bool is_mock_device() const { return mock_cluster_desc_path_.has_value(); }
     const std::string& mock_cluster_desc_path() const { return *mock_cluster_desc_path_; }
     const FabricConfigDescriptor& fabric_config_descriptor() const { return fabric_config_desc_; }
+    PhysicalChipDiscovery physical_chip_discovery() const { return physical_chip_discovery_; }
+    // MmioOnly excludes remote Ethernet chips before driver startup and firmware
+    // initialization. Combine it with TT_VISIBLE_DEVICES to select a PCI/BDF.
+    // It is a physical-silicon mode and cannot be combined with fabric routing.
+    void set_physical_chip_discovery(PhysicalChipDiscovery mode) {
+        if (mode != PhysicalChipDiscovery::AllConnected && mode != PhysicalChipDiscovery::MmioOnly)
+            throw std::invalid_argument("unknown physical chip discovery mode");
+        if (mode == PhysicalChipDiscovery::MmioOnly) {
+            if (is_mock_device())
+                throw std::invalid_argument("MMIO-only chip discovery requires physical silicon");
+            if (fabric_config_desc_.fabric_config != tt_fabric::FabricConfig::DISABLED ||
+                fabric_config_desc_.fabric_tensix_config != tt_fabric::FabricTensixConfig::DISABLED ||
+                fabric_config_desc_.fabric_udm_mode != tt_fabric::FabricUDMMode::DISABLED)
+                throw std::invalid_argument("MMIO-only chip discovery does not support fabric routing");
+        }
+        physical_chip_discovery_ = mode;
+    }
     std::optional<DeviceProfilerMode> device_profiler_mode() const { return device_profiler_mode_; }
     void set_device_profiler_mode(DeviceProfilerMode mode) {
         if (published_deployment_ && published_deployment_->configuration().profiler_mode() != mode)
@@ -71,6 +89,7 @@ public:
 protected:
     std::optional<std::string> mock_cluster_desc_path_ = std::nullopt;
     FabricConfigDescriptor fabric_config_desc_;
+    PhysicalChipDiscovery physical_chip_discovery_ = PhysicalChipDiscovery::AllConnected;
     // Absence preserves the existing environment-driven SDK behavior.
     std::optional<DeviceProfilerMode> device_profiler_mode_;
     std::shared_ptr<const experimental::PublishedDeployment> published_deployment_;

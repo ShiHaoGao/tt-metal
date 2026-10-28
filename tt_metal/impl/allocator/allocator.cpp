@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <memory>
+#include <limits>
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/experimental/allocator.hpp>
 #include <tt-metalium/experimental/range_lockstep_allocation/buffer.hpp>
@@ -10,12 +11,16 @@
 #include <tt-metalium/experimental/allocation_context.hpp>
 #include "allocator_types.hpp"
 #include <tt-metalium/buffer.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
+#include "distributed/mesh_device_impl.hpp"
 #include "impl/buffers/buffer_impl.hpp"
+#include "impl/device/device_impl.hpp"
 #include <enchantum/enchantum.hpp>
 #include <functional>
 #include <algorithm>
 #include <string>
 #include <mutex>
+#include <condition_variable>
 
 #include <tt_stl/assert.hpp>
 #include "buffer_types.hpp"
@@ -29,7 +34,185 @@
 
 namespace tt::tt_metal {
 
+struct AllocatorImpl::L1PinOwner {
+    explicit L1PinOwner(AllocatorImpl* allocator) : allocator(allocator) {}
+    std::mutex mutex;
+    std::condition_variable releases_finished;
+    AllocatorImpl* allocator;
+    std::unordered_map<Buffer*, size_t> pins;
+    size_t active_releases = 0;
+    bool withdrawing = false;
+};
+
+struct AllocatorImpl::L1AllocationPin::State {
+    State(
+        std::shared_ptr<L1PinOwner> owner,
+        std::shared_ptr<Buffer> buffer,
+        CoreCoord core,
+        DeviceAddr begin,
+        DeviceAddr end) :
+        owner(std::move(owner)),
+        buffer(std::move(buffer)),
+        allocation_id(this->buffer->unique_id()),
+        device(this->buffer->device()),
+        core(core),
+        begin(begin),
+        end(end) {}
+    ~State() noexcept {
+        if (!counted) {
+            return;
+        }
+        bool release_registered = false;
+        {
+            std::lock_guard lock(owner->mutex);
+            if (owner->allocator) {
+                // Removing the last pin must not let withdrawal destroy the
+                // allocator before the original strong owners finish releasing
+                // their Buffers outside this lock.
+                ++owner->active_releases;
+                release_registered = true;
+                const auto found = owner->pins.find(buffer.get());
+                if (found != owner->pins.end() && --found->second == 0) {
+                    owner->pins.erase(found);
+                }
+            }
+            buffer->impl().lifetime_->l1_pins.fetch_sub(1, std::memory_order_release);
+        }
+        if (mesh_buffer) {
+            std::lock_guard lock(mesh_buffer->lifetime_mutex_);
+            --mesh_buffer->l1_pins_;
+        }
+        // A final Buffer/MeshBuffer destructor may reenter the actual
+        // allocator. Keep it alive without holding any of its locks.
+        mesh_buffer.reset();
+        buffer.reset();
+        if (release_registered) {
+            {
+                std::lock_guard lock(owner->mutex);
+                --owner->active_releases;
+            }
+            owner->releases_finished.notify_all();
+        }
+    }
+    std::shared_ptr<L1PinOwner> owner;
+    std::shared_ptr<Buffer> buffer;
+    std::shared_ptr<distributed::MeshBuffer> mesh_buffer;
+    const size_t allocation_id;
+    IDevice* const device;
+    const CoreCoord core;
+    const DeviceAddr begin;
+    const DeviceAddr end;
+    bool counted = false;
+};
+
+AllocatorImpl::L1AllocationPin::L1AllocationPin(std::unique_ptr<State> state) : state_(std::move(state)) {}
+AllocatorImpl::L1AllocationPin::L1AllocationPin(L1AllocationPin&&) noexcept = default;
+AllocatorImpl::L1AllocationPin& AllocatorImpl::L1AllocationPin::operator=(L1AllocationPin&&) noexcept = default;
+AllocatorImpl::L1AllocationPin::~L1AllocationPin() noexcept = default;
+const Buffer& AllocatorImpl::L1AllocationPin::buffer() const {
+    TT_FATAL(state_, "L1 allocation pin is moved-from");
+    return *state_->buffer;
+}
+size_t AllocatorImpl::L1AllocationPin::allocation_id() const {
+    TT_FATAL(state_, "L1 allocation pin is moved-from");
+    return state_->allocation_id;
+}
+IDevice* AllocatorImpl::L1AllocationPin::device() const {
+    TT_FATAL(state_, "L1 allocation pin is moved-from");
+    return state_->device;
+}
+CoreCoord AllocatorImpl::L1AllocationPin::core() const {
+    TT_FATAL(state_, "L1 allocation pin is moved-from");
+    return state_->core;
+}
+DeviceAddr AllocatorImpl::L1AllocationPin::begin() const {
+    TT_FATAL(state_, "L1 allocation pin is moved-from");
+    return state_->begin;
+}
+DeviceAddr AllocatorImpl::L1AllocationPin::end() const {
+    TT_FATAL(state_, "L1 allocation pin is moved-from");
+    return state_->end;
+}
+bool AllocatorImpl::L1AllocationPin::live() const noexcept {
+    if (!state_) {
+        return false;
+    }
+    std::lock_guard lock(state_->owner->mutex);
+    return state_->counted && state_->owner->allocator && !state_->owner->withdrawing &&
+           state_->buffer->is_allocated() &&
+           state_->buffer->unique_id() == state_->allocation_id && state_->owner->pins.contains(state_->buffer.get());
+}
+
+AllocatorImpl::L1AllocationPin AllocatorImpl::pin_l1(
+    std::shared_ptr<Buffer> buffer, CoreCoord core, BufferRegion region) {
+    TT_FATAL(buffer, "L1 pin requires the original live Buffer");
+    // The registered pointer is necessary, but a caller-supplied control block
+    // is not authority over its lifetime. Retain the original SDK owner.
+    buffer = buffer->shared_from_this();
+    auto& original = buffer->impl();
+    std::lock_guard lifetime_lock(original.lifetime_->mutex);
+    std::lock_guard lock(mutex_);
+    TT_FATAL(
+        l1_pin_owner_->allocator == this && !l1_pin_owner_->withdrawing && allocated_buffers_.contains(buffer.get()) &&
+            original.allocator_ == this && original.owns_data_ && original.is_allocated() &&
+            dynamic_cast<Device*>(original.device_) && original.device_->is_initialized() &&
+            original.device_->allocator_impl().get() == this &&
+            original.buffer_type_ == BufferType::L1 && original.per_core_allocation_ && !original.hooked_allocation_,
+        "L1 pin requires its actual registered owning per-core allocation");
+    const auto found = original.per_core_addresses_.find(core);
+    TT_FATAL(
+        found != original.per_core_addresses_.end() && has_bank(BufferType::L1, core),
+        "L1 pin requires an exact allocated Worker core");
+    const DeviceAddr base = found->second;
+    const DeviceAddr bytes = buffer->aligned_size_per_bank();
+    TT_FATAL(
+        region.size && region.offset <= bytes && region.size <= bytes - region.offset &&
+            base <= std::numeric_limits<DeviceAddr>::max() - bytes && base >= config_->l1_unreserved_base &&
+            base + bytes <= config_->worker_l1_size,
+        "L1 pin subrange exceeds its actual per-core reservation");
+    const auto previous = l1_pin_owner_->pins.find(buffer.get());
+    TT_FATAL(
+        previous == l1_pin_owner_->pins.end() || previous->second != std::numeric_limits<size_t>::max(),
+        "L1 allocation pin count is exhausted");
+    auto state = std::make_unique<L1AllocationPin::State>(
+        l1_pin_owner_, buffer, core, base + region.offset, base + region.offset + region.size);
+    // Every potentially throwing allocation precedes publication of the pin.
+    auto count = l1_pin_owner_->pins.try_emplace(buffer.get(), 0).first;
+    ++count->second;
+    original.lifetime_->l1_pins.fetch_add(1, std::memory_order_release);
+    state->counted = true;
+    return L1AllocationPin(std::move(state));
+}
+
+AllocatorImpl::L1AllocationPin AllocatorImpl::pin_l1(
+    std::shared_ptr<distributed::MeshBuffer> buffer,
+    const distributed::MeshCoordinate& coordinate,
+    CoreCoord core,
+    BufferRegion region) {
+    TT_FATAL(buffer, "L1 pin requires the original live MeshBuffer");
+    auto original_owner = buffer->lifetime_owner_.lock();
+    TT_FATAL(
+        original_owner && original_owner.get() == buffer.get(),
+        "L1 pin requires the original SDK factory MeshBuffer owner");
+    buffer = std::move(original_owner);
+    std::lock_guard lifetime_lock(buffer->lifetime_mutex_);
+    TT_FATAL(
+        buffer->is_allocated() && buffer->device()->impl().is_local(coordinate) &&
+            buffer->l1_pins_ != std::numeric_limits<size_t>::max(),
+        "L1 pin requires its original allocated local mesh device");
+    auto* original = buffer->get_device_buffer(coordinate);
+    TT_FATAL(
+        original && original->device() == buffer->device()->impl().get_device(coordinate),
+        "L1 pin requires the exact MeshBuffer device allocation");
+    auto pin = pin_l1(original->shared_from_this(), core, region);
+    pin.state_->mesh_buffer = std::move(buffer);
+    ++pin.state_->mesh_buffer->l1_pins_;
+    return pin;
+}
+
 AllocatorImpl::AllocatorImpl(const AllocatorConfig& alloc_config) :
+    l1_pin_owner_(std::make_shared<L1PinOwner>(this)),
+    mutex_(l1_pin_owner_->mutex),
     config_(std::make_unique<AllocatorConfig>(alloc_config)),
     persistent_l1_(
         alloc_config.l1_unreserved_base,
@@ -368,6 +551,7 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
 
 void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
     std::lock_guard<std::mutex> lock(mutex_);
+    TT_FATAL(!l1_pin_owner_->pins.contains(buffer), "Cannot deallocate an L1 allocation with live pins");
     auto address = buffer->address();
     auto buffer_type = buffer->buffer_type();
 
@@ -403,6 +587,9 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
 
 void AllocatorImpl::deallocate_buffers() {
     std::lock_guard<std::mutex> lock(mutex_);
+    TT_FATAL(
+        l1_pin_owner_->pins.empty() && l1_pin_owner_->active_releases == 0,
+        "Cannot release allocator buffers with live L1 pins or pending pin releases");
     dram_manager_->deallocate_all();
     l1_manager_->deallocate_all();
     l1_small_manager_->deallocate_all();
@@ -698,6 +885,9 @@ DeviceAddr AllocatorImpl::get_dram_deletion_high_water_mark() const {
 
 void AllocatorImpl::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
+    TT_FATAL(
+        l1_pin_owner_->pins.empty() && l1_pin_owner_->active_releases == 0,
+        "Cannot clear an allocator with live L1 pins or pending pin releases");
     dram_manager_->clear();
     l1_manager_->clear();
     l1_small_manager_->clear();
@@ -716,6 +906,19 @@ void AllocatorConfig::reset() {
 }
 
 AllocatorImpl::~AllocatorImpl() {
+    {
+        std::unique_lock lock(mutex_);
+        l1_pin_owner_->withdrawing = true;
+        l1_pin_owner_->releases_finished.wait(lock, [&] { return l1_pin_owner_->active_releases == 0; });
+        // Actual Device/allocator teardown is withdrawal, not normal retirement.
+        // Late pin destruction must neither call a dead allocator nor dereference
+        // the Device through a retained Buffer destructor.
+        l1_pin_owner_->allocator = nullptr;
+        for (const auto& [buffer, count] : l1_pin_owner_->pins) {
+            buffer->impl().mark_as_deallocated();
+        }
+        l1_pin_owner_->pins.clear();
+    }
     if (traceback_capture_enabled_) {
         unregister_traceback_allocator(this);
     }
@@ -770,6 +973,9 @@ AllocatorState AllocatorImpl::extract_state() const {
 
 void AllocatorImpl::override_state(const AllocatorState& state) {
     std::lock_guard<std::mutex> lock(mutex_);
+    TT_FATAL(
+        l1_pin_owner_->pins.empty() && l1_pin_owner_->active_releases == 0,
+        "Cannot replace allocator state with live L1 pins or pending pin releases");
     for (auto* buf : allocated_buffers_) {
         TT_FATAL(!buf->impl().per_core_allocation_, "override_state does not yet support per-core L1 allocations");
     }

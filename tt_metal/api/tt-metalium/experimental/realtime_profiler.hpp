@@ -4,12 +4,16 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <span>
 #include <string_view>
 
 namespace tt::tt_metal::experimental {
+
+enum class ProgramRealtimeBoundary : uint8_t { Legacy = 0, DispatchGoToCompletion = 1 };
+enum class ProgramRealtimeStatus : uint8_t { Complete = 0, Invalid = 1 };
 
 struct ProgramRealtimeRecord {
     uint32_t runtime_id;                               // Runtime ID. Currently truncated to 16 bits;
@@ -20,6 +24,13 @@ struct ProgramRealtimeRecord {
     double frequency;                                  // Device clock frequency (cycles per ns)
     std::span<const std::string_view> kernel_sources;  // Kernel source paths; valid until
                                                        // MetalContext teardown or reinitialization.
+    ProgramRealtimeBoundary boundary = ProgramRealtimeBoundary::Legacy;
+    ProgramRealtimeStatus status = ProgramRealtimeStatus::Complete;
+    uint64_t occurrence_id = 0;
+    uint32_t dispatch_core_x = 0;                      // Actual virtual dispatch tile coordinates.
+    uint32_t dispatch_core_y = 0;
+    uint32_t producer_dropped = 0;                     // Cumulative device queue loss counter.
+    std::array<uint32_t, 16> raw_words{};              // Original qualified 64-byte wire page.
 };
 
 struct ProgramRealtimeRecordBatch {

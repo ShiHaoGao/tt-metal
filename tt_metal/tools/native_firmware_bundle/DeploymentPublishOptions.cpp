@@ -21,8 +21,8 @@ DeploymentPublishOptions parse_deployment_options(std::span<const std::string_vi
             parse_path("--program-record=", result.program_record, program)) continue;
         throw std::invalid_argument("unknown or duplicate supplier argument: " + std::string(argument));
     }
-    if (!output || !input || !program)
-        throw std::invalid_argument("usage: native_deployment_publish --output=<fresh-resource-root> --input=<facts.json> --program-record=<canonical-record>");
+    if (!output || !input)
+        throw std::invalid_argument("usage: native_deployment_publish --output=<fresh-resource-root> --input=<facts.json> [--program-record=<expected-canonical-record>]");
     return result;
 }
 }

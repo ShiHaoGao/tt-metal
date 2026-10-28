@@ -7,6 +7,7 @@
 #include <cstdint>
 #include "risc_common.h"
 #include "hostdev/realtime_profiler_msgs.h"
+#include "hostdevcommon/dispatch_timing.hpp"
 
 // Wall clock register indices — registers are 8 bytes apart (0x1F0, 0x1F8),
 // so the uint32_t array stride is 2, not 1.
@@ -31,7 +32,8 @@ constexpr uint32_t PROGRAM_ID_FIFO_SIZE = 32;
 // The control block (including this FIFO) lives in dispatch-core-local L1, assigned by
 // CommandQueueDeviceAddrType::REALTIME_PROFILER_MSG.
 FORCE_INLINE
-bool program_id_fifo_append(volatile tt_l1_ptr realtime_profiler_msg_t* msg, uint32_t program_id) {
+bool program_id_fifo_append(volatile tt_l1_ptr realtime_profiler_msg_t* msg, uint32_t program_id,
+                            uint64_t occurrence = 0, uint32_t workers = 0) {
     uint32_t end = msg->program_id_fifo_end;
     uint32_t next_end = (end + 1) % PROGRAM_ID_FIFO_SIZE;
 
@@ -41,6 +43,10 @@ bool program_id_fifo_append(volatile tt_l1_ptr realtime_profiler_msg_t* msg, uin
     }
 
     msg->program_id_fifo[end] = program_id;
+    msg->program_occurrence_lo_fifo[end] = static_cast<uint32_t>(occurrence);
+    msg->program_occurrence_hi_fifo[end] = static_cast<uint32_t>(occurrence >> 32);
+    msg->program_worker_count_fifo[end] = workers;
+    tt::dispatch_timing::publish_fence();
     msg->program_id_fifo_end = next_end;
     return true;
 }
@@ -59,6 +65,36 @@ bool program_id_fifo_pop(volatile tt_l1_ptr realtime_profiler_msg_t* msg, uint32
     *program_id = msg->program_id_fifo[start];
     msg->program_id_fifo_start = (start + 1) % PROGRAM_ID_FIFO_SIZE;
     return true;
+}
+
+// Live HIGH/LOW/HIGH avoids the shared low-read latch: another RISC on this
+// same tile may read LOW between our two accesses. Both qualified boundaries
+// use this tile-local counter and this coherent sampling routine.
+FORCE_INLINE uint64_t dispatch_timing_timestamp() {
+    auto* low = reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
+    auto* high = reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L + sizeof(uint32_t));
+    uint32_t before, value, after;
+    do { before = *high; value = *low; after = *high; } while (before != after);
+    return (static_cast<uint64_t>(after) << 32) | value;
+}
+
+struct DispatchTimingProgram {
+    uint32_t runtime_id = 0;
+    uint64_t occurrence = 0;
+    uint32_t workers = 0;
+};
+
+FORCE_INLINE DispatchTimingProgram pop_dispatch_timing_program(volatile tt_l1_ptr realtime_profiler_msg_t* msg) {
+    DispatchTimingProgram result;
+    const uint32_t start = msg->program_id_fifo_start;
+    if (start == msg->program_id_fifo_end) return result;
+    result.runtime_id = msg->program_id_fifo[start];
+    result.occurrence = (static_cast<uint64_t>(msg->program_occurrence_hi_fifo[start]) << 32) |
+                        msg->program_occurrence_lo_fifo[start];
+    result.workers = msg->program_worker_count_fifo[start];
+    tt::dispatch_timing::publish_fence();
+    msg->program_id_fifo_start = (start + 1) % PROGRAM_ID_FIFO_SIZE;
+    return result;
 }
 
 // Record a real-time profiler timestamp (start or end) to the appropriate ping-pong buffer.
@@ -118,7 +154,7 @@ void write_buffer_id(volatile tt_l1_ptr realtime_profiler_msg_t* msg, uint32_t i
 }
 #else
 FORCE_INLINE
-bool program_id_fifo_append(volatile tt_l1_ptr realtime_profiler_msg_t*, uint32_t) { return false; }
+bool program_id_fifo_append(volatile tt_l1_ptr realtime_profiler_msg_t*, uint32_t, uint64_t = 0, uint32_t = 0) { return false; }
 
 FORCE_INLINE
 bool program_id_fifo_pop(volatile tt_l1_ptr realtime_profiler_msg_t*, uint32_t*) { return false; }

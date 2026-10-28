@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <variant>
@@ -102,8 +103,8 @@ public:
     // multiple owners of the same device memory, leading to double-free on destruction.
     MeshBuffer(const MeshBuffer&) = delete;
     MeshBuffer& operator=(const MeshBuffer&) = delete;
-    MeshBuffer(MeshBuffer&& other) noexcept;
-    MeshBuffer& operator=(MeshBuffer&& other) noexcept;
+    MeshBuffer(MeshBuffer&& other);
+    MeshBuffer& operator=(MeshBuffer&& other);
 
     // Returns true if the MeshBuffer is allocated. Note that MeshBuffer is created in the allocated state; either the
     // destructor or the `deallocate` method deallocate the MeshBuffer.
@@ -145,6 +146,18 @@ public:
     uint32_t num_pages() const { return page_size() == 0 ? 0 : device_local_size_ / page_size(); }
 
 private:
+    friend class ::tt::tt_metal::AllocatorImpl;
+    struct MoveGuard;
+    explicit MeshBuffer(MoveGuard guard);
+    std::vector<std::shared_ptr<Buffer>> retain_buffers_locked() const;
+    void deallocate_locked();
+    mutable std::mutex lifetime_mutex_;
+    size_t l1_pins_ = 0;
+    // Only SDK factories register a lifetime owner. Moving allocation state
+    // preserves a factory destination's own identity; it cannot transfer the
+    // source object's control block to a caller-created destination.
+    std::weak_ptr<MeshBuffer> lifetime_owner_;
+
     // Creates an owning `MeshBuffer`, backed by an allocation made through `backing_buffer`.
     MeshBuffer(
         const MeshBufferConfig& config,

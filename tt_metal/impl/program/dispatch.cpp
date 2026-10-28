@@ -2986,6 +2986,7 @@ void update_program_dispatch_commands(
     uint32_t multicast_cores_launch_message_wptr,
     uint32_t unicast_cores_launch_message_wptr,
     uint32_t expected_num_workers_completed,
+    uint32_t num_program_workers,
     CoreCoord dispatch_core,
     SubDeviceId sub_device_id,
     const ProgramDispatchMetadata& dispatch_md,
@@ -3045,6 +3046,14 @@ void update_program_dispatch_commands(
     uint16_t runtime_id = static_cast<uint16_t>(program.get_runtime_id());
     cached_program_command_sequence.preamble_command_sequence.update_cmd_sequence(
         program_host_id_offset, &runtime_id, sizeof(runtime_id));
+    const uint64_t occurrence = program.get_dispatch_timing_occurrence();
+    TT_FATAL(occurrence == 0 || (program.get_runtime_id() == runtime_id && runtime_id != 0 && num_program_workers != 0),
+             "Qualified dispatch timing requires its exact runtime identity and worker count");
+    const uint32_t timing_metadata[3] = {
+        static_cast<uint32_t>(occurrence), static_cast<uint32_t>(occurrence >> 32), num_program_workers};
+    cached_program_command_sequence.preamble_command_sequence.update_cmd_sequence(
+        sizeof(CQPrefetchCmd) + offsetof(CQDispatchCmd, set_write_offset.timing_occurrence_lo),
+        timing_metadata, sizeof(timing_metadata));
 
     RecordProgramMetadata(program.get_context_id(), program);
 
@@ -3261,6 +3270,12 @@ void update_traced_program_dispatch_commands(
     uint16_t runtime_id = trace_node.program_runtime_id;
     cached_program_command_sequence.preamble_command_sequence.update_cmd_sequence(
         program_host_id_offset, &runtime_id, sizeof(runtime_id));
+    // A trace replay has no fresh invocation occurrence contract. Never replay
+    // a qualified occurrence retained in the cached non-trace command.
+    const uint32_t no_timing_metadata[3] = {};
+    cached_program_command_sequence.preamble_command_sequence.update_cmd_sequence(
+        sizeof(CQPrefetchCmd) + offsetof(CQDispatchCmd, set_write_offset.timing_occurrence_lo),
+        no_timing_metadata, sizeof(no_timing_metadata));
     if (hal.get_programmable_core_type_count() >= 2) {
         cached_program_command_sequence.preamble_command_sequence.update_cmd_sequence(
             eth_l1_write_offset_offset,

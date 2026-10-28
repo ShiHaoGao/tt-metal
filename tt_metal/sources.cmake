@@ -243,10 +243,13 @@ set(JITAPI_FILES
     soc_descriptors/blackhole_140_arch.yaml
     soc_descriptors/wormhole_b0_80_arch.yaml
     tools/profiler/kernel_profiler.hpp
+    tools/profiler/kernel_profiler_streaming.hpp
+    tools/profiler/synchronization_event_profiler.hpp
     tools/profiler/profiler_counter.hpp
     tools/profiler/perf_counters.hpp
     tools/profiler/fabric_event_profiler.hpp
     tools/profiler/noc_event_profiler.hpp
+    tools/profiler/event_metadata.hpp
     tools/profiler/noc_debugging_profiler.hpp
     tools/profiler/noc_debugging_metadata.hpp
     tools/profiler/cpp_device_analyses.json

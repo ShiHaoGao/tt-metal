@@ -324,7 +324,11 @@ void Hal::initialize_wh(
     };
 
     this->valid_reg_addr_func_ = [](uint32_t addr) {
+        // The ISA's multi-reader counter protocol uses the live high word
+        // (low + 4), not the shared high latch (low + 8).
         return (
+            (addr == RISCV_DEBUG_REG_WALL_CLOCK_L) ||
+            (addr == RISCV_DEBUG_REG_WALL_CLOCK_L + sizeof(uint32_t)) ||
             ((addr >= NOC_OVERLAY_START_ADDR) &&
              (addr < NOC_OVERLAY_START_ADDR + NOC_STREAM_REG_SPACE_SIZE * NOC_NUM_STREAMS)) ||
             ((addr >= NOC0_REGS_START_ADDR) && (addr < NOC0_REGS_START_ADDR + 0x1000)) ||

@@ -169,7 +169,7 @@ void MetalEnvImpl::initialize_base_objects() {
 
     const auto platform_arch = get_platform_architecture(*this->rtoptions_);
 
-    cluster_ = std::make_unique<Cluster>(*this->rtoptions_);
+    cluster_ = std::make_unique<Cluster>(*this->rtoptions_, descriptor_.physical_chip_discovery());
     this->verify_fw_capabilities();
 
     if (platform_arch == tt::ARCH::QUASAR && this->rtoptions_->get_fast_dispatch()) {
@@ -232,6 +232,10 @@ tt_fabric::FabricManagerMode MetalEnvImpl::get_fabric_manager() const { return f
 uint8_t MetalEnvImpl::get_num_fabric_active_routing_planes() const { return num_fabric_active_routing_planes_; }
 
 void MetalEnvImpl::set_fabric_tensix_config(tt_fabric::FabricTensixConfig fabric_tensix_config) {
+    if (descriptor_.physical_chip_discovery() == PhysicalChipDiscovery::MmioOnly &&
+        fabric_tensix_config != tt_fabric::FabricTensixConfig::DISABLED) {
+        throw std::invalid_argument("MMIO-only chip discovery does not support fabric routing");
+    }
     fabric_tensix_config_ = fabric_tensix_config;
 }
 
@@ -247,6 +251,12 @@ bool MetalEnvImpl::set_fabric_config(
     tt_fabric::FabricUDMMode fabric_udm_mode,
     tt_fabric::FabricManagerMode fabric_manager,
     tt_fabric::FabricRouterConfig router_config) {
+    if (descriptor_.physical_chip_discovery() == PhysicalChipDiscovery::MmioOnly &&
+        (fabric_config != tt_fabric::FabricConfig::DISABLED ||
+         fabric_tensix_config != tt_fabric::FabricTensixConfig::DISABLED ||
+         fabric_udm_mode != tt_fabric::FabricUDMMode::DISABLED)) {
+        throw std::invalid_argument("MMIO-only chip discovery does not support fabric routing");
+    }
     // Reject transitions that would reinitialize the control plane while devices are still open.
     // Callers must close the mesh device first. Going TO DISABLED is allowed
     if (fabric_config != tt_fabric::FabricConfig::DISABLED) {

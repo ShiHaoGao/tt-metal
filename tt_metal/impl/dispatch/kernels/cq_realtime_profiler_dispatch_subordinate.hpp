@@ -64,6 +64,11 @@ FORCE_INLINE void dispatch_subordinate_realtime_profiler() {
                 (volatile uint32_t*)STREAM_REG_ADDR(stream_id, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX);
 
             uint32_t current_count = *stream_reg;
+            // Same tile, same live counter as dispatch_s's GO sample. A stream
+            // change alone is insufficient: only the row's exact expected
+            // completion count can seal a qualified timing interval.
+            tt::dispatch_timing::complete(*rt_profiler_msg, stream_id, current_count,
+                                          dispatch_timing_timestamp(), MEM_WORD_ADDR_WIDTH);
             if (current_count != last_counts[i]) {
                 DeviceZoneScopedN("TRISC0-record-end-ts");
                 last_counts[i] = current_count;

@@ -36,6 +36,15 @@ void validate_managed_reload(const ProgramImpl& program) {
 }
 }  // namespace
 
+struct ProgramExecution::ManagedInvocation::ItemWitnessRound {
+    const NiuItemWitnessObservation observation;
+    const NiuHandoffReceiver::ItemAcknowledgement acknowledgement;
+};
+
+struct ProgramExecution::ManagedInvocation::ItemWitnessSeries {
+    const NiuHandoffReceiver::ItemReception::SeriesTerminal terminal;
+};
+
 struct ProgramExecution::ManagedInvocation::ItemWitnessStorage {
     NiuKey niu;
     CoreCoord logical_core;
@@ -46,28 +55,43 @@ struct ProgramExecution::ManagedInvocation::ItemWitnessStorage {
     size_t member;
     uint64_t device_epoch;
     uint32_t address;
-    tt_niu_item_witness_request request;
+    // Initialized once before the real slot is exposed. Reception mutations
+    // require the original admission guard; opaque handles retain const views.
+    mutable std::optional<NiuHandoffReceiver::ItemReception> reception;
+    mutable std::shared_ptr<const ItemWitnessRound> active_round;
+    mutable std::shared_ptr<const ItemWitnessSeries> series_terminal;
+    const tt_niu_item_witness_request& request() const { return reception->request(); }
 };
 
 uint32_t ProgramExecution::ManagedInvocation::ItemWitnessLease::address() const { return storage_->address; }
 const tt_niu_item_witness_request& ProgramExecution::ManagedInvocation::ItemWitnessLease::request() const {
-    return storage_->request;
+    return storage_->request();
 }
 const tt_niu_item_witness_request& ProgramExecution::ManagedInvocation::ItemWitnessObservation::request() const {
-    return storage_->request;
+    return round_->observation.wire().receipt.request;
 }
 NiuKey ProgramExecution::ManagedInvocation::ItemWitnessObservation::niu() const { return storage_->niu; }
 ProgramExecution::ManagedInvocation::ItemCompletionFact
 ProgramExecution::ManagedInvocation::ItemWitnessObservation::completion() const {
-    return static_cast<ItemCompletionFact>(storage_->request.completion);
+    return static_cast<ItemCompletionFact>(request().completion);
+}
+const tt_niu_item_witness_request& ProgramExecution::ManagedInvocation::ItemSeriesObservation::request() const {
+    return series_->terminal.observation().wire().receipt.request;
+}
+NiuKey ProgramExecution::ManagedInvocation::ItemSeriesObservation::niu() const { return storage_->niu; }
+uint64_t ProgramExecution::ManagedInvocation::ItemSeriesObservation::final_count() const {
+    return series_->terminal.final_count();
 }
 
 bool ProgramExecution::validate_item_witness_locked(
-    NiuAdmission& admission, const NiuAdmission::Guard& guard,
-    const ManagedInvocation::ItemWitnessStorage& storage, bool issued) const {
-    if (!managed || !token || simulated || resources_retired || preparation.cancelled() ||
+    NiuAdmission& admission,
+    const NiuAdmission::Guard& guard,
+    const ManagedInvocation::ItemWitnessStorage& storage,
+    bool issued) const {
+    if (!managed || !token || !storage.reception || simulated || resources_retired || preparation.cancelled() ||
         owner.lock().get() != &admission ||
-        (issued ? state != State::Issued && state != State::Stopped : state != State::Reserved))
+        (issued ? state != State::Reserved && state != State::Issued && state != State::Stopped
+                : state != State::Reserved))
         return false;
     std::string error;
     if (state == State::Stopped) {
@@ -78,12 +102,12 @@ bool ProgramExecution::validate_item_witness_locked(
         storage.device_epoch != (epoch == admission.device_epochs_.end() ? 0 : epoch->second)) return false;
     const auto boot = boots.find(storage.niu.chip);
     if (boot == boots.end() || !boot->second || !boot->second->live() ||
-        boot->second->boot_cookie() != storage.request.boot_cookie ||
-        invocation_identity != storage.request.invocation_id || storage.member >= members.size()) return false;
+        boot->second->boot_cookie() != storage.request().boot_cookie ||
+        invocation_identity != storage.request().invocation_id || storage.member >= members.size()) return false;
     const auto selected = std::find_if(managed->selections().begin(), managed->selections().end(),
                                      [&](const auto& row) { return row.niu == storage.niu; });
-    if (selected == managed->selections().end() || storage.request.selector >= niu_selector_count ||
-        !selected->selectors.test(storage.request.selector)) return false;
+    if (selected == managed->selections().end() || storage.request().selector >= niu_selector_count ||
+        !selected->selectors.test(storage.request().selector)) return false;
     const auto& member = members[storage.member];
     const auto device = member.devices.find(storage.niu.chip);
     const auto cores = member.cores.find(storage.niu.chip);
@@ -102,8 +126,11 @@ bool ProgramExecution::validate_item_witness_locked(
         ++matches;
     }
     const auto leaf = leaves.find({storage.member, storage.niu.chip});
-    return matches == 1 && leaf != leaves.end() &&
-           (!issued || leaf->second.state == State::Issued || leaf->second.state == State::Stopped);
+    if (matches != 1 || leaf == leaves.end()) return false;
+    if (state == State::Reserved) return leaf->second.state == State::Reserved;
+    if (state == State::Stopped) return leaf->second.state == State::Stopped;
+    return issued && (leaf->second.state == State::Reserved || leaf->second.state == State::Issued ||
+                      leaf->second.state == State::Stopped);
 }
 
 ProgramExecution::FailureScope::FailureScope(std::shared_ptr<ProgramExecution> execution) :
@@ -893,17 +920,21 @@ std::optional<ProgramExecution::ManagedInvocation::ItemWitnessLease>
 ProgramExecution::ManagedInvocation::acquire_item_witness(
     const SelectorLease& selector, const ItemWitnessRequirement& requirement) const {
     const auto valid_identity = [](uint64_t value) { return value && value != UINT64_MAX; };
-    if (!selector.valid() || selector.owner_ != execution || !requirement.kernel ||
-        !valid_identity(requirement.item) || !valid_identity(requirement.generation) ||
-        !valid_identity(requirement.occurrence) || !requirement.leaf ||
+    if (!selector.valid() || selector.owner_ != execution || !requirement.kernel || !valid_identity(requirement.item) ||
+        !valid_identity(requirement.generation) || requirement.occurrence != 1 || !requirement.leaf ||
         (requirement.completion != ItemCompletionFact::ReadDestinationLocal &&
-         requirement.completion != ItemCompletionFact::NonPostedWriteAcknowledged)) return std::nullopt;
+         requirement.completion != ItemCompletionFact::NonPostedWriteAcknowledged)) {
+        return std::nullopt;
+    }
     auto* native = dynamic_cast<NativeElfKernel*>(requirement.kernel.get());
     if (!native || native->native_images().images.size() != 1 ||
-        !native->is_on_logical_core(requirement.logical_core)) return std::nullopt;
-    const auto role = native->native_images().images.front().role();
-    if (role != experimental::TensixKernelRole::Brisc && role != experimental::TensixKernelRole::Ncrisc)
+        !native->is_on_logical_core(requirement.logical_core)) {
         return std::nullopt;
+    }
+    const auto role = native->native_images().images.front().role();
+    if (role != experimental::TensixKernelRole::Brisc && role != experimental::TensixKernelRole::Ncrisc) {
+        return std::nullopt;
+    }
     auto admission = execution->owner.lock();
     if (!admission) return std::nullopt;
     // Keep the allocation's destructor before the lifetime gate on unwind.
@@ -944,19 +975,19 @@ ProgramExecution::ManagedInvocation::acquire_item_witness(
         if (!original_program || storage->member == SIZE_MAX) return std::nullopt;
         for (const auto& previous : execution->item_witnesses)
             if (previous->niu == storage->niu &&
-                (previous->request.selector == selector.selector() ||
-                 (previous->request.item == requirement.item && previous->request.generation == requirement.generation &&
-                  previous->request.occurrence == requirement.occurrence && previous->request.leaf == requirement.leaf)))
+                (previous->request().selector == selector.selector() ||
+                 (previous->request().item == requirement.item && previous->request().generation == requirement.generation &&
+                  previous->request().occurrence == requirement.occurrence && previous->request().leaf == requirement.leaf)))
                 return std::nullopt;
         const auto epoch = admission->device_epochs_.find(storage->niu.chip);
         storage->device_epoch = epoch == admission->device_epochs_.end() ? 0 : epoch->second;
-        storage->request = {TT_NIU_ITEM_WITNESS_VERSION,
+        storage->reception.emplace(tt_niu_item_witness_request{TT_NIU_ITEM_WITNESS_VERSION,
                             static_cast<uint32_t>(execution->item_witnesses.size() + 1),
                             selector.boot_cookie(), selector.invocation_id(), requirement.item,
                             requirement.generation, requirement.occurrence, requirement.leaf,
                             static_cast<uint8_t>(storage->niu.noc), selector.selector(),
                             static_cast<uint8_t>(role == experimental::TensixKernelRole::Brisc ? 1 : 2),
-                            static_cast<uint8_t>(requirement.completion), 0};
+                            static_cast<uint8_t>(requirement.completion), 0});
         if (!execution->validate_item_witness_locked(*admission, guard, *storage, false) ||
             !execution->preparation.acquire()) return std::nullopt;
         lifetime.emplace(Preparation(execution, true));
@@ -1022,7 +1053,7 @@ ProgramExecution::ManagedInvocation::acquire_item_witness(
             cluster.read_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
             return NiuHandoffIoStatus::Complete;
         },
-        storage->request);
+        storage->request());
     if (initialized != NiuHandoffWriteStatus::Published) return std::nullopt;
     auto guard = admission->lock();
     if (!execution->validate_item_witness_locked(*admission, guard, *storage, false)) return std::nullopt;
@@ -1034,49 +1065,222 @@ ProgramExecution::ManagedInvocation::acquire_item_witness(
     return ItemWitnessLease(execution, std::move(storage));
 }
 
-std::optional<ProgramExecution::ManagedInvocation::ItemWitnessObservation>
-ProgramExecution::ManagedInvocation::observe_item(const ItemWitnessLease& lease) const {
-    if (lease.owner_ != execution || !lease.storage_) return std::nullopt;
+ProgramExecution::ManagedInvocation::ItemWitnessResult
+ProgramExecution::ManagedInvocation::poll_item(const ItemWitnessLease& lease) const {
+    // A foreign or moved-from lease has no authority over this invocation's
+    // admission state, including no authority to quarantine its real owner.
+    if (lease.owner_ != execution || !lease.storage_) return {ItemWitnessStatus::Invalidated, std::nullopt};
     auto admission = execution->owner.lock();
-    if (!admission) return std::nullopt;
+    if (!admission) return {ItemWitnessStatus::Invalidated, std::nullopt};
     std::optional<Preparation> lifetime;
     std::shared_ptr<Buffer> backing;
     std::shared_ptr<ProgramImpl> program;
     const auto& storage = *lease.storage_;
+    using Reception = NiuHandoffReceiver::ItemReception;
+    const auto issuer_state = [](State state) {
+        return state == State::Stopped ? Reception::IssuerState::Stopped :
+               state == State::Issued ? Reception::IssuerState::Issued : Reception::IssuerState::Reserved;
+    };
+    auto sampled_issuer = Reception::IssuerState::Reserved;
+    const auto terminal_locked = [&](const NiuAdmission::Guard& guard, ItemWitnessStatus status) {
+        // Keep every actual resource retained. Only original issued/stopped
+        // admissions can be quarantined; actual withdrawal remains withdrawn.
+        if (execution->token && (execution->state == State::Issued || execution->state == State::Stopped)) {
+            std::string ignored;
+            admission->quarantine_locked(guard, *execution->token, ignored);
+            execution->state = State::Quarantined;
+        } else if (execution->state == State::Reserved) {
+            execution->preparation.cancel();
+        }
+        return ItemWitnessResult{status, std::nullopt};
+    };
+    const auto terminal = [&](ItemWitnessStatus status) {
+        auto guard = admission->lock();
+        return terminal_locked(guard, status);
+    };
+    const auto complete_locked = [&](const NiuAdmission::Guard& guard) {
+        if (!storage.active_round) {
+            const auto acknowledgement = storage.reception->acknowledgement();
+            if (!storage.reception->accepted() || !acknowledgement)
+                return terminal_locked(guard, ItemWitnessStatus::Rejected);
+            storage.active_round = std::make_shared<ItemWitnessRound>(
+                ItemWitnessRound{*storage.reception->accepted(), *acknowledgement});
+        }
+        return ItemWitnessResult{
+            ItemWitnessStatus::Complete, ItemWitnessObservation(execution, lease.storage_, storage.active_round)};
+    };
+    const auto series_locked = [&](const NiuAdmission::Guard& guard) {
+        const auto& terminal = storage.reception->terminal();
+        const auto issuer = execution->leaves.at({storage.member, storage.niu.chip}).state;
+        if (!terminal || storage.reception->accepted() || storage.active_round || issuer != State::Stopped) {
+            return terminal_locked(guard, ItemWitnessStatus::Rejected);
+        }
+        if (!storage.series_terminal) {
+            storage.series_terminal = std::make_shared<ItemWitnessSeries>(ItemWitnessSeries{*terminal});
+        }
+        const auto status = terminal->final_count() ? ItemWitnessStatus::Finished : ItemWitnessStatus::NotExecuted;
+        return ItemWitnessResult{
+            status, std::nullopt, ItemSeriesObservation(execution, lease.storage_, storage.series_terminal)};
+    };
     {
         auto guard = admission->lock();
         if (std::find(execution->item_witnesses.begin(), execution->item_witnesses.end(), lease.storage_) ==
-                execution->item_witnesses.end() ||
-            !execution->validate_item_witness_locked(*admission, guard, storage, true)) return std::nullopt;
+                execution->item_witnesses.end()) return {ItemWitnessStatus::Invalidated, std::nullopt};
+        if (!execution->validate_item_witness_locked(*admission, guard, storage, true))
+            return terminal_locked(guard, ItemWitnessStatus::Invalidated);
+        // Another member can already be issued while this original leaf is
+        // still being prepared. Zero counters there are not item completion.
+        sampled_issuer = issuer_state(execution->leaves.at({storage.member, storage.niu.chip}).state);
+        if (sampled_issuer == Reception::IssuerState::Reserved)
+            return {ItemWitnessStatus::Pending, std::nullopt};
+        // Only a previous fresh Stopped/End/Stopped receive creates this cache.
+        // Revalidate the original admission/boot/epoch above on every reuse;
+        // a retained observation cannot authorize polling after retirement.
+        if (storage.reception->terminal()) {
+            return series_locked(guard);
+        }
+        // Cached online delivery is immutable, but cannot stand in for the
+        // fresh final publication of an actual stopped writer.
+        if (storage.reception->accepted() && sampled_issuer != Reception::IssuerState::Stopped)
+            return complete_locked(guard);
         backing = storage.backing.lock();
         program = storage.program.lock();
-        if (!backing || !program || !execution->preparation.acquire()) return std::nullopt;
+        if (!backing || !program) return terminal_locked(guard, ItemWitnessStatus::Invalidated);
+        // A concurrent legitimate host preparation merely defers this poll.
+        if (!execution->preparation.acquire()) return {ItemWitnessStatus::Pending, std::nullopt};
         lifetime.emplace(Preparation(execution, true));
     }
-    auto& context = MetalContext::instance(program->get_context_id());
-    if (context.niu_admission_owner().lock() != admission || !backing->is_allocated() ||
-        backing->address() != storage.address || backing->device() != storage.device ||
-        !storage.device->is_initialized()) return std::nullopt;
-    const auto& cluster = context.get_cluster();
-    const auto& soc = cluster.get_soc_desc(storage.niu.chip);
-    if (soc.get_physical_tensix_core_from_logical(storage.logical_core) != storage.niu.physical_worker)
-        return std::nullopt;
-    const auto translated = soc.translate_coord_to(storage.niu.physical_worker, tt::CoordSystem::NOC0,
-                                                  tt::CoordSystem::TRANSLATED);
-    const tt_cxy_pair core(storage.niu.chip, translated.x, translated.y);
-    const auto base = uint64_t(storage.address) +
-                      context.hal().get_l1_noc_offset(HalProgrammableCoreType::TENSIX);
-    auto observed = NiuHandoffReceiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) {
-        if (offset > sizeof(tt_niu_item_witness_region) || bytes.size() > sizeof(tt_niu_item_witness_region) - offset)
-            return NiuHandoffIoStatus::Failed;
-        cluster.read_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
-        return NiuHandoffIoStatus::Complete;
-    });
-    auto guard = admission->lock();
-    if (!execution->validate_item_witness_locked(*admission, guard, storage, true) ||
-        observed.status != NiuHandoffReadStatus::Observed || !observed.observation ||
-        !NiuHandoffReceiver::closed_item(*observed.observation, storage.request)) return std::nullopt;
-    return ItemWitnessObservation(execution, lease.storage_);
+    try {
+        auto& context = MetalContext::instance(program->get_context_id());
+        if (context.niu_admission_owner().lock() != admission || !backing->is_allocated() ||
+            backing->address() != storage.address || backing->device() != storage.device ||
+            !storage.device->is_initialized()) return terminal(ItemWitnessStatus::Invalidated);
+        const auto& cluster = context.get_cluster();
+        const auto& soc = cluster.get_soc_desc(storage.niu.chip);
+        if (soc.get_physical_tensix_core_from_logical(storage.logical_core) != storage.niu.physical_worker)
+            return terminal(ItemWitnessStatus::Invalidated);
+        const auto translated = soc.translate_coord_to(storage.niu.physical_worker, tt::CoordSystem::NOC0,
+                                                      tt::CoordSystem::TRANSLATED);
+        const tt_cxy_pair core(storage.niu.chip, translated.x, translated.y);
+        const auto base = uint64_t(storage.address) +
+                          context.hal().get_l1_noc_offset(HalProgrammableCoreType::TENSIX);
+        auto observed = NiuHandoffReceiver::read_item([&](uint32_t offset, std::span<std::byte> bytes) {
+            if (offset > sizeof(tt_niu_item_witness_region) ||
+                bytes.size() > sizeof(tt_niu_item_witness_region) - offset) return NiuHandoffIoStatus::Failed;
+            cluster.read_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
+            return NiuHandoffIoStatus::Complete;
+        });
+        auto guard = admission->lock();
+        if (!execution->validate_item_witness_locked(*admission, guard, storage, true))
+            return terminal_locked(guard, ItemWitnessStatus::Invalidated);
+        const auto issuer = execution->leaves.at({storage.member, storage.niu.chip}).state;
+        switch (storage.reception->receive(sampled_issuer, issuer_state(issuer), observed)) {
+            case Reception::Status::Complete: return complete_locked(guard);
+            case Reception::Status::NotExecuted:
+            case Reception::Status::Finished: return series_locked(guard);
+            case Reception::Status::Pending: return {ItemWitnessStatus::Pending, std::nullopt};
+            case Reception::Status::Invalidated: return terminal_locked(guard, ItemWitnessStatus::Invalidated);
+            case Reception::Status::Rejected: return terminal_locked(guard, ItemWitnessStatus::Rejected);
+            case Reception::Status::IoFailure: return terminal_locked(guard, ItemWitnessStatus::IoFailure);
+        }
+    } catch (...) {
+        return terminal(ItemWitnessStatus::IoFailure);
+    }
+    return terminal(ItemWitnessStatus::Rejected);
+}
+
+ProgramExecution::ManagedInvocation::ItemAcknowledgementStatus
+ProgramExecution::ManagedInvocation::acknowledge_item(const ItemWitnessObservation& observation) const {
+    // Only the original SDK-minted delivery has authority to publish to this
+    // slot. Foreign and already-consumed rounds cannot poison a live owner.
+    if (observation.owner_ != execution || !observation.storage_ || !observation.round_)
+        return ItemAcknowledgementStatus::Invalidated;
+    auto admission = execution->owner.lock();
+    if (!admission) return ItemAcknowledgementStatus::Invalidated;
+    std::optional<Preparation> lifetime;
+    std::shared_ptr<Buffer> backing;
+    std::shared_ptr<ProgramImpl> program;
+    const auto& storage = *observation.storage_;
+    const auto current_round = [&] {
+        return std::find(execution->item_witnesses.begin(), execution->item_witnesses.end(), observation.storage_) !=
+                   execution->item_witnesses.end() && storage.active_round == observation.round_;
+    };
+    const auto terminal_locked = [&](const NiuAdmission::Guard& guard, ItemAcknowledgementStatus status) {
+        if (execution->token && (execution->state == State::Issued || execution->state == State::Stopped)) {
+            std::string ignored;
+            admission->quarantine_locked(guard, *execution->token, ignored);
+            execution->state = State::Quarantined;
+        } else if (execution->state == State::Reserved) {
+            execution->preparation.cancel();
+        }
+        return status;
+    };
+    const auto terminal = [&](ItemAcknowledgementStatus status) {
+        auto guard = admission->lock();
+        return terminal_locked(guard, status);
+    };
+    {
+        auto guard = admission->lock();
+        if (!current_round()) return ItemAcknowledgementStatus::Invalidated;
+        if (!execution->validate_item_witness_locked(*admission, guard, storage, true))
+            return terminal_locked(guard, ItemAcknowledgementStatus::Invalidated);
+        const auto issuer = execution->leaves.at({storage.member, storage.niu.chip}).state;
+        if (issuer != State::Issued && issuer != State::Stopped)
+            return terminal_locked(guard, ItemAcknowledgementStatus::Invalidated);
+        backing = storage.backing.lock();
+        program = storage.program.lock();
+        if (!backing || !program) return terminal_locked(guard, ItemAcknowledgementStatus::Invalidated);
+        if (!execution->preparation.acquire()) return ItemAcknowledgementStatus::Pending;
+        lifetime.emplace(Preparation(execution, true));
+    }
+    try {
+        auto& context = MetalContext::instance(program->get_context_id());
+        if (context.niu_admission_owner().lock() != admission || !backing->is_allocated() ||
+            backing->address() != storage.address || backing->device() != storage.device || !storage.device ||
+            !storage.device->is_initialized()) return terminal(ItemAcknowledgementStatus::Invalidated);
+        const auto& cluster = context.get_cluster();
+        const auto& soc = cluster.get_soc_desc(storage.niu.chip);
+        if (soc.get_physical_tensix_core_from_logical(storage.logical_core) != storage.niu.physical_worker)
+            return terminal(ItemAcknowledgementStatus::Invalidated);
+        const auto translated = soc.translate_coord_to(storage.niu.physical_worker, tt::CoordSystem::NOC0,
+                                                       tt::CoordSystem::TRANSLATED);
+        const tt_cxy_pair core(storage.niu.chip, translated.x, translated.y);
+        const auto base = uint64_t(storage.address) +
+                          context.hal().get_l1_noc_offset(HalProgrammableCoreType::TENSIX);
+        const auto published = NiuHandoffReceiver::write_item_acknowledgement(
+            [&](uint32_t offset, std::span<const std::byte> bytes) {
+                if (offset > sizeof(tt_niu_item_witness_region) ||
+                    bytes.size() > sizeof(tt_niu_item_witness_region) - offset) return NiuHandoffIoStatus::Failed;
+                cluster.write_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
+                cluster.l1_barrier(storage.niu.chip);
+                return NiuHandoffIoStatus::Complete;
+            },
+            [&](uint32_t offset, std::span<std::byte> bytes) {
+                if (offset > sizeof(tt_niu_item_witness_region) ||
+                    bytes.size() > sizeof(tt_niu_item_witness_region) - offset) return NiuHandoffIoStatus::Failed;
+                cluster.read_core(bytes.data(), static_cast<uint32_t>(bytes.size()), core, base + offset);
+                return NiuHandoffIoStatus::Complete;
+            },
+            observation.round_->acknowledgement);
+        auto guard = admission->lock();
+        if (!current_round()) return ItemAcknowledgementStatus::Invalidated;
+        if (!execution->validate_item_witness_locked(*admission, guard, storage, true))
+            return terminal_locked(guard, ItemAcknowledgementStatus::Invalidated);
+        switch (published) {
+            case NiuHandoffWriteStatus::IoFailure:
+                return terminal_locked(guard, ItemAcknowledgementStatus::IoFailure);
+            case NiuHandoffWriteStatus::ReadbackMismatch:
+            case NiuHandoffWriteStatus::InvalidRequest:
+                return terminal_locked(guard, ItemAcknowledgementStatus::Rejected);
+            case NiuHandoffWriteStatus::Published: break;
+        }
+        if (!storage.reception->acknowledge(observation.round_->acknowledgement))
+            return terminal_locked(guard, ItemAcknowledgementStatus::Rejected);
+        storage.active_round.reset();
+        return ItemAcknowledgementStatus::Acknowledged;
+    } catch (...) {
+        return terminal(ItemAcknowledgementStatus::IoFailure);
+    }
 }
 
 std::vector<ProgramExecution::HandoffObservation> ProgramExecution::ManagedInvocation::handoff_observations() const {
@@ -1140,18 +1344,70 @@ ProgramExecution::ManagedInvocation::observe_selector(const SelectorLease& selec
     return SelectorObservation(execution, niu, selector.selector(), selector.boot_cookie(), selector.invocation_id());
 }
 
+ProgramExecution::ManagedInvocation::ResourceRetirementReception::Status
+ProgramExecution::ManagedInvocation::ResourceRetirementReception::receive(
+    Identity identity,
+    const ProgramPreparation& preparation,
+    std::span<const NiuHandoffReceiver::ItemReception* const> series,
+    Inventory inventory) {
+    if (identity != Identity::Current || preparation.cancelled()) {
+        return Status::Invalidated;
+    }
+    if ((inventory != Inventory::RequireSeries && inventory != Inventory::AllowEmpty) ||
+        (inventory == Inventory::RequireSeries && series.empty())) {
+        return Status::Rejected;
+    }
+    for (size_t index = 0; index != series.size(); ++index) {
+        if (!series[index] ||
+            std::find(series.begin(), series.begin() + index, series[index]) != series.begin() + index) {
+            return Status::Rejected;
+        }
+    }
+    if (preparation.occupied()) {
+        return Status::Pending;
+    }
+    for (const auto* reception : series) {
+        if (!reception->terminal() || reception->accepted() ||
+            reception->closed_prefix() != reception->acknowledged_prefix() ||
+            reception->terminal()->final_count() != reception->closed_prefix()) {
+            return Status::Pending;
+        }
+    }
+    return Status::Ready;
+}
+
 bool ProgramExecution::ManagedInvocation::retire_selectors() const {
     auto admission = execution->owner.lock();
-    if (!admission) return false;
-    auto guard = admission->lock();
-    if (execution->state != State::Stopped || !execution->handoff_snapshot ||
-        execution->preparation.occupied())
+    if (!admission) {
         return false;
+    }
+    auto guard = admission->lock();
+    if (execution->state != State::Stopped || !execution->handoff_snapshot) {
+        return false;
+    }
     execution->validate_handoff_locked(*admission, guard, *execution->handoff_snapshot);
+    // Aggregate counter closure, the last Closed and its ACK cannot substitute
+    // the explicit source-series End. Only poll_item's fresh stopped read of
+    // that epilogue publication establishes this prerequisite. Payload backing
+    // visibility and retention still require their independent receivers.
+    std::vector<const NiuHandoffReceiver::ItemReception*> series;
+    series.reserve(execution->item_witnesses.size());
+    for (const auto& item : execution->item_witnesses) {
+        if (!item || !execution->validate_item_witness_locked(*admission, guard, *item, true)) {
+            return false;
+        }
+        series.push_back(&*item->reception);
+    }
+    if (ResourceRetirementReception::receive(
+            ResourceRetirementReception::Identity::Current,
+            execution->preparation,
+            series,
+            ResourceRetirementReception::Inventory::AllowEmpty) != ResourceRetirementReception::Status::Ready) {
+        return false;
+    }
     for (const auto& selection : execution->managed->selections()) {
         const auto observed = std::find_if(
-            execution->observed_handoffs.begin(), execution->observed_handoffs.end(),
-            [&](const auto& observation) {
+            execution->observed_handoffs.begin(), execution->observed_handoffs.end(), [&](const auto& observation) {
                 return observation.chip == selection.niu.chip &&
                        observation.physical_worker == selection.niu.physical_worker;
             });
@@ -1165,16 +1421,112 @@ bool ProgramExecution::ManagedInvocation::retire_selectors() const {
                 return false;
         }
     }
+    // Freeze the original native-owner identities before selector retirement
+    // changes either ledger. No allocation follows a successful clean commit.
+    auto terminal = std::make_shared<NativeBackingTerminal>(
+        execution->handoff_snapshot, execution->invocation_identity, execution->item_witnesses);
     std::string error;
-    TT_FATAL(admission->record_clean_locked(*execution->token, execution->boots, error),
+    terminal->clean = admission->record_clean_locked(
+        guard, *execution->token, execution->boots, execution->handoff_snapshot->epochs, error);
+    TT_FATAL(terminal->clean,
              "Managed selector clean reception lost its original stopped admission: {}", error);
     for (auto& group : execution->groups) group.state = GroupState::Clean;
-    // Selector counters no longer exclude this allocation, but posted payload
-    // visibility and backing retention are separate obligations. Preserve the
-    // execution and all original native resources until their independent
-    // receiver, or actual boot withdrawal, authorizes retirement.
+    execution->native_backing_terminal = std::move(terminal);
+    // Selector clean only mints the private native-retirement predecessor.
+    // The separate receiver below still owns detachment and destruction;
+    // source payload visibility/last-use remain independent obligations.
     execution->state = State::SelectorsClean;
     return true;
+}
+
+ProgramExecution::ManagedInvocation::NativeResourceRetirementStatus
+ProgramExecution::ManagedInvocation::retire_native_resources() const {
+    using Status = NativeResourceRetirementStatus;
+    const auto admission = execution->owner.lock();
+    if (!admission) return Status::Invalidated;
+    NiuAdmission::Retirement retired;
+    {
+        auto guard = admission->lock();
+        if (!execution->managed || !execution->token || execution->simulated ||
+            execution->owner.lock() != admission || execution->preparation.cancelled())
+            return Status::Invalidated;
+        if (execution->state == State::Quarantined ||
+            (execution->state == State::Withdrawn && !execution->native_retirement_pending))
+            return Status::Invalidated;
+        if (execution->state != State::SelectorsClean && !execution->native_retirement_pending)
+            return Status::Pending;
+        const auto& terminal = execution->native_backing_terminal;
+        if (!terminal || !terminal->clean || !terminal->handoff ||
+            terminal->handoff != execution->handoff_snapshot || terminal->handoff != execution->issued_handoff ||
+            !terminal->invocation || terminal->invocation != execution->invocation_identity ||
+            terminal->witnesses != execution->item_witnesses ||
+            terminal->handoff->footprint != execution->footprint || execution->footprint.empty() ||
+            execution->attached_chips.size() != execution->footprint.size())
+            return Status::Rejected;
+        std::string error;
+        // A private receipt from record_clean_locked proves the original
+        // successful transition even though its ledger record was erased.
+        // Do not resample selectors: a later invocation may already own them.
+        if (!admission->validate_clean_terminal_locked(
+                guard, *terminal->clean, *execution->token, execution->boots, terminal->handoff->epochs, error) ||
+            !admission->validate_clean_terminal_locked(
+                guard, *terminal->clean, terminal->handoff->token, terminal->handoff->boots,
+                terminal->handoff->epochs, error))
+            return Status::Invalidated;
+        for (const auto& [chip, workers] : execution->footprint) {
+            if (!execution->attached_chips.contains(chip)) return Status::Invalidated;
+        }
+        if (execution->native_retirement_pending)
+            return execution->resources_retired ? Status::Retired : Status::Pending;
+        if (execution->resources_retired || execution->groups.empty() || execution->leaves.empty() ||
+            !std::all_of(execution->groups.begin(), execution->groups.end(), [](const auto& group) {
+                return group.state == GroupState::Clean;
+            }) || !std::all_of(execution->leaves.begin(), execution->leaves.end(), [](const auto& leaf) {
+                return leaf.second.state == State::Stopped && leaf.second.pending.empty();
+            }))
+            return Status::Rejected;
+        std::vector<const NiuHandoffReceiver::ItemReception*> series;
+        series.reserve(terminal->witnesses.size());
+        for (const auto& item : terminal->witnesses) {
+            if (!item || !item->reception || !item->series_terminal || item->active_round)
+                return Status::Rejected;
+            series.push_back(&*item->reception);
+        }
+        switch (ResourceRetirementReception::receive(
+            ResourceRetirementReception::Identity::Current, execution->preparation, series,
+            ResourceRetirementReception::Inventory::AllowEmpty)) {
+            case ResourceRetirementReception::Status::Pending: return Status::Pending;
+            case ResourceRetirementReception::Status::Rejected: return Status::Rejected;
+            case ResourceRetirementReception::Status::Invalidated: return Status::Invalidated;
+            case ResourceRetirementReception::Status::Ready: break;
+        }
+        if (execution->retained_programs.size() != execution->members.size() ||
+            execution->retained_witness_backing.size() != terminal->witnesses.size())
+            return Status::Rejected;
+        for (size_t index = 0; index != execution->members.size(); ++index) {
+            const auto program = execution->members[index].program.lock();
+            if (!program || execution->retained_programs[index] != program ||
+                program->managed_niu_invocation_.lock() != execution)
+                return Status::Invalidated;
+        }
+        for (size_t index = 0; index != terminal->witnesses.size(); ++index) {
+            const auto backing = terminal->witnesses[index]->backing.lock();
+            if (!backing || execution->retained_witness_backing[index] != backing)
+                return Status::Invalidated;
+        }
+        for (const auto& workload : execution->retained_workloads) {
+            if (!workload || workload->managed_niu_invocation_.lock() != execution)
+                return Status::Invalidated;
+        }
+        // The existing lock-outside-destruction owner holds Device reopening
+        // closed and publishes resources_retired only after every destructor.
+        // Concurrent callers observe Pending until that final publication.
+        execution->native_retirement_pending = true;
+        execution->state = State::Withdrawn;
+        admission->retire_managed_locked(*execution, retired);
+    }
+    retired.release();
+    return Status::Retired;
 }
 
 void ProgramExecution::validate_request_locked(
@@ -1398,7 +1750,15 @@ void ProgramExecution::observe_handoff() {
     }
 }
 
-ProgramExecution::ManagedInvocation::~ManagedInvocation() { execution->abandon_managed(); }
+ProgramExecution::ManagedInvocation::~ManagedInvocation() {
+    try {
+        (void)retire_native_resources();
+    } catch (...) {
+        // Allocation failure cannot manufacture terminal proof or detach an
+        // unverified owner. Preserve the original fail-closed abandonment.
+    }
+    execution->abandon_managed();
+}
 
 void ProgramExecution::abandon_managed(bool preparation_owner_only) noexcept {
     auto admission = owner.lock();

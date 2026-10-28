@@ -290,6 +290,16 @@ private:
         std::map<ChipId, Binding> bindings;
         std::weak_ptr<const Token::Lease> lease;
     };
+    // Produced only by this admission's successful stopped-to-clean
+    // transition. Record erasure alone is never proof of clean retirement.
+    class CleanTerminal final {
+        friend class NiuAdmission;
+        CleanTerminal(const Token& token, const Boots& boots, const std::map<ChipId, uint64_t>& epochs) :
+            token_(token), boots_(boots), epochs_(epochs) {}
+        const Token token_;
+        const Boots boots_;
+        const std::map<ChipId, uint64_t> epochs_;
+    };
 
     // Only the existing initializer's successful real boot seam can publish.
     // It holds mutex_ while changing both LoadedFirmware::live and these maps.
@@ -324,7 +334,12 @@ private:
     // The receiver retains the exact boot set from the operation being proved;
     // a completion from an old boot cannot retire a reimported ordinary intent.
     bool record_stop_locked(const Token& token, const Boots& boots, std::string& error);
-    bool record_clean_locked(const Token& token, const Boots& boots, std::string& error);
+    std::shared_ptr<const CleanTerminal> record_clean_locked(
+        const Guard& guard, const Token& token, const Boots& boots,
+        const std::map<ChipId, uint64_t>& epochs, std::string& error);
+    bool validate_clean_terminal_locked(
+        const Guard& guard, const CleanTerminal& terminal, const Token& token, const Boots& boots,
+        const std::map<ChipId, uint64_t>& epochs, std::string& error) const;
 
     std::map<ChipId, size_t> retirements_;
     mutable std::mutex mutex_;

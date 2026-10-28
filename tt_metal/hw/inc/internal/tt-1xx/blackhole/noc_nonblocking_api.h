@@ -9,7 +9,7 @@
 #include "internal/tt-1xx/cache.h"
 #include "noc_parameters.h"
 #include "hostdev/dev_msgs.h"
-#include "hostdev/blackhole_noc_counters.h"
+#include "hostdev/noc_counters.h"
 #include "noc_overlay_parameters.h"
 #include "api/debug/assert.h"
 

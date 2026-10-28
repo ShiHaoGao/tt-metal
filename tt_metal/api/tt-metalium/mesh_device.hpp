@@ -245,6 +245,10 @@ public:
 
     DeviceIds get_device_ids() const;
 
+    // Exact virtual dispatch tile monitored by the real-time profiler for a
+    // physical chip. Empty when the producer was not admitted for that chip.
+    std::optional<CoreCoord> dispatch_timing_producer_core(ChipId chip_id) const;
+
     size_t num_devices() const;
 
     // The following methods assume 2D mesh, and throw if the mesh is not 2D.

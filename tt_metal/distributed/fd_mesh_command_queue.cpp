@@ -732,6 +732,7 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
             mcast_launch_msg_wptr,
             unicast_launch_msg_wptr,
             expected_num_workers_completed,
+            num_workers,
             dispatch_core,
             sub_device_id,
             dispatch_metadata,

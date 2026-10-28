@@ -1436,7 +1436,11 @@ re_run_command:
             }
             if (rt_profiler_msg->realtime_profiler_core_noc_xy != 0 &&
                 program_host_id != REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID) {
-                while (!program_id_fifo_append(rt_profiler_msg, program_host_id)) {
+                const uint64_t occurrence =
+                    (static_cast<uint64_t>(load_aligned<uint32_t>(&cmd->set_write_offset.timing_occurrence_hi)) << 32) |
+                    load_aligned<uint32_t>(&cmd->set_write_offset.timing_occurrence_lo);
+                const uint32_t workers = load_aligned<uint32_t>(&cmd->set_write_offset.timing_worker_count);
+                while (!program_id_fifo_append(rt_profiler_msg, program_host_id, occurrence, workers)) {
                     invalidate_l1_cache();
                 }
             }

@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 
@@ -25,6 +26,11 @@ public:
         ALLOCATION_REQUESTED,
         ALLOCATED,
         DEALLOCATED,
+    };
+    struct Lifetime {
+        std::mutex mutex;
+        std::atomic<size_t> l1_pins{0};
+        std::atomic<AllocationStatus> allocation_status{AllocationStatus::ALLOCATION_REQUESTED};
     };
 
     BufferImpl(
@@ -57,7 +63,7 @@ public:
 
     std::shared_ptr<Buffer> view(Buffer& self, const BufferRegion& region);
 
-    bool is_allocated() const { return allocation_status_ == AllocationStatus::ALLOCATED; }
+    bool is_allocated() const { return lifetime_->allocation_status == AllocationStatus::ALLOCATED; }
     HalMemType memory_type() const;
     bool is_valid_region(const BufferRegion& region) const;
     bool is_valid_partial_region(const BufferRegion& region) const;
@@ -66,7 +72,7 @@ public:
     std::shared_ptr<Buffer> root_buffer(Buffer& self);
     BufferRegion root_buffer_region() const { return BufferRegion(root_buffer_offset_, size_); }
     std::optional<SubDeviceId> sub_device_id() const { return sub_device_id_; }
-    void mark_as_deallocated() { allocation_status_ = AllocationStatus::DEALLOCATED; }
+    void mark_as_deallocated() { lifetime_->allocation_status = AllocationStatus::DEALLOCATED; }
 
     void allocate_impl(Buffer& self);
     void deallocate(Buffer& self);
@@ -88,7 +94,8 @@ public:
     std::optional<SubDeviceManagerId> sub_device_manager_id_;
     AllocatorImpl* allocator_ = nullptr;
 
-    AllocationStatus allocation_status_ = AllocationStatus::ALLOCATION_REQUESTED;
+    // Kept behind a movable owner because BufferImpl is moved into Buffer.
+    std::unique_ptr<Lifetime> lifetime_ = std::make_unique<Lifetime>();
     bool hooked_allocation_ = false;
     DeviceAddr address_ = 0;
 

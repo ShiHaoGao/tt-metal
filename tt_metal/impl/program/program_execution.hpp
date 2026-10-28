@@ -118,6 +118,9 @@ public:
     };
     class ManagedInvocation final {
         struct ItemWitnessStorage;
+        struct ItemWitnessRound;
+        struct ItemWitnessSeries;
+
     public:
         class SelectorLease final {
         public:
@@ -232,10 +235,58 @@ public:
         private:
             friend class ManagedInvocation;
             ItemWitnessObservation(
-                std::shared_ptr<ProgramExecution> owner, std::shared_ptr<const ItemWitnessStorage> storage) :
-                owner_(std::move(owner)), storage_(std::move(storage)) {}
+                std::shared_ptr<ProgramExecution> owner, std::shared_ptr<const ItemWitnessStorage> storage,
+                std::shared_ptr<const ItemWitnessRound> round) :
+                owner_(std::move(owner)), storage_(std::move(storage)), round_(std::move(round)) {}
             std::shared_ptr<ProgramExecution> owner_;
             std::shared_ptr<const ItemWitnessStorage> storage_;
+            std::shared_ptr<const ItemWitnessRound> round_;
+        };
+        // An original source-series End, distinct from any individual Closed
+        // round. The execution retains native owners until SDK retirement;
+        // this immutable observation never extends allocation authority past
+        // boot withdrawal or grants payload visibility/selector reclamation.
+        class ItemSeriesObservation final {
+        public:
+            const tt_niu_item_witness_request& request() const;
+            detail::NiuKey niu() const;
+            uint64_t final_count() const;
+
+        private:
+            friend class ManagedInvocation;
+            ItemSeriesObservation(
+                std::shared_ptr<ProgramExecution> owner,
+                std::shared_ptr<const ItemWitnessStorage> storage,
+                std::shared_ptr<const ItemWitnessSeries> series) :
+                owner_(std::move(owner)), storage_(std::move(storage)), series_(std::move(series)) {}
+            std::shared_ptr<ProgramExecution> owner_;
+            std::shared_ptr<const ItemWitnessStorage> storage_;
+            std::shared_ptr<const ItemWitnessSeries> series_;
+        };
+        enum class ItemWitnessStatus { Pending, Complete, NotExecuted, Finished, Rejected, Invalidated, IoFailure };
+        enum class ItemAcknowledgementStatus { Acknowledged, Pending, Invalidated, Rejected, IoFailure };
+        struct ItemWitnessResult {
+            ItemWitnessStatus status;
+            std::optional<ItemWitnessObservation> observation;
+            std::optional<ItemSeriesObservation> series = std::nullopt;
+        };
+        // Read-only prerequisite reception shared with selector cleaning.
+        // Ready is not native resource retirement: payload visibility and
+        // last-use still require their independent original-owner receivers.
+        // The invocation must freshly validate owner/boot/token/Device epoch
+        // before supplying Current; this input grants no resource authority.
+        class ResourceRetirementReception final {
+        public:
+            enum class Status { Pending, Ready, Rejected, Invalidated };
+            enum class Identity { Current, Invalidated };
+            // Selector cleaning also supports native invocations that have
+            // no registered source series. This waives only nonemptiness.
+            enum class Inventory { RequireSeries, AllowEmpty };
+            static Status receive(
+                Identity identity,
+                const ProgramPreparation& preparation,
+                std::span<const NiuHandoffReceiver::ItemReception* const> series,
+                Inventory inventory);
         };
         ~ManagedInvocation();
         ManagedInvocation(const ManagedInvocation&) = delete;
@@ -250,18 +301,33 @@ public:
         std::vector<CompletionObservation> completion_observations() const;
         std::optional<SelectorObservation> observe_selector(const SelectorLease& selector) const;
         // Revalidate every admitted selector against the original stopped
-        // invocation. Nonzero/uncertain counters preserve the full exclusion.
+        // invocation and require a fresh explicit End read from every actual
+        // stopped item issuer. Nonzero/uncertain counters preserve exclusion.
         // No caller-supplied counters, receipt, bool or generation can retire.
         bool retire_selectors() const;
+        enum class NativeResourceRetirementStatus { Pending, Retired, Rejected, Invalidated };
+        // Consume only the private terminal minted by this invocation's
+        // original selector-clean receiver. Native owners are destroyed
+        // outside admission; this grants no Channel payload visibility,
+        // last-use, retention release or slot-generation reuse.
+        NativeResourceRetirementStatus retire_native_resources() const;
         // The SDK allocates and initializes one real Worker L1 slot before
         // issue, binding the exact frozen native kernel and original selector.
         // No caller-supplied address or copied receipt can produce a lease.
-        std::optional<ItemWitnessLease> acquire_item_witness(
-            const SelectorLease&, const ItemWitnessRequirement&) const;
+        std::optional<ItemWitnessLease> acquire_item_witness(const SelectorLease&, const ItemWitnessRequirement&) const;
         // Online observation reads the original allocation and then revalidates
         // the original boot/token/Device epoch. It reports physical completion
-        // only, never consumer visibility, release or rolling-slot reuse.
-        std::optional<ItemWitnessObservation> observe_item(const ItemWitnessLease&) const;
+        // or explicit source-series termination, never consumer visibility,
+        // release or rolling-slot reuse. Complete carries one Closed round;
+        // NotExecuted/Finished carry only the original stopped series End.
+        // Terminal failures retain the original allocation and quarantine
+        // issued/stopped owners. A foreign lease has no quarantine authority.
+        ItemWitnessResult poll_item(const ItemWitnessLease&) const;
+        // Explicit observer consumption publishes the original round's opaque
+        // ACK to its actual L1 allocation and verifies the ordered readback.
+        // This releases receipt-slot backpressure only; it grants neither
+        // payload visibility, last-use, Channel release nor selector clean.
+        ItemAcknowledgementStatus acknowledge_item(const ItemWitnessObservation&) const;
 
     private:
         friend class ProgramExecution;
@@ -342,6 +408,16 @@ private:
         Cores footprint;
         std::map<ChipId, uint64_t> epochs;
         std::map<ChipId, std::map<CoreCoord, NiuHandoffExpectedExecution>> expected;
+    };
+    struct NativeBackingTerminal {
+        NativeBackingTerminal(
+            std::shared_ptr<const HandoffSnapshot> handoff, uint64_t invocation,
+            const std::vector<std::shared_ptr<const ManagedInvocation::ItemWitnessStorage>>& witnesses) :
+            handoff(std::move(handoff)), invocation(invocation), witnesses(witnesses) {}
+        const std::shared_ptr<const HandoffSnapshot> handoff;
+        const uint64_t invocation;
+        const std::vector<std::shared_ptr<const ManagedInvocation::ItemWitnessStorage>> witnesses;
+        std::shared_ptr<const NiuAdmission::CleanTerminal> clean;
     };
     ProgramExecution(
         MetalContext& context,
@@ -446,6 +522,7 @@ private:
     NiuAdmission::Boots boots;
     std::shared_ptr<const HandoffSnapshot> handoff_snapshot;
     std::shared_ptr<const HandoffSnapshot> issued_handoff;
+    std::shared_ptr<const NativeBackingTerminal> native_backing_terminal;
     std::vector<HandoffObservation> observed_handoffs;
     Endpoints managed_endpoints;
     std::optional<NiuAdmission::Boots> replay_boots;
@@ -461,6 +538,7 @@ private:
     std::set<ChipId> retirement_chips;
     ProgramPreparation preparation;
     bool resources_retired = false;
+    bool native_retirement_pending = false;
     std::map<LeafKey, Leaf> leaves;
     std::weak_ptr<distributed::MeshDevice> mesh_owner;
     std::optional<SubDeviceManagerId> subdevice_manager;

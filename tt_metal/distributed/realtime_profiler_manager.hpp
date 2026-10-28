@@ -70,6 +70,11 @@ public:
     uint64_t num_published_records() const { return num_published_records_.load(std::memory_order_relaxed); }
     uint64_t num_published_batches() const { return num_published_batches_.load(std::memory_order_relaxed); }
     uint32_t ring_full_wait_count() const;  // reads device L1
+    // Return the exact virtual dispatch tile whose queue GO records are
+    // monitored by the co-located completion observer for a physical chip.
+    // No value means this chip has no qualified producer (for example, the
+    // dispatch core was not allocated or profiler setup skipped the chip).
+    std::optional<CoreCoord> dispatch_timing_producer_core(uint32_t chip_id) const;
     size_t num_active_devices() const { return devices_.size(); }
 
 private:
@@ -78,6 +83,8 @@ private:
         uint32_t chip_id = 0;
         MeshCoordinate mesh_coord = MeshCoordinate(0);
         CoreCoord realtime_profiler_core;
+        CoreCoord dispatch_timing_core;
+        bool dispatch_timing_available = false;
         std::unique_ptr<D2HSocket> socket;
         // Owns the BRISC+NCRISC program to keep its kernels (and their metadata for tt-inspector) alive for the
         // manager's lifetime.

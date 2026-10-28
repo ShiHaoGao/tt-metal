@@ -67,7 +67,9 @@ public:
     Cluster(const Cluster&) = delete;
     Cluster(Cluster&& other) noexcept = delete;
 
-    Cluster(llrt::RunTimeOptions& rtoptions);
+    Cluster(
+        llrt::RunTimeOptions& rtoptions,
+        tt_metal::PhysicalChipDiscovery physical_chip_discovery = tt_metal::PhysicalChipDiscovery::AllConnected);
     ~Cluster();
 
     std::unordered_map<ChipId, EthCoord> get_user_chip_ethernet_coordinates() const;
@@ -483,6 +485,7 @@ private:
     // Cluster depends on RunTimeOptions and Hal to set up, but they're all initialized/accessed by MetalContext, so
     // keep a local reference for init.
     const llrt::RunTimeOptions& rtoptions_;
+    const tt_metal::PhysicalChipDiscovery physical_chip_discovery_;
     const tt_metal::Hal* hal_ = nullptr;
 };
 

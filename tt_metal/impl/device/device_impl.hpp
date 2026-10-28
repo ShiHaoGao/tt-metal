@@ -188,6 +188,7 @@ public:
 
 private:
     friend class DispatchKernelInitializer;
+    void detach_programs();
     // Deprecated overrides for sub_device_manager_tracker
     CoreRangeSet worker_cores(HalProgrammableCoreType core_type, SubDeviceId sub_device_id) const override;
     uint32_t num_worker_cores(HalProgrammableCoreType core_type, SubDeviceId sub_device_id) const override;
