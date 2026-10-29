@@ -7,6 +7,7 @@
 
 namespace tt::tt_metal {
 struct AllocatorConfig;
+namespace detail { class ProgramExecution; }
 class NativeElfKernel final : public ExternalBinaryKernel {
 public:
     NativeElfKernel(
@@ -37,6 +38,13 @@ public:
     const std::vector<const ll_api::memory*>& owned_binaries() const override { return owned_binaries_; }
 
 private:
+    friend class detail::ProgramExecution;
+    // The ordinary managed validator intentionally rejects relative windows.
+    // ProgramExecution calls this private path only after it has received and
+    // revalidated every original allocation binding.
+    void validate_managed_traffic_bound(const AllocatorConfig&) const;
+    void validate_managed_traffic_static() const;
+    static void validate_managed_group_bound(std::span<const NativeElfKernel* const>);
     void retain_binaries();
     std::string config_hash() const override;
     Config config_;

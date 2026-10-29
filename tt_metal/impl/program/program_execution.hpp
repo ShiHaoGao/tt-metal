@@ -4,6 +4,7 @@
 
 #include <map>
 #include <atomic>
+#include <array>
 #include <memory>
 #include <set>
 #include <span>
@@ -13,6 +14,7 @@
 
 #include "impl/context/niu_admission.hpp"
 #include "impl/context/niu_handoff_receiver.hpp"
+#include "impl/allocator/allocator.hpp"
 #include "hostdev/native_kernel_contract.h"
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/sub_device_types.hpp>
@@ -26,6 +28,7 @@ class IDevice;
 class Kernel;
 class Buffer;
 namespace experimental {
+enum class TensixKernelRole : uint8_t;
 void DispatchCompiledProgramToDevice(IDevice*, Program&);
 }
 namespace distributed {
@@ -96,6 +99,38 @@ public:
     };
     static Preparation reserve_direct(Program& program, IDevice& device);
     static Preparation reserve_workload(distributed::MeshDevice& mesh, distributed::MeshWorkload& workload);
+
+    // A host-only binding request. The caller supplies only the original
+    // source objects and one canonical SDK allocation pin; image window,
+    // endpoint and child-range facts are received from those owners below.
+    struct PayloadBindingRequest {
+        Program* program;
+        std::shared_ptr<Kernel> kernel;
+        experimental::TensixKernelRole role;
+        size_t window;
+        distributed::MeshCoordinate coordinate;
+        CoreCoord issuer;
+        std::array<uint32_t, 3> arguments;
+        AllocatorImpl::L1AllocationPin allocation;
+    };
+    class PayloadBindings final {
+    public:
+        PayloadBindings(PayloadBindings&&) noexcept;
+        PayloadBindings& operator=(PayloadBindings&&) noexcept;
+        ~PayloadBindings();
+        PayloadBindings(const PayloadBindings&) = delete;
+        PayloadBindings& operator=(const PayloadBindings&) = delete;
+
+    private:
+        struct Storage;
+        friend class ProgramExecution;
+        explicit PayloadBindings(std::unique_ptr<Storage> storage);
+        std::unique_ptr<Storage> storage_;
+    };
+    static PayloadBindings prepare_payload_bindings(
+        distributed::MeshDevice& mesh,
+        std::span<distributed::MeshWorkload* const> workloads,
+        std::vector<PayloadBindingRequest> requests);
     class FailureScope final {
     public:
         ~FailureScope();
@@ -337,6 +372,10 @@ public:
     static std::unique_ptr<ManagedInvocation> acquire_managed(Program& program, std::span<IDevice* const> devices);
     static std::unique_ptr<ManagedInvocation> acquire_managed(
         distributed::MeshDevice& mesh, std::span<distributed::MeshWorkload* const> workloads);
+    static std::unique_ptr<ManagedInvocation> acquire_managed(
+        distributed::MeshDevice& mesh,
+        std::span<distributed::MeshWorkload* const> workloads,
+        PayloadBindings&& bindings);
     class DispatchFootprint final {
     private:
         friend class ProgramExecution;
@@ -429,7 +468,7 @@ private:
     static Endpoints freeze_managed_endpoints(MetalContext& context, const Cores& cores);
     static void validate_managed_traffic(
         const Member& member, const NiuAdmission::Boots& boots, const Endpoints& endpoints,
-        distributed::MeshDevice* mesh);
+        distributed::MeshDevice* mesh, bool payload_bound = false);
     static std::unique_ptr<ManagedInvocation> acquire_managed(
         MetalContext& context,
         Origin origin,
@@ -437,7 +476,12 @@ private:
         std::vector<Member> members,
         std::vector<Group> groups,
         distributed::MeshDevice* mesh = nullptr,
-        std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>> workloads = {});
+        std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>> workloads = {},
+        std::unique_ptr<PayloadBindings::Storage> payload = {});
+    static std::unique_ptr<ManagedInvocation> acquire_managed(
+        distributed::MeshDevice& mesh,
+        std::span<distributed::MeshWorkload* const> workloads,
+        PayloadBindings* payload);
     void validate_member_locked(
         NiuAdmission& admission,
         const NiuAdmission::Guard& guard,
@@ -456,6 +500,7 @@ private:
         NiuAdmission&, const NiuAdmission::Guard&, const ManagedInvocation::ItemWitnessStorage&, bool issued) const;
     void validate_request_locked(
         NiuAdmission& admission, const NiuAdmission::Guard& guard, const HandoffSnapshot& snapshot) const;
+    void validate_payload_issue_locked() const;
     void prepare_handoff();
     std::vector<ManagedInvocation::CompletionBinding> completion_bindings() const;
     class Submission final {
@@ -532,6 +577,7 @@ private:
     std::vector<Group> groups;
     std::vector<std::shared_ptr<ProgramImpl>> retained_programs;
     std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>> retained_workloads;
+    std::unique_ptr<PayloadBindings::Storage> payload_bindings;
     std::vector<std::shared_ptr<Buffer>> retained_witness_backing;
     std::vector<std::shared_ptr<const ManagedInvocation::ItemWitnessStorage>> item_witnesses;
     std::set<ChipId> attached_chips;

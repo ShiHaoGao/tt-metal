@@ -36,6 +36,126 @@ void validate_managed_reload(const ProgramImpl& program) {
 }
 }  // namespace
 
+struct ProgramExecution::PayloadBindings::Storage {
+    distributed::MeshDevice* mesh = nullptr;
+    std::vector<distributed::MeshWorkloadImpl*> workloads;
+    std::vector<std::shared_ptr<ProgramImpl>> programs;
+    std::vector<PayloadBindingRequest> rows;
+};
+
+ProgramExecution::PayloadBindings::PayloadBindings(PayloadBindings&&) noexcept = default;
+ProgramExecution::PayloadBindings& ProgramExecution::PayloadBindings::operator=(PayloadBindings&&) noexcept = default;
+ProgramExecution::PayloadBindings::~PayloadBindings() = default;
+ProgramExecution::PayloadBindings::PayloadBindings(std::unique_ptr<Storage> storage) : storage_(std::move(storage)) {}
+
+namespace {
+struct PayloadCoverageKey {
+    const ProgramImpl* program;
+    const Kernel* kernel;
+    uint32_t x;
+    uint32_t y;
+    CoreCoord issuer;
+    uint8_t role;
+    size_t window;
+    auto tie() const { return std::tie(program, kernel, x, y, issuer, role, window); }
+    bool operator<(const PayloadCoverageKey& other) const { return tie() < other.tie(); }
+    bool operator==(const PayloadCoverageKey& other) const = default;
+};
+
+const experimental::KernelElfImage* find_payload_image(
+    const NativeElfKernel& kernel, experimental::TensixKernelRole role) {
+    for (const auto& image : kernel.native_images().images)
+        if (image.role() == role) return &image;
+    return nullptr;
+}
+
+void validate_payload_rows(
+    distributed::MeshDevice& mesh,
+    std::span<distributed::MeshWorkload* const> workloads,
+    std::vector<ProgramExecution::PayloadBindingRequest>& rows,
+    std::vector<distributed::MeshWorkloadImpl*>& retained_workloads,
+    std::vector<std::shared_ptr<ProgramImpl>>& retained_programs) {
+    if (workloads.empty() || rows.empty()) throw std::runtime_error("Payload binding requires nonempty inputs");
+    std::set<const distributed::MeshWorkloadImpl*> workload_ids;
+    std::set<const ProgramImpl*> program_ids;
+    std::set<PayloadCoverageKey> seen;
+    std::set<PayloadCoverageKey> expected;
+    for (auto* workload : workloads) {
+        if (!workload) throw std::runtime_error("Payload binding workload is null");
+        auto* workload_impl = &workload->impl();
+        if (!workload_ids.insert(workload_impl).second) throw std::runtime_error("Duplicate workload owner");
+        retained_workloads.push_back(workload_impl);
+        for (auto& [range, program] : workload->get_programs()) {
+            auto impl = program.impl().shared_from_this();
+            if (!program_ids.insert(impl.get()).second) throw std::runtime_error("Duplicate Program owner");
+            retained_programs.push_back(impl);
+            for (const auto& coord : range) {
+                auto* device = mesh.impl().get_device(coord);
+                if (!device) continue;
+                for (size_t index = 0; index != program.impl().num_kernels(); ++index) {
+                    for (const auto& [_, kernel] : program.impl().get_kernels(index)) {
+                        auto* native = dynamic_cast<NativeElfKernel*>(kernel.get());
+                        if (!native) throw std::runtime_error("Payload binding requires native kernels");
+                        for (const auto& image : native->native_images().images) {
+                            for (size_t window = 0; window != image.noc_windows().size(); ++window)
+                                for (const auto& issuer : native->logical_cores())
+                                    expected.insert(PayloadCoverageKey{
+                                        &program.impl(), kernel.get(), coord[0], coord[1], issuer,
+                                        static_cast<uint8_t>(image.role()), window});
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (auto& row : rows) {
+        if (!row.program || !row.kernel || !row.allocation.live()) throw std::runtime_error("Payload binding has invalid owner");
+        auto program = row.program->impl().shared_from_this();
+        if (!program_ids.contains(program.get())) throw std::runtime_error("Payload binding Program is not in workload");
+        if (!row.kernel->is_native() || !row.kernel->is_on_logical_core(row.issuer))
+            throw std::runtime_error("Payload binding kernel or issuer is not original");
+        auto* native = dynamic_cast<NativeElfKernel*>(row.kernel.get());
+        const auto* image = native ? find_payload_image(*native, row.role) : nullptr;
+        if (!image || row.window >= image->noc_windows().size()) throw std::runtime_error("Payload image window is absent");
+        auto* device = mesh.impl().get_device(row.coordinate);
+        if (!device || row.allocation.device() != device || row.allocation.core() != row.issuer)
+            throw std::runtime_error("Payload pin is not the original actual Device/core");
+        bool placed = false;
+        for (auto* workload : workloads)
+            for (auto& [range, candidate] : workload->get_programs())
+                if (&candidate == row.program && range.contains(row.coordinate)) placed = true;
+        if (!placed) throw std::runtime_error("Payload coordinate is outside original Program placement");
+        const auto& window = image->noc_windows()[row.window];
+        const uint64_t base = row.arguments[2];
+        if (window.base_alignment == 0 || base % window.base_alignment || base + window.relative_begin < base ||
+            base + window.relative_end < base || base + window.relative_begin < row.allocation.begin() ||
+            base + window.relative_end > row.allocation.end())
+            throw std::runtime_error("Payload window exceeds exact allocation child or alignment");
+        if (window.addressing == TT_NATIVE_NOC_WINDOW_RUNTIME_ENDPOINT) {
+            const auto expected = device->virtual_noc0_coordinate(
+                0, device->worker_core_from_logical_core(row.allocation.core()));
+            if (row.arguments[0] != expected.x || row.arguments[1] != expected.y)
+                throw std::runtime_error("Payload tuple endpoint differs from original allocation home");
+        }
+        PayloadCoverageKey key{program.get(), row.kernel.get(), row.coordinate[0], row.coordinate[1], row.issuer,
+                               static_cast<uint8_t>(row.role), row.window};
+        if (!seen.insert(key).second) throw std::runtime_error("Duplicate payload window binding");
+    }
+    if (seen != expected) throw std::runtime_error("Payload bindings do not cover every original image window");
+}
+}  // namespace
+
+ProgramExecution::PayloadBindings ProgramExecution::prepare_payload_bindings(
+    distributed::MeshDevice& mesh,
+    std::span<distributed::MeshWorkload* const> workloads,
+    std::vector<PayloadBindingRequest> requests) {
+    auto storage = std::make_unique<PayloadBindings::Storage>();
+    storage->mesh = &mesh;
+    validate_payload_rows(mesh, workloads, requests, storage->workloads, storage->programs);
+    storage->rows = std::move(requests);
+    return PayloadBindings(std::move(storage));
+}
+
 struct ProgramExecution::ManagedInvocation::ItemWitnessRound {
     const NiuItemWitnessObservation observation;
     const NiuHandoffReceiver::ItemAcknowledgement acknowledgement;
@@ -371,7 +491,7 @@ ProgramExecution::Endpoints ProgramExecution::freeze_managed_endpoints(MetalCont
 
 void ProgramExecution::validate_managed_traffic(
     const Member& member, const NiuAdmission::Boots& boots, const Endpoints& endpoints,
-    distributed::MeshDevice* mesh) {
+    distributed::MeshDevice* mesh, bool payload_bound) {
     auto program = member.program.lock();
     TT_FATAL(program && member.kernels.size() == program->num_kernels(),
              "Managed native Program lost its complete algorithm inventory");
@@ -395,19 +515,37 @@ void ProgramExecution::validate_managed_traffic(
                          "Managed native traffic declaration differs from actual firmware boot");
             const auto* actual = dynamic_cast<const Device*>(device);
             TT_FATAL(actual && device->allocator(), "Managed native traffic requires the actual SDK allocator");
-            image->validate_managed_traffic(device->allocator()->impl().get_config());
+            if (payload_bound) image->validate_managed_traffic_bound(device->allocator()->impl().get_config());
+            else image->validate_managed_traffic(device->allocator()->impl().get_config());
             const auto allowed = endpoints.find(chip);
             TT_FATAL(allowed != endpoints.end(), "Managed native traffic lost its original endpoint projection");
             image->validate_managed_endpoints(allowed->second);
         }
         if (mesh) {
             TT_FATAL(mesh->allocator_impl(), "Managed native traffic requires the actual mesh allocator");
-            image->validate_managed_traffic(mesh->allocator_impl()->get_config());
+            if (payload_bound) image->validate_managed_traffic_bound(mesh->allocator_impl()->get_config());
+            else image->validate_managed_traffic(mesh->allocator_impl()->get_config());
         }
         retained.push_back(std::move(kernel));
         native.push_back(image);
     }
-    NativeElfKernel::validate_managed_group(native);
+    if (payload_bound) NativeElfKernel::validate_managed_group_bound(native);
+    else NativeElfKernel::validate_managed_group(native);
+}
+
+void ProgramExecution::validate_payload_issue_locked() const {
+    if (!payload_bindings) return;
+    for (const auto& row : payload_bindings->rows) {
+        auto* native = dynamic_cast<NativeElfKernel*>(row.kernel.get());
+        const auto* image = native ? find_payload_image(*native, row.role) : nullptr;
+        TT_FATAL(image && row.window < image->noc_windows().size(), "Managed issue lost its original payload image window");
+        const auto offset = image->noc_windows()[row.window].abi_word_offset;
+        auto& args = row.kernel->runtime_args(row.issuer);
+        TT_FATAL(offset + 3 <= args.size(), "Managed issue runtime args lost the original payload tuple");
+        TT_FATAL(
+            std::equal(row.arguments.begin(), row.arguments.end(), args.begin() + offset),
+            "Managed issue runtime args differ from the host payload binding tuple");
+    }
 }
 
 std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_managed(
@@ -434,7 +572,30 @@ std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_m
 
 std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_managed(
     distributed::MeshDevice& mesh, std::span<distributed::MeshWorkload* const> workloads) {
+    return acquire_managed(mesh, workloads, static_cast<PayloadBindings*>(nullptr));
+}
+
+std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_managed(
+    distributed::MeshDevice& mesh,
+    std::span<distributed::MeshWorkload* const> workloads,
+    PayloadBindings&& bindings) {
+    return acquire_managed(mesh, workloads, &bindings);
+}
+
+std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_managed(
+    distributed::MeshDevice& mesh,
+    std::span<distributed::MeshWorkload* const> workloads,
+    PayloadBindings* payload_bindings) {
     TT_FATAL(!workloads.empty(), "Managed invocation requires a nonempty workload collection");
+    std::unique_ptr<PayloadBindings::Storage> payload;
+    if (payload_bindings) {
+        payload = std::move(payload_bindings->storage_);
+        TT_FATAL(payload && payload->mesh == &mesh,
+                 "Payload binding batch was already consumed or belongs to another MeshDevice");
+        std::vector<distributed::MeshWorkloadImpl*> current_workloads;
+        std::vector<std::shared_ptr<ProgramImpl>> current_programs;
+        validate_payload_rows(mesh, workloads, payload->rows, current_workloads, current_programs);
+    }
     auto api_lock = mesh.impl().lock_api();
     auto& context = MetalContext::instance(mesh.impl().get_context_id());
     const auto origin = context.rtoptions().get_fast_dispatch() ? Origin::Queue : Origin::Direct;
@@ -499,7 +660,7 @@ std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_m
     }
     return acquire_managed(
         context, origin, std::move(cores), std::move(members), std::move(groups), &mesh,
-        std::move(retained_workloads));
+        std::move(retained_workloads), std::move(payload));
 }
 
 std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_managed(
@@ -509,7 +670,8 @@ std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_m
     std::vector<Member> members,
     std::vector<Group> groups,
     distributed::MeshDevice* mesh,
-    std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>> workloads) {
+    std::vector<std::shared_ptr<distributed::MeshWorkloadImpl>> workloads,
+    std::unique_ptr<PayloadBindings::Storage> payload) {
     TT_FATAL(!members.empty() && !cores.empty(), "Managed NIU invocation requires a nonempty Worker footprint");
     // Validate every member and retained workload before consulting firmware or
     // reserving any physical selector. A malformed later group cannot publish
@@ -574,7 +736,7 @@ std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_m
     // Static algorithm eligibility and actual configured load-region bounds
     // precede reservation/publication. They do not prove NIU bootstrap or clean.
     auto endpoints = freeze_managed_endpoints(context, cores);
-    for (const auto& member : members) validate_managed_traffic(member, boots, endpoints, mesh);
+    for (const auto& member : members) validate_managed_traffic(member, boots, endpoints, mesh, payload != nullptr);
     std::string error;
     auto allocation = context.niu_admission().acquire_managed(boots, requests, error);
     TT_FATAL(allocation, "Managed NIU invocation admission failed: {}", error);
@@ -589,6 +751,7 @@ std::unique_ptr<ProgramExecution::ManagedInvocation> ProgramExecution::acquire_m
         execution->members = std::move(members);
         execution->groups = std::move(groups);
         execution->retained_workloads = std::move(workloads);
+        execution->payload_bindings = std::move(payload);
         for (const auto& member : execution->members) {
             execution->retained_programs.push_back(member.program.lock());
         }
@@ -746,7 +909,7 @@ void ProgramExecution::validate_member_locked(
             TT_FATAL(
                 found != kernels.end() && found->second == kernel.lock(), "Managed Program kernel identity changed");
         }
-        validate_managed_traffic(member, boots, managed_endpoints, mesh_owner.lock().get());
+        validate_managed_traffic(member, boots, managed_endpoints, mesh_owner.lock().get(), payload_bindings != nullptr);
         TT_FATAL(leaves.at(key).state == State::Reserved, "Managed Program/device member was already submitted");
         validate_leaf_overlap_locked(key);
     }
@@ -1821,9 +1984,10 @@ ProgramExecution::Submission::Submission(
     if (execution.managed) {
         TT_FATAL(group, "Managed invocation requires its actual workload group");
         execution.validate_group_locked(*group);
+        execution.validate_payload_issue_locked();
         for (auto member : execution.groups.at(group->index).members)
             validate_managed_traffic(execution.members.at(member), execution.boots, execution.managed_endpoints,
-                                     execution.mesh_owner.lock().get());
+                                     execution.mesh_owner.lock().get(), execution.payload_bindings != nullptr);
         TT_FATAL(execution.preparation.owned(), "Managed issue requires its actual host preparation owner");
         if (execution.origin == Origin::Direct) {
             TT_FATAL(

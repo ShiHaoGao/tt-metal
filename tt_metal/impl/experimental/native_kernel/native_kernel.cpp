@@ -123,6 +123,14 @@ void NativeElfKernel::validate_stream_owner(tt::worker_stream_state::Owner owner
 }
 
 void NativeElfKernel::validate_managed_traffic() const {
+    validate_managed_traffic_static();
+    for (const auto& image : native_images().images) {
+        TT_FATAL(image.noc_windows().empty(),
+                 "Managed native relative L1 windows require original live allocation bindings");
+    }
+}
+
+void NativeElfKernel::validate_managed_traffic_static() const {
     if (const auto* dm = std::get_if<experimental::NativeDataMovementConfig>(&config_)) {
         TT_FATAL(
             dm->noc_mode == NOC_MODE::DM_DYNAMIC_NOC,
@@ -135,14 +143,25 @@ void NativeElfKernel::validate_managed_traffic() const {
         TT_FATAL(
             firmware && firmware->traffic_contract == algorithm->traffic_contract,
             "Managed native algorithm requires matching firmware NIU handoff support");
-        TT_FATAL(
-            image.noc_windows().empty(),
-            "Managed native relative L1 windows require original live allocation bindings");
     }
 }
 
 void NativeElfKernel::validate_managed_traffic(const AllocatorConfig& layout) const {
     validate_managed_traffic();
+    TT_FATAL(
+        layout.l1_unreserved_base && layout.l1_unreserved_base < layout.worker_l1_size,
+        "Managed native traffic requires the actual configured L1 data region");
+    for (const auto& image : native_images().images) {
+        const auto algorithm = *image.noc_contract();
+        TT_FATAL(
+            (algorithm.l1_begin == 0 && algorithm.l1_end == 0) ||
+                (algorithm.l1_begin >= layout.l1_unreserved_base && algorithm.l1_end <= layout.worker_l1_size),
+            "Managed native memory accesses overlap the actual SDK load region or leave L1");
+    }
+}
+
+void NativeElfKernel::validate_managed_traffic_bound(const AllocatorConfig& layout) const {
+    validate_managed_traffic_static();
     TT_FATAL(
         layout.l1_unreserved_base && layout.l1_unreserved_base < layout.worker_l1_size,
         "Managed native traffic requires the actual configured L1 data region");
@@ -180,6 +199,23 @@ void NativeElfKernel::validate_managed_group(std::span<const NativeElfKernel* co
         if (std::holds_alternative<experimental::NativeDataMovementConfig>(kernel->config_)) {
             dynamic.insert(cores.begin(), cores.end());
         }
+    }
+    TT_FATAL(
+        std::includes(dynamic.begin(), dynamic.end(), active.begin(), active.end()),
+        "Managed native group requires a dynamic DM configuration on every active Worker");
+}
+
+void NativeElfKernel::validate_managed_group_bound(std::span<const NativeElfKernel* const> kernels) {
+    TT_FATAL(!kernels.empty(), "Managed native group requires actual algorithms");
+    std::set<CoreCoord> active;
+    std::set<CoreCoord> dynamic;
+    for (const auto* kernel : kernels) {
+        TT_FATAL(kernel, "Managed native group contains no actual algorithm");
+        kernel->validate_managed_traffic_static();
+        const auto& cores = kernel->logical_cores();
+        active.insert(cores.begin(), cores.end());
+        if (std::holds_alternative<experimental::NativeDataMovementConfig>(kernel->config_))
+            dynamic.insert(cores.begin(), cores.end());
     }
     TT_FATAL(
         std::includes(dynamic.begin(), dynamic.end(), active.begin(), active.end()),

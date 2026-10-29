@@ -4,7 +4,8 @@ include(sources.cmake)
 # CPU allocation/lifetime coverage uses the production Metalium algorithm.
 # It does not construct a firmware boot or activate device admission.
 add_executable(unit_tests_niu_admission
-    test_niu_admission.cpp test_niu_infrastructure.cpp)
+    test_niu_admission.cpp test_niu_infrastructure.cpp
+    test_native_payload_bindings.cpp)
 target_compile_features(unit_tests_niu_admission PRIVATE cxx_std_20)
 target_include_directories(unit_tests_niu_admission BEFORE PRIVATE
     "$<TARGET_PROPERTY:Metalium::Metal,INCLUDE_DIRECTORIES>"
