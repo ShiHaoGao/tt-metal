@@ -76,6 +76,12 @@ struct HalProcessorImageRegions {
     HalKernelTextLimit kernel_text_limit;
     uint32_t firmware_kernel_pad;
 };
+// Derived from the selected processor ABI, validated firmware boundaries and
+// explicit build options. This value is not a second archived configuration.
+struct HalProcessorKernelRegions {
+    HalImageRegion text;
+    HalImageRegion data;
+};
 
 // Note: nsidwell will be removing need for fw_base_addr and local_init_addr
 // fw_launch_addr is programmed with fw_launch_addr_value on the master risc
@@ -645,6 +651,9 @@ public:
         uint32_t programmable_core_type_index, uint32_t processor_class_idx) const;
 
     std::optional<HalProcessorImageRegions> get_processor_image_regions(HalProcessorIdentifier) const;
+    std::optional<HalProcessorKernelRegions> get_processor_kernel_regions(
+        HalProcessorIdentifier, uint64_t firmware_text_end,
+        uint64_t firmware_data_end, bool erisc_iram) const;
 
     uint64_t relocate_dev_addr(uint64_t addr, uint64_t local_init_addr = 0, bool has_shared_local_mem = false) const {
         return relocate_func_(addr, local_init_addr, has_shared_local_mem);

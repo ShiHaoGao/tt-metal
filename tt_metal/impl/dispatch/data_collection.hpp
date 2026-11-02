@@ -14,6 +14,7 @@
 #include <tt-metalium/sub_device_types.hpp>
 #include "program/program_impl.hpp"
 #include "impl/context/context_types.hpp"
+#include "impl/dispatch/realtime_profiler_callback_registry.hpp"
 
 namespace tt {
 namespace tt_metal {
@@ -27,12 +28,6 @@ enum data_collector_t {
     DISPATCH_DATA_RTARGS,
     DISPATCH_DATA_BINARY,
 };
-
-// Aliases to the public experimental types for internal use.
-using ProgramRealtimeRecord = tt::tt_metal::experimental::ProgramRealtimeRecord;
-using ProgramRealtimeRecordBatch = tt::tt_metal::experimental::ProgramRealtimeRecordBatch;
-using ProgramRealtimeProfilerCallback = tt::tt_metal::experimental::ProgramRealtimeProfilerCallback;
-using ProgramRealtimeProfilerCallbackHandle = tt::tt_metal::experimental::ProgramRealtimeProfilerCallbackHandle;
 
 /* Record a single dispatch write, to be dumped with stats on program exit. Should only be called once per transaction
  * per program (if a program is enqueued multiple times, don't call this multiple times).
@@ -100,14 +95,6 @@ ProgramRealtimeProfilerCallbackHandle RegisterProgramRealtimeProfilerCallback(Pr
 
 // Unregister a previously registered callback by its handle.
 void UnregisterProgramRealtimeProfilerCallback(ProgramRealtimeProfilerCallbackHandle handle);
-
-class RealtimeProfilerCallbackListener {
-public:
-    virtual ~RealtimeProfilerCallbackListener() = default;
-    virtual void on_callback_registered(
-        ProgramRealtimeProfilerCallbackHandle handle, const ProgramRealtimeProfilerCallback& callback) = 0;
-    virtual void on_callback_unregistered(ProgramRealtimeProfilerCallbackHandle handle) = 0;
-};
 
 // Returns true if the real-time profiler is currently active on at least one chip,
 // i.e. at least one MeshDevice finished the init+sync handshake and has a receiver

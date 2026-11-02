@@ -1308,7 +1308,8 @@ void RiscFirmwareInitializer::initialize_firmware(
                             processor_class,
                             riscv_id);
                         if (native) native_loaded_roles_[device_id] |= 1u << static_cast<uint8_t>(role);
-                        if (cluster_.arch() == ARCH::BLACKHOLE && riscv_id == 0 && processor_class < 2) {
+                        if ((cluster_.arch() == ARCH::BLACKHOLE || cluster_.arch() == ARCH::WORMHOLE_B0) &&
+                            riscv_id == 0 && processor_class < 2) {
                             auto& images = worker_images_[device_id];
                             auto*& slot = images.loaded[processor_class];
                             images.mismatch |= slot != nullptr && slot != &binary_mem;

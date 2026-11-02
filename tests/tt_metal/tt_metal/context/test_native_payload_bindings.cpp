@@ -70,7 +70,8 @@ struct PayloadElf {
         put(0x84, uint32_t{0x12345678});
         put(0x90, tt_native_image_record{
                       TT_NATIVE_IMAGE_MAGIC, TT_NATIVE_IMAGE_ABI_VERSION, kind, role, TT_NATIVE_ARCH_BLACKHOLE,
-                      TT_NATIVE_LOADING_DISCRETE, TT_NATIVE_PROFILE_ABSENT, TT_NATIVE_PRINT_ABSENT, 1,
+                      kind == TT_NATIVE_IMAGE_KERNEL ? TT_NATIVE_LOADING_CONTIGUOUS_XIP : TT_NATIVE_LOADING_DISCRETE,
+                      TT_NATIVE_PROFILE_ABSENT, TT_NATIVE_PRINT_ABSENT, 1,
                       TT_NATIVE_WORKER_STREAM_SDK, 0});
         constexpr char names[] = "\0.text\0.data\0.tt_native_image\0.shstrtab\0.symtab\0.strtab\0.rela.text\0";
         std::memcpy(bytes.data() + 0x100, names, sizeof(names));
@@ -362,6 +363,77 @@ TEST_F(NativePayloadBindingsTest, OriginalImageAndAllocationDoNotManufactureFirm
     auto pin = mesh->impl().get_device(coordinate)->allocator_impl()->pin_l1(
         allocation, coordinate, {0, 0}, BufferRegion{0, 64});
     EXPECT_TRUE(pin.live());
+    for (auto* device : mesh->get_devices()) EXPECT_FALSE(context->native_firmware(device->id()));
+}
+
+
+// Host-owner destruction only: no test publishes LoadedFirmware, issue,
+// selector clean, or native Retired. This covers the same real payload owner
+// reset used by the lock-outside-destruction retirement path.
+TEST_F(NativePayloadBindingsTest, PayloadOwnerMovesReleaseOnlyTheReplacedActualAllocationPins) {
+    using Execution = detail::ProgramExecution;
+    const std::array workloads{work.get()};
+    auto firstAllocation = allocation;
+    auto first = Execution::prepare_payload_bindings(*mesh, workloads, requests<Execution>());
+    auto moved = std::move(first);
+    EXPECT_THROW(firstAllocation->deallocate(), std::runtime_error);
+    {
+        // The moved-from owner has no residual pin. Its destruction cannot
+        // release pins retained by the actual moved-to owner.
+        auto empty = std::move(first);
+    }
+    EXPECT_THROW(firstAllocation->deallocate(), std::runtime_error);
+
+    BufferShardingArgs sharding(
+        ShardSpecBuffer(CoreRangeSet(CoreRange({0, 0}, {1, 0})), {1, 1},
+                        ShardOrientation::ROW_MAJOR, {1, 1}, {2, 1}),
+        TensorMemoryLayout::HEIGHT_SHARDED);
+    experimental::per_core_allocation::set_per_core_allocation(sharding, true);
+    distributed::DeviceLocalBufferConfig local;
+    local.page_size = 1024;
+    local.buffer_type = BufferType::L1;
+    local.sharding_args = sharding;
+    allocation = distributed::MeshBuffer::create(
+        distributed::ReplicatedBufferConfig{2048}, local, mesh.get());
+    auto second = Execution::prepare_payload_bindings(*mesh, workloads, requests<Execution>());
+    EXPECT_THROW(allocation->deallocate(), std::runtime_error);
+    moved = std::move(second);
+    EXPECT_NO_THROW(firstAllocation->deallocate());
+    EXPECT_FALSE(firstAllocation->is_allocated());
+    EXPECT_THROW(allocation->deallocate(), std::runtime_error);
+    {
+        auto finalOwner = std::move(moved);
+    }
+    EXPECT_NO_THROW(allocation->deallocate());
+    EXPECT_FALSE(allocation->is_allocated());
+    for (auto* device : mesh->get_devices()) EXPECT_FALSE(context->native_firmware(device->id()));
+}
+
+TEST_F(NativePayloadBindingsTest, PayloadOwnerAloneRetainsOriginalProgramKernelAndAllocationUntilDestruction) {
+    using Execution = detail::ProgramExecution;
+    std::weak_ptr<detail::ProgramImpl> originalProgram = program().impl().shared_from_this();
+    std::weak_ptr<Kernel> originalKernel = kernel;
+    std::weak_ptr<distributed::MeshBuffer> originalAllocation = allocation;
+    const std::array workloads{work.get()};
+    {
+        auto bindings = Execution::prepare_payload_bindings(*mesh, workloads, requests<Execution>());
+        work.reset();
+        kernel.reset();
+        allocation.reset();
+        EXPECT_FALSE(originalProgram.expired());
+        EXPECT_FALSE(originalKernel.expired());
+        EXPECT_FALSE(originalAllocation.expired());
+        auto retained = originalAllocation.lock();
+        ASSERT_TRUE(retained);
+        EXPECT_THROW(retained->deallocate(), std::runtime_error);
+        auto moved = std::move(bindings);
+        EXPECT_FALSE(originalProgram.expired());
+        EXPECT_FALSE(originalKernel.expired());
+        EXPECT_FALSE(originalAllocation.expired());
+    }
+    EXPECT_TRUE(originalProgram.expired());
+    EXPECT_TRUE(originalKernel.expired());
+    EXPECT_TRUE(originalAllocation.expired());
     for (auto* device : mesh->get_devices()) EXPECT_FALSE(context->native_firmware(device->id()));
 }
 

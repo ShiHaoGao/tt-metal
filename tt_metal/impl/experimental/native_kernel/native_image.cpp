@@ -24,6 +24,15 @@ size_t index(TensixKernelRole role) {
     return result;
 }
 
+ll_api::memory::Loading decode_loading(uint8_t loading) {
+    switch (loading) {
+        case TT_NATIVE_LOADING_DISCRETE: return ll_api::memory::Loading::DISCRETE;
+        case TT_NATIVE_LOADING_CONTIGUOUS_XIP: return ll_api::memory::Loading::CONTIGUOUS_XIP;
+        case TT_NATIVE_LOADING_CONTIGUOUS: return ll_api::memory::Loading::CONTIGUOUS;
+        default: throw std::invalid_argument("unsupported native ELF loading mode");
+    }
+}
+
 tt_native_image_record read_contract(ll_api::ElfFile& elf, uint8_t kind) {
     const auto bytes = elf.GetMetadataSection(TT_NATIVE_IMAGE_SECTION);
     if (bytes.size() != sizeof(tt_native_image_record)) {
@@ -34,12 +43,13 @@ tt_native_image_record read_contract(ll_api::ElfFile& elf, uint8_t kind) {
     if (result.magic != TT_NATIVE_IMAGE_MAGIC || result.version != TT_NATIVE_IMAGE_ABI_VERSION || result.kind != kind ||
         result.role >= TT_NATIVE_ROLE_COUNT ||
         (result.architecture != TT_NATIVE_ARCH_BLACKHOLE && result.architecture != TT_NATIVE_ARCH_WORMHOLE) ||
-        result.loading > TT_NATIVE_LOADING_CONTIGUOUS_XIP || result.profile > TT_NATIVE_PROFILE_CLASSIC_DRAM_PROGRAM ||
+        result.profile > TT_NATIVE_PROFILE_CLASSIC_DRAM_PROGRAM ||
         result.print > TT_NATIVE_PRINT_TENSIX_SHARED_BUFFER ||
         result.worker_stream_abi != tt::worker_stream_state::kVersion ||
         result.worker_stream_owner > TT_NATIVE_WORKER_STREAM_PROGRAM || result.reserved) {
         throw std::invalid_argument("unsupported native ELF support contract");
     }
+    static_cast<void>(decode_loading(result.loading));
     if (kind == TT_NATIVE_IMAGE_FIRMWARE &&
         (result.loading != TT_NATIVE_LOADING_DISCRETE || result.worker_stream_owner != TT_NATIVE_WORKER_STREAM_SDK)) {
         throw std::invalid_argument("firmware requires discrete loading and SDK default worker ownership");
@@ -364,9 +374,7 @@ KernelElfImage KernelElfImage::from_bytes(
             }
         }
     }
-    auto loading = image.contract.loading == TT_NATIVE_LOADING_DISCRETE ? ll_api::memory::Loading::DISCRETE
-                                                                        : ll_api::memory::Loading::CONTIGUOUS_XIP;
-    image.memory = ll_api::memory(image.bytes, loading, label);
+    image.memory = ll_api::memory(image.bytes, decode_loading(image.contract.loading), label);
     return KernelElfImage(std::move(owner));
 }
 
@@ -399,6 +407,29 @@ const ll_api::memory& native_detail::NativeImageAccess::memory(const KernelElfIm
 }
 const ll_api::memory& native_detail::NativeImageAccess::memory(const FirmwareBundle& image, TensixKernelRole role) {
     return image.impl_->images[index(role)].memory;
+}
+void native_detail::NativeImageAccess::validate_target(const KernelElfImage& image, const Hal& hal) {
+    uint8_t architecture;
+    switch (hal.get_arch()) {
+        case tt::ARCH::BLACKHOLE: architecture = TT_NATIVE_ARCH_BLACKHOLE; break;
+        case tt::ARCH::WORMHOLE_B0: architecture = TT_NATIVE_ARCH_WORMHOLE; break;
+        default: throw std::invalid_argument("Native ELF requires a supported processor HAL architecture");
+    }
+    if (image.contract().architecture != architecture) {
+        throw std::invalid_argument("Native ELF architecture differs from processor HAL");
+    }
+    const auto role = index(image.role());
+    const bool data_movement = role < TT_NATIVE_ROLE_TRISC0;
+    const auto processor_class = data_movement ? HalProcessorClassType::DM : HalProcessorClassType::COMPUTE;
+    const auto processor = data_movement ? role : role - TT_NATIVE_ROLE_TRISC0;
+    const auto expected = hal.get_jit_build_config(
+                                 hal.get_programmable_core_type_index(HalProgrammableCoreType::TENSIX),
+                                 static_cast<uint32_t>(processor_class),
+                                 static_cast<uint32_t>(processor))
+                              .memory_load;
+    if (memory(image).get_loading() != expected) {
+        throw std::invalid_argument("Native ELF loading mode differs from processor HAL");
+    }
 }
 void native_detail::NativeImageAccess::validate_niu_handoff(const FirmwareBundle& firmware, const Hal& hal) {
     const auto capability = firmware.niu_handoff();

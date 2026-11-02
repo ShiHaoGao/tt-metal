@@ -1524,18 +1524,20 @@ Program CreateProgram() { return Program(); }
 
 KernelHandle experimental::CreateKernelFromElf(
     Program& program, const CoreRangeSet& cores, const NativeDataMovementConfig& config) {
-    TT_FATAL(config.image.role() == TensixKernelRole::Brisc || config.image.role() == TensixKernelRole::Ncrisc,
-             "Native DM requires BRISC or NCRISC");
+    TT_FATAL(
+        config.image.role() == TensixKernelRole::Brisc || config.image.role() == TensixKernelRole::Ncrisc,
+        "Native DM requires BRISC or NCRISC");
     TT_FATAL(config.noc == NOC::NOC_0 || config.noc == NOC::NOC_1, "Invalid native NoC placement");
-    TT_FATAL(config.noc_mode == NOC_MODE::DM_DEDICATED_NOC || config.noc_mode == NOC_MODE::DM_DYNAMIC_NOC,
-             "Invalid native NoC mode");
+    TT_FATAL(
+        config.noc_mode == NOC_MODE::DM_DEDICATED_NOC || config.noc_mode == NOC_MODE::DM_DYNAMIC_NOC,
+        "Invalid native NoC mode");
+    const auto id = program.impl().get_context_id();
+    auto context = KernelBuildContext::from_runtime(id);
+    experimental::native_detail::NativeImageAccess::validate_target(config.image, context.hal);
     const auto status = CheckDataMovementConfig(HalProgrammableCoreType::TENSIX, program, cores);
     const auto brisc = config.image.role() == TensixKernelRole::Brisc;
     TT_FATAL(!(brisc ? status.riscv0_in_use : status.riscv1_in_use), "Native DM processor already in use");
     TT_FATAL(!(config.noc == NOC::NOC_0 ? status.noc0_in_use : status.noc1_in_use), "Native DM NoC already in use");
-    const auto id = program.impl().get_context_id();
-    auto context = KernelBuildContext::from_runtime(id);
-    TT_FATAL(context.hal.get_arch() == tt::ARCH::BLACKHOLE, "Native ELF requires Blackhole");
     auto kernel = std::make_shared<NativeElfKernel>(context, id, cores, config);
     return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
 }
@@ -1545,7 +1547,9 @@ KernelHandle experimental::CreateKernelFromElf(
     experimental::native_detail::NativeImageAccess::validate_compute(config);
     const auto id = program.impl().get_context_id();
     auto context = KernelBuildContext::from_runtime(id);
-    TT_FATAL(context.hal.get_arch() == tt::ARCH::BLACKHOLE, "Native ELF requires Blackhole");
+    for (const auto* image : {&config.trisc0, &config.trisc1, &config.trisc2}) {
+        experimental::native_detail::NativeImageAccess::validate_target(*image, context.hal);
+    }
     auto kernel = std::make_shared<NativeElfKernel>(context, id, cores, config);
     return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
 }

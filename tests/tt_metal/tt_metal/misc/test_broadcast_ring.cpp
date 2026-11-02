@@ -90,6 +90,106 @@ TEST(BroadcastRing, ReadBatchIsOrderedAndBoundedByOutput) {
     EXPECT_TRUE(reader.read_batch(out8).empty());
 }
 
+TEST(BroadcastRing, PublishedPrefixExcludesLaterItems) {
+    BroadcastRing<uint32_t> ring(8);
+    auto reader = ring.make_reader();
+    uint32_t first[] = {1, 2, 3};
+    ring.writer().publish_batch(first);
+    const auto prefix = reader.published_prefix();
+    uint32_t later[] = {4, 5};
+    ring.writer().publish_batch(later);
+
+    std::array<uint32_t, 8> out{};
+    const auto batch = reader.read_batch(out, prefix);
+    EXPECT_EQ(std::vector<uint32_t>(batch.begin(), batch.end()), (std::vector<uint32_t>{1, 2, 3}));
+    EXPECT_TRUE(reader.reached(prefix));
+    EXPECT_TRUE(reader.read_batch(out, prefix).empty());
+    EXPECT_EQ(reader.dropped(), 0u);
+    const auto remaining = reader.read_batch(out);
+    EXPECT_EQ(std::vector<uint32_t>(remaining.begin(), remaining.end()), (std::vector<uint32_t>{4, 5}));
+}
+
+TEST(BroadcastRing, PublishedPrefixAccountsOnlyItsLostItems) {
+    BroadcastRing<uint32_t> ring(4);
+    auto reader = ring.make_reader();
+    uint32_t first[] = {1, 2, 3, 4};
+    ring.writer().publish_batch(first);
+    std::array<uint32_t, 2> out{};
+    const auto already_read = reader.read_batch(out);
+    ASSERT_EQ(already_read.size(), 2u);
+    EXPECT_EQ(already_read[0], 1u);
+    EXPECT_EQ(already_read[1], 2u);
+    const auto prefix = reader.published_prefix();
+    uint32_t later[] = {5, 6, 7, 8, 9, 10, 11, 12};
+    ring.writer().publish_batch(later);
+
+    EXPECT_TRUE(reader.read_batch(out, prefix).empty());
+    EXPECT_TRUE(reader.reached(prefix));
+    EXPECT_EQ(reader.dropped(), 2u);
+    EXPECT_TRUE(reader.read_batch(out, prefix).empty());
+    EXPECT_EQ(reader.dropped(), 2u);
+    const auto remaining = reader.read_batch(out);
+    EXPECT_EQ(std::vector<uint32_t>(remaining.begin(), remaining.end()), (std::vector<uint32_t>{9, 10}));
+    EXPECT_EQ(reader.dropped(), 6u);
+}
+
+TEST(BroadcastRing, PublishedPrefixFinishesWhileProducerRemainsLive) {
+    BroadcastRing<uint32_t> ring(16);
+    auto reader = ring.make_reader();
+    std::latch initial_published{1};
+    std::latch continue_writing{1};
+    std::atomic<bool> later_published{false};
+    std::atomic<bool> consumer_finished{false};
+    std::thread producer([&] {
+        for (uint32_t value = 0; value != 8; ++value) {
+            ring.writer().publish(value);
+        }
+        initial_published.count_down();
+        continue_writing.wait();
+        ring.writer().publish(8);
+        later_published.store(true, std::memory_order_release);
+        later_published.notify_one();
+        uint32_t value = 9;
+        while (!consumer_finished.load(std::memory_order_acquire)) {
+            ring.writer().publish(value++);
+        }
+    });
+    initial_published.wait();
+    const auto prefix = reader.published_prefix();
+    continue_writing.count_down();
+    later_published.wait(false, std::memory_order_acquire);
+    std::vector<uint32_t> received;
+    std::array<uint32_t, 1> out{};
+    for (unsigned reads = 0; reads != 16 && !reader.reached(prefix); ++reads) {
+        const auto batch = reader.read_batch(out, prefix);
+        received.insert(received.end(), batch.begin(), batch.end());
+    }
+    const bool reached = reader.reached(prefix);
+    consumer_finished.store(true, std::memory_order_release);
+    producer.join();
+
+    EXPECT_TRUE(reached);
+    EXPECT_EQ(received.size() + reader.dropped(), 8u);
+    for (uint32_t value : received) {
+        EXPECT_LT(value, 8u);
+    }
+}
+
+TEST(BroadcastRing, PublishedPrefixRejectsAnotherRingWithoutAdvancing) {
+    BroadcastRing<uint32_t> ring(4);
+    BroadcastRing<uint32_t> other_ring(4);
+    auto reader = ring.make_reader();
+    auto other_reader = other_ring.make_reader();
+    ring.writer().publish(1);
+    const auto foreign_prefix = other_reader.published_prefix();
+    std::array<uint32_t, 1> out{};
+    EXPECT_THROW((void)reader.read_batch(out, foreign_prefix), std::exception);
+    EXPECT_THROW((void)reader.reached(foreign_prefix), std::exception);
+    EXPECT_EQ(reader.dropped(), 0u);
+    EXPECT_TRUE(reader.read(out[0]));
+    EXPECT_EQ(out[0], 1u);
+}
+
 TEST(BroadcastRing, RecordsBroadcastToAllReadersWithSpanFieldsIntact) {
     static_assert(std::is_trivially_copyable_v<ProgramRealtimeRecord>);
     EXPECT_TRUE(BroadcastRing<ProgramRealtimeRecord>::is_always_lock_free);

@@ -3263,7 +3263,8 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
         context_id_.get(),
         device_context_id.get());
 
-    const auto& cluster = MetalContext::instance(device_context_id).get_cluster();
+    auto& device_context = MetalContext::instance(device_context_id);
+    const auto& cluster = device_context.get_cluster();
 
     bool has_source_kernels = false;
     FirmwareDeployments loaded_firmware;
@@ -3278,6 +3279,10 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
                 for (const auto& [chip, firmware] : loaded_firmware)
                     validate_kernel_placement(force_slow_dispatch, kernel, chip);
             } else {
+                TT_FATAL(!device_context.get_env().get_descriptor().published_deployment(),
+                         "Program {} cannot compile source kernel {} under a published deployment; "
+                         "only precompiled kernels are allowed",
+                         this->id, kernel->name());
                 has_source_kernels = true;
             }
         }
@@ -3552,8 +3557,9 @@ void detail::ProgramImpl::validate_worker_stream_state() const {
     TT_FATAL(worker_stream_state_owner_ == Owner::SdkCircularBuffers || worker_stream_state_owner_ == Owner::Program,
              "Unknown worker stream state owner");
     if (worker_stream_state_owner_ == Owner::Program) {
-        TT_FATAL(MetalContext::instance(context_id_).hal().get_arch() == tt::ARCH::BLACKHOLE,
-                 "Program-owned worker stream state currently requires Blackhole firmware");
+        const auto architecture = MetalContext::instance(context_id_).hal().get_arch();
+        TT_FATAL(architecture == tt::ARCH::BLACKHOLE || architecture == tt::ARCH::WORMHOLE_B0,
+                 "Program-owned worker stream state requires Blackhole or Wormhole firmware");
         TT_FATAL(circular_buffers_.empty() && dataflow_buffers_.empty() && cross_node_dfbs_.empty() &&
                      prefetcher_pipe_slots_.empty(),
                  "Program-owned worker stream state cannot contain SDK CB or DFB resources");
@@ -3568,8 +3574,9 @@ void detail::ProgramImpl::set_worker_stream_state_owner(tt::worker_stream_state:
              "Cannot change worker stream state owner after program projection or compilation");
     // Validate before committing the new fact. Failure preserves the old owner.
     if (owner == Owner::Program) {
-        TT_FATAL(MetalContext::instance(context_id_).hal().get_arch() == tt::ARCH::BLACKHOLE,
-                 "Program-owned worker stream state currently requires Blackhole firmware");
+        const auto architecture = MetalContext::instance(context_id_).hal().get_arch();
+        TT_FATAL(architecture == tt::ARCH::BLACKHOLE || architecture == tt::ARCH::WORMHOLE_B0,
+                 "Program-owned worker stream state requires Blackhole or Wormhole firmware");
         TT_FATAL(circular_buffers_.empty() && dataflow_buffers_.empty() && cross_node_dfbs_.empty() &&
                      prefetcher_pipe_slots_.empty(),
                  "Program-owned worker stream state cannot contain SDK CB or DFB resources");

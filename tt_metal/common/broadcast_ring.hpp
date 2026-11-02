@@ -154,6 +154,34 @@ public:
 
     class alignas(kFalseSharingSize) Reader {
     public:
+        class PublishedPrefix {
+        public:
+            PublishedPrefix(const PublishedPrefix&) = default;
+            PublishedPrefix& operator=(const PublishedPrefix&) = default;
+
+        private:
+            friend class Reader;
+            PublishedPrefix(const SharedState* owner, uint64_t end) noexcept : owner_(owner), end_(end) {}
+            const SharedState* owner_;
+            uint64_t end_;
+        };
+
+        /**
+         * @brief Captures the fully published host prefix without stopping the writer.
+         *
+         * Safe to call concurrently with this reader. This observes only the host ring;
+         * it does not establish device completion or delivery of unpublished records.
+         */
+        [[nodiscard]] PublishedPrefix published_prefix() const noexcept {
+            return PublishedPrefix(shared_state_, shared_state_->head.load(std::memory_order_acquire));
+        }
+
+        /** @brief True after all items through @p prefix have been read or counted as dropped. */
+        [[nodiscard]] bool reached(const PublishedPrefix& prefix) const {
+            TT_FATAL(prefix.owner_ == shared_state_, "BroadcastRing prefix belongs to another ring");
+            return cursor_ >= prefix.end_;
+        }
+
         /**
          * @brief Reads the next available items, oldest first; non-blocking.
          *
@@ -169,11 +197,29 @@ public:
          *         returned.
          */
         [[nodiscard]] std::span<T> read_batch(std::span<T> out) noexcept(kLoadNoexcept) {
+            return read_batch_before(out, std::nullopt);
+        }
+
+        /**
+         * @brief Reads only the captured published prefix; later publications are excluded.
+         *
+         * Loss is counted only through the prefix. An empty returned span can still
+         * advance dropped(); use reached() to determine whether the prefix is complete.
+         */
+        [[nodiscard]] std::span<T> read_batch(std::span<T> out, const PublishedPrefix& prefix) {
+            TT_FATAL(prefix.owner_ == shared_state_, "BroadcastRing prefix belongs to another ring");
+            return read_batch_before(out, prefix.end_);
+        }
+
+    private:
+        [[nodiscard]] std::span<T> read_batch_before(std::span<T> out, std::optional<uint64_t> end) noexcept(
+            kLoadNoexcept) {
             if (out.empty()) {
                 return out;
             }
             const SharedState* const shared_state = shared_state_;
-            const uint64_t head = shared_state->head.load(std::memory_order_acquire);
+            const uint64_t published = shared_state->head.load(std::memory_order_acquire);
+            const uint64_t head = end ? std::min(published, *end) : published;
             if (cursor_ >= head) {
                 return out.first(0);
             }
@@ -183,7 +229,7 @@ public:
 
             const uint64_t max_lag = view.capacity - std::min<uint64_t>(writer_advance_estimate_, view.capacity >> 1);
             if (uint64_t lag = claim_before - cursor_; lag > max_lag) {
-                const uint64_t drop = lag - max_lag;
+                const uint64_t drop = end ? std::min(lag - max_lag, *end - cursor_) : lag - max_lag;
                 dropped_ += drop;
                 cursor_ += drop;
             }
@@ -201,10 +247,10 @@ public:
             observe_advance(claim - claim_before);
             if (claim - start > view.capacity) {
                 const uint64_t oldest = claim - view.capacity;
-                const uint64_t lost = oldest - start;
+                const uint64_t lost = end ? std::min(oldest - start, *end - start) : oldest - start;
                 dropped_ += lost;
                 if (lost >= n) {
-                    cursor_ = oldest;
+                    cursor_ = start + lost;
                     return out.first(0);
                 }
                 cursor_ = start + n;
@@ -215,6 +261,7 @@ public:
             return out.first(n);
         }
 
+    public:
         /** @brief Reads one item into @p out; returns false when none is available (caught up or dropped). */
         [[nodiscard]] bool read(T& out) noexcept(kLoadNoexcept) { return !read_batch({&out, 1}).empty(); }
 

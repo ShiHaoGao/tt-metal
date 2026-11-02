@@ -1,4 +1,5 @@
 set(WH_HAL_SOURCES
+    wormhole/wh_image_regions.cpp
     wormhole/wh_hal.cpp
     wormhole/wh_hal_tensix.cpp
     wormhole/wh_hal_active_eth.cpp

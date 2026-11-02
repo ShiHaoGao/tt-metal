@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -190,6 +191,27 @@ public:
         const NiuItemWitnessObservation& observation, const ItemWitnessRequest& expected);
     static bool closed_item(
         const NiuItemWitnessObservation& observation, const ItemWitnessRequest& expected);
+};
+
+// Pure request-numbering and observation algorithm, not execution authority.
+// The production instance belongs to one actual boot/Worker in NiuAdmission.
+// Only that owner may supply a live invocation and persist a clean transition
+// after its original stopped/End/ACK/selector retirement obligations succeed.
+// Direct instances cannot mint a boot, lease, Source-bank or visibility proof.
+class NiuHandoffJournal final {
+public:
+    using SelectorMasks = std::array<uint16_t, TT_NIU_HANDOFF_NOC_COUNT>;
+    std::optional<NiuHandoffExpectedExecution> prepare_request(
+        const NiuHandoffObservation&, uint64_t boot_cookie, uint64_t invocation_id, bool has_source);
+    bool matches_request(const NiuHandoffExpectedExecution&) const;
+    bool record_clean(const NiuHandoffObservation&, const NiuHandoffExpectedExecution&, const SelectorMasks&);
+    void quarantine() noexcept;
+
+private:
+    enum class State { Initial, Prepared, Clean, Quarantined };
+    State state_ = State::Initial;
+    std::optional<NiuHandoffExpectedExecution> expected_;
+    std::optional<NiuHandoffObservation> predecessor_;
 };
 
 }  // namespace tt::tt_metal::detail

@@ -27,7 +27,7 @@
 #include "tt-metalium/circular_buffer_constants.h"
 // clang-format on
 
-#if defined(ARCH_BLACKHOLE) && COMPILE_FOR_TRISC == 0
+#if (defined(ARCH_BLACKHOLE) || defined(ARCH_WORMHOLE)) && COMPILE_FOR_TRISC == 0
 __attribute__((used, section(".tt_worker_stream_state")))
 const tt::worker_stream_state::ImageRecord worker_stream_state_image{
     tt::worker_stream_state::kVersion,

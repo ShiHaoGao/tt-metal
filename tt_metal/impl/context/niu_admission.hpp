@@ -20,6 +20,8 @@
 #include <tt-metalium/core_coord.hpp>
 #include <umd/device/types/cluster_descriptor_types.hpp>
 
+#include "niu_handoff_receiver.hpp"
+
 namespace tt::tt_metal { class NiuAdmission; }
 namespace tt::tt_metal { class Buffer; }
 namespace tt::tt_metal::distributed { class MeshWorkloadImpl; }
@@ -275,9 +277,19 @@ private:
     using LedgerSet = std::unordered_map<ChipId, std::shared_ptr<detail::NiuLedger>>;
     enum class Kind { Managed, Ordinary };
     enum class State { Reserved, Issued, Stopped, Quarantined };
+    class CleanTerminal;
+    struct WorkerHandoff {
+        detail::NiuHandoffJournal journal;
+        // Persist only a genuinely retired predecessor. Retaining an active
+        // Token here would hide expiration from abandoned-lease detection.
+        std::shared_ptr<const CleanTerminal> clean;
+    };
+    using WorkerHandoffs = std::map<CoreCoord, WorkerHandoff>;
     struct BootState {
         std::shared_ptr<const experimental::native_detail::LoadedFirmware> firmware;
         std::shared_ptr<detail::NiuLedger> ledger;
+        // Binding and pending boot copies share the one original journal.
+        std::shared_ptr<WorkerHandoffs> handoffs;
     };
     struct Binding {
         BootState boot;
@@ -340,6 +352,7 @@ private:
     bool validate_clean_terminal_locked(
         const Guard& guard, const CleanTerminal& terminal, const Token& token, const Boots& boots,
         const std::map<ChipId, uint64_t>& epochs, std::string& error) const;
+    bool validate_worker_clean_locked(const Guard& guard, const WorkerHandoff& worker, std::string& error) const;
 
     std::map<ChipId, size_t> retirements_;
     mutable std::mutex mutex_;

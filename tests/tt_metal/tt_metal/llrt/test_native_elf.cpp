@@ -11,11 +11,16 @@
 #include <vector>
 #include "tt-metalium/experimental/native_kernel.hpp"
 #include "impl/context/metal_context.hpp"
+#include "impl/context/metal_env_accessor.hpp"
+#include "impl/device/device_impl.hpp"
+#include "impl/program/program_impl.hpp"
 #include "impl/allocator/allocator_types.hpp"
 #include "impl/experimental/native_kernel/native_image.hpp"
 #include "impl/experimental/native_kernel/native_kernel.hpp"
 #include "llrt/rtoptions.hpp"
 #include "llrt/hal.hpp"
+#include "tt-metalium/experimental/mock_device/mock_device.hpp"
+#include "tt-metalium/program.hpp"
 
 namespace tt::tt_metal::experimental {
 namespace {
@@ -1120,6 +1125,98 @@ TEST(NativeElf, RetainsOriginalImageAlongsideXipPackedBytes) {
         std::equal(image.image_bytes().begin(), image.image_bytes().end(), kernel.bytes.begin(), kernel.bytes.end()));
 }
 
+TEST(NativeElf, ContiguousLoadingPreservesLinkedAddressesAndPacksOneSpan) try {
+    ASSERT_FALSE(MetalContext::instance_exists());
+    FirmwareInput input;
+    auto firmware = FirmwareBundle::from_images(input.spans());
+    NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_NCRISC);
+    // Wire 2 is CONTIGUOUS, distinct from the existing XIP wire value 1.
+    kernel.put(NativeElf::note_offset + 9, uint8_t{2});
+    const auto image = KernelElfImage::from_bytes(kernel.bytes, firmware);
+    const auto& packed = native_detail::NativeImageAccess::memory(image);
+    EXPECT_EQ(packed.get_loading(), ll_api::memory::Loading::CONTIGUOUS);
+    EXPECT_EQ(packed.get_text_addr(), 0x1000u);
+    EXPECT_EQ(packed.get_text_size(), 4u);
+    EXPECT_EQ(packed.get_packed_size(), 8u);
+    EXPECT_EQ(packed.data(), (std::vector<uint32_t>{0x00008067u, 0x12345678u}));
+    ASSERT_EQ(packed.num_spans(), 1u);
+    packed.process_spans([&](auto begin, uint64_t address, uint32_t words) {
+        EXPECT_EQ(address, 0x1000u);
+        EXPECT_EQ(words, 2u);
+        EXPECT_EQ(std::vector<uint32_t>(begin, begin + words), (std::vector<uint32_t>{0x00008067u, 0x12345678u}));
+    });
+    EXPECT_TRUE(
+        std::equal(image.image_bytes().begin(), image.image_bytes().end(), kernel.bytes.begin(), kernel.bytes.end()));
+    Elf32_Phdr data{};
+    std::memcpy(&data, image.image_bytes().data() + sizeof(Elf32_Ehdr) + sizeof(Elf32_Phdr), sizeof(data));
+    EXPECT_EQ(data.p_vaddr, 0x2000u);
+    EXPECT_EQ(data.p_paddr, 0x1004u);
+    EXPECT_FALSE(MetalContext::instance_exists());
+} catch (const std::exception& error) {
+    FAIL() << error.what();
+}
+
+TEST(NativeElf, WormholeRoleImagesMatchHalLoadingWithoutGrantingDeployment) try {
+    ASSERT_FALSE(MetalContext::instance_exists());
+    FirmwareInput input;
+    for (auto& image : input.images) {
+        image.put(NativeElf::note_offset + 8, uint8_t{2});
+    }
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    const Hal hal(tt::ARCH::WORMHOLE_B0, false, false, 0, false);
+    const auto core = hal.get_programmable_core_type_index(HalProgrammableCoreType::TENSIX);
+    for (uint8_t role = 0; role != TT_NATIVE_ROLE_COUNT; ++role) {
+        SCOPED_TRACE(role);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, role);
+        kernel.put(NativeElf::note_offset + 8, uint8_t{2});
+        kernel.put(NativeElf::note_offset + 9, role == TT_NATIVE_ROLE_NCRISC ? uint8_t{2} : uint8_t{1});
+        const auto image = KernelElfImage::from_bytes(kernel.bytes, firmware);
+        const auto processor_class = role < 2 ? HalProcessorClassType::DM : HalProcessorClassType::COMPUTE;
+        const auto processor = role < 2 ? role : role - 2;
+        const auto expected =
+            hal.get_jit_build_config(core, static_cast<uint32_t>(processor_class), processor).memory_load;
+        EXPECT_EQ(native_detail::NativeImageAccess::memory(image).get_loading(), expected);
+        EXPECT_EQ(image.role(), static_cast<TensixKernelRole>(role));
+        EXPECT_FALSE(image.noc_contract());
+    }
+    EXPECT_FALSE(firmware.niu_handoff());
+    EXPECT_FALSE(MetalContext::instance_exists());
+} catch (const std::exception& error) {
+    FAIL() << error.what();
+}
+
+TEST(NativeElf, RejectsUnknownLoadingWireValues) {
+    FirmwareInput input;
+    const auto firmware = FirmwareBundle::from_images(input.spans());
+    for (const uint8_t loading : {uint8_t{3}, uint8_t{255}}) {
+        SCOPED_TRACE(loading);
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, TT_NATIVE_ROLE_NCRISC);
+        kernel.put(NativeElf::note_offset + 9, loading);
+        EXPECT_THROW(KernelElfImage::from_bytes(kernel.bytes, firmware), std::exception);
+        auto malformed = input;
+        malformed.images[TT_NATIVE_ROLE_NCRISC].put(NativeElf::note_offset + 9, loading);
+        EXPECT_THROW(FirmwareBundle::from_images(malformed.spans()), std::exception);
+    }
+}
+
+TEST(NativeElf, FirmwareRequiresDiscreteLoadingForEveryRoleAndArchitecture) {
+    for (const uint8_t architecture : {uint8_t{1}, uint8_t{2}}) {
+        for (const uint8_t loading : {uint8_t{1}, uint8_t{2}}) {
+            for (uint8_t role = 0; role != TT_NATIVE_ROLE_COUNT; ++role) {
+                SCOPED_TRACE(architecture);
+                SCOPED_TRACE(loading);
+                SCOPED_TRACE(role);
+                FirmwareInput input;
+                for (auto& image : input.images) {
+                    image.put(NativeElf::note_offset + 8, architecture);
+                }
+                input.images[role].put(NativeElf::note_offset + 9, loading);
+                EXPECT_THROW(FirmwareBundle::from_images(input.spans()), std::exception);
+            }
+        }
+    }
+}
+
 class NativeKernel : public ::testing::Test {
 protected:
     llrt::RunTimeOptions options{llrt::RunTimeOptions::ExplicitBuildOptions{.root_dir = "/tmp"}};
@@ -1137,6 +1234,220 @@ protected:
         return KernelElfImage::from_bytes(kernel.bytes, firmware, "native");
     }
 };
+
+class NativeElfFactory : public ::testing::Test {
+protected:
+    void TearDown() override {
+        disable_mock_mode();
+        EXPECT_FALSE(MetalContext::instance_exists());
+    }
+
+    template <class F>
+    void with_environment(tt::ARCH architecture, F&& body) {
+        configure_mock_mode(architecture, 1);
+        {
+            MetalEnv env(MetalEnvDescriptor(get_mock_cluster_desc().value()));
+            auto& owner = MetalEnvAccessor(env).impl();
+            owner.get_rtoptions().set_watcher_enabled(false);
+            const auto id = ContextId{owner.ensure_context_registered(env)};
+            Program program(std::make_shared<detail::ProgramImpl>(id));
+            body(program, id);
+            EXPECT_FALSE(MetalContext::instance(id).native_firmware(0));
+            EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+        }
+        disable_mock_mode();
+    }
+
+    KernelElfImage image(
+        uint8_t architecture, uint8_t role, uint8_t loading, uint8_t stream_owner = TT_NATIVE_WORKER_STREAM_SDK) {
+        FirmwareInput input;
+        for (auto& entry : input.images) {
+            entry.put(NativeElf::note_offset + 8, architecture);
+        }
+        auto firmware = FirmwareBundle::from_images(input.spans());
+        NativeElf kernel(TT_NATIVE_IMAGE_KERNEL, role);
+        kernel.put(NativeElf::note_offset + 8, architecture);
+        kernel.put(NativeElf::note_offset + 9, loading);
+        kernel.put(NativeElf::note_offset + 14, stream_owner);
+        return KernelElfImage::from_bytes(kernel.bytes, firmware);
+    }
+
+    NativeComputeConfig compute(uint8_t architecture, uint8_t loading = TT_NATIVE_LOADING_CONTIGUOUS_XIP) {
+        return {
+            image(architecture, TT_NATIVE_ROLE_TRISC0, loading),
+            image(architecture, TT_NATIVE_ROLE_TRISC1, loading),
+            image(architecture, TT_NATIVE_ROLE_TRISC2, loading)};
+    }
+
+    CoreRangeSet cores{CoreRange({0, 0}, {0, 0})};
+};
+
+TEST_F(NativeElfFactory, CreatesWormholeRoleGroupsWithoutPublishingBoot) {
+    with_environment(tt::ARCH::WORMHOLE_B0, [&](Program& program, ContextId) {
+        const auto brisc = image(TT_NATIVE_ARCH_WORMHOLE, TT_NATIVE_ROLE_BRISC, TT_NATIVE_LOADING_CONTIGUOUS_XIP);
+        const auto ncrisc = image(TT_NATIVE_ARCH_WORMHOLE, TT_NATIVE_ROLE_NCRISC, TT_NATIVE_LOADING_CONTIGUOUS);
+        const auto triscs = compute(TT_NATIVE_ARCH_WORMHOLE);
+        KernelHandle brisc_handle{}, ncrisc_handle{}, compute_handle{};
+        ASSERT_NO_THROW(brisc_handle = CreateKernelFromElf(program, cores, NativeDataMovementConfig{brisc}));
+        ASSERT_NO_THROW(
+            ncrisc_handle = CreateKernelFromElf(program, cores, NativeDataMovementConfig{ncrisc, NOC::NOC_1}));
+        ASSERT_NO_THROW(compute_handle = CreateKernelFromElf(program, cores, triscs));
+        EXPECT_EQ(program.impl().num_kernels(), 3u);
+        for (const auto handle : {brisc_handle, ncrisc_handle, compute_handle}) {
+            auto kernel = std::dynamic_pointer_cast<NativeElfKernel>(program.impl().get_kernel(handle));
+            ASSERT_TRUE(kernel);
+            for (size_t index = 0; index != kernel->native_images().images.size(); ++index) {
+                EXPECT_EQ(
+                    kernel->owned_binaries()[index],
+                    &native_detail::NativeImageAccess::memory(kernel->native_images().images[index]));
+            }
+            EXPECT_THROW(kernel->prepare(nullptr, tt::worker_stream_state::Owner::SdkCircularBuffers), std::exception);
+        }
+    });
+}
+
+TEST_F(NativeElfFactory, ProgramOwnershipRequiresActualWorkerStreamProvider) {
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        SCOPED_TRACE(static_cast<int>(architecture));
+        with_environment(architecture, [&](Program&, ContextId id) {
+            auto& context = MetalContext::instance(id);
+            context.initialize({}, 1, {}, 0, true);
+            const uint8_t wire = architecture == tt::ARCH::BLACKHOLE ? TT_NATIVE_ARCH_BLACKHOLE : TT_NATIVE_ARCH_WORMHOLE;
+            auto bytes = image(
+                wire, TT_NATIVE_ROLE_BRISC, TT_NATIVE_LOADING_CONTIGUOUS_XIP, TT_NATIVE_WORKER_STREAM_PROGRAM);
+            NativeElfKernel kernel(KernelBuildContext::from_runtime(id), id, cores, NativeDataMovementConfig{bytes});
+            tt::tt_metal::Device unbooted(&context.get_env(), &context, 0, 1, 0, 0, {}, true);
+            ASSERT_FALSE(context.worker_stream_state_provider(0));
+            // A valid target and Program-owned ELF are static inputs. Neither
+            // can replace the actual BRISC/TRISC0 provider minted after boot.
+            try {
+                kernel.validate_deployment(unbooted, tt::worker_stream_state::Owner::Program);
+                FAIL() << "Native Program ownership requires completed worker firmware support";
+            } catch (const std::runtime_error& error) {
+                EXPECT_NE(std::string(error.what()).find("completed worker stream-state"), std::string::npos)
+                    << error.what();
+            }
+            EXPECT_FALSE(unbooted.is_initialized());
+            EXPECT_FALSE(context.worker_stream_state_provider(0));
+        });
+    }
+}
+
+TEST_F(NativeElfFactory, RejectsForeignDataMovementArchitectureBeforeAddingKernel) {
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        SCOPED_TRACE(static_cast<int>(architecture));
+        with_environment(architecture, [&](Program& program, ContextId) {
+            const uint8_t actual =
+                architecture == tt::ARCH::BLACKHOLE ? TT_NATIVE_ARCH_BLACKHOLE : TT_NATIVE_ARCH_WORMHOLE;
+            const uint8_t foreign =
+                architecture == tt::ARCH::BLACKHOLE ? TT_NATIVE_ARCH_WORMHOLE : TT_NATIVE_ARCH_BLACKHOLE;
+            const auto wrong = image(foreign, TT_NATIVE_ROLE_BRISC, TT_NATIVE_LOADING_CONTIGUOUS_XIP);
+            EXPECT_THROW(CreateKernelFromElf(program, cores, NativeDataMovementConfig{wrong}), std::exception);
+            EXPECT_EQ(program.impl().num_kernels(), 0u);
+            const auto valid = image(actual, TT_NATIVE_ROLE_BRISC, TT_NATIVE_LOADING_CONTIGUOUS_XIP);
+            ASSERT_NO_THROW(CreateKernelFromElf(program, cores, NativeDataMovementConfig{valid}));
+            EXPECT_EQ(program.impl().num_kernels(), 1u);
+        });
+    }
+}
+
+TEST_F(NativeElfFactory, RejectsForeignComputeArchitectureBeforeAddingKernel) {
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        SCOPED_TRACE(static_cast<int>(architecture));
+        with_environment(architecture, [&](Program& program, ContextId) {
+            const uint8_t actual =
+                architecture == tt::ARCH::BLACKHOLE ? TT_NATIVE_ARCH_BLACKHOLE : TT_NATIVE_ARCH_WORMHOLE;
+            const uint8_t foreign =
+                architecture == tt::ARCH::BLACKHOLE ? TT_NATIVE_ARCH_WORMHOLE : TT_NATIVE_ARCH_BLACKHOLE;
+            EXPECT_THROW(CreateKernelFromElf(program, cores, compute(foreign)), std::exception);
+            EXPECT_EQ(program.impl().num_kernels(), 0u);
+            ASSERT_NO_THROW(CreateKernelFromElf(program, cores, compute(actual)));
+            EXPECT_EQ(program.impl().num_kernels(), 1u);
+        });
+    }
+}
+
+TEST_F(NativeElfFactory, RejectsDataMovementLoadingMismatchBeforeAddingKernel) {
+    with_environment(tt::ARCH::WORMHOLE_B0, [&](Program& program, ContextId) {
+        const auto wrong = image(TT_NATIVE_ARCH_WORMHOLE, TT_NATIVE_ROLE_NCRISC, TT_NATIVE_LOADING_CONTIGUOUS_XIP);
+        EXPECT_THROW(CreateKernelFromElf(program, cores, NativeDataMovementConfig{wrong}), std::exception);
+        EXPECT_EQ(program.impl().num_kernels(), 0u);
+        const auto valid = image(TT_NATIVE_ARCH_WORMHOLE, TT_NATIVE_ROLE_NCRISC, TT_NATIVE_LOADING_CONTIGUOUS);
+        ASSERT_NO_THROW(CreateKernelFromElf(program, cores, NativeDataMovementConfig{valid}));
+        EXPECT_EQ(program.impl().num_kernels(), 1u);
+    });
+}
+
+TEST_F(NativeElfFactory, RejectsComputeLoadingMismatchBeforeAddingKernel) {
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        const uint8_t wire = architecture == tt::ARCH::BLACKHOLE ? TT_NATIVE_ARCH_BLACKHOLE : TT_NATIVE_ARCH_WORMHOLE;
+        for (uint8_t role = TT_NATIVE_ROLE_TRISC0; role != TT_NATIVE_ROLE_COUNT; ++role) {
+            SCOPED_TRACE(static_cast<int>(architecture));
+            SCOPED_TRACE(role);
+            with_environment(architecture, [&](Program& program, ContextId) {
+                auto wrong = compute(wire);
+                const auto mismatch = image(wire, role, TT_NATIVE_LOADING_CONTIGUOUS);
+                switch (role) {
+                    case TT_NATIVE_ROLE_TRISC0: wrong.trisc0 = mismatch; break;
+                    case TT_NATIVE_ROLE_TRISC1: wrong.trisc1 = mismatch; break;
+                    case TT_NATIVE_ROLE_TRISC2: wrong.trisc2 = mismatch; break;
+                }
+                EXPECT_THROW(CreateKernelFromElf(program, cores, wrong), std::exception);
+                EXPECT_EQ(program.impl().num_kernels(), 0u);
+                ASSERT_NO_THROW(CreateKernelFromElf(program, cores, compute(wire)));
+                EXPECT_EQ(program.impl().num_kernels(), 1u);
+            });
+        }
+    }
+}
+
+TEST_F(NativeElfFactory, TargetValidationReceivesEveryRoleOfBothArchitectures) {
+    ASSERT_FALSE(MetalContext::instance_exists());
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        const Hal actual(architecture, false, false, 0, false);
+        const uint8_t wire = architecture == tt::ARCH::BLACKHOLE ? TT_NATIVE_ARCH_BLACKHOLE : TT_NATIVE_ARCH_WORMHOLE;
+        for (uint8_t role = 0; role != TT_NATIVE_ROLE_COUNT; ++role) {
+            SCOPED_TRACE(static_cast<int>(architecture));
+            SCOPED_TRACE(role);
+            const uint8_t loading = architecture == tt::ARCH::WORMHOLE_B0 && role == TT_NATIVE_ROLE_NCRISC
+                                        ? TT_NATIVE_LOADING_CONTIGUOUS
+                                        : TT_NATIVE_LOADING_CONTIGUOUS_XIP;
+            const auto valid = image(wire, role, loading);
+            EXPECT_NO_THROW(native_detail::NativeImageAccess::validate_target(valid, actual));
+            for (const uint8_t wrong :
+                 {uint8_t{TT_NATIVE_LOADING_DISCRETE},
+                  uint8_t{TT_NATIVE_LOADING_CONTIGUOUS_XIP},
+                  uint8_t{TT_NATIVE_LOADING_CONTIGUOUS}}) {
+                if (wrong != loading) {
+                    EXPECT_THROW(
+                        native_detail::NativeImageAccess::validate_target(image(wire, role, wrong), actual),
+                        std::invalid_argument);
+                }
+            }
+        }
+    }
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+
+TEST_F(NativeElfFactory, TargetValidationRejectsForeignAndUnsupportedArchitecture) {
+    ASSERT_FALSE(MetalContext::instance_exists());
+    const Hal blackhole(tt::ARCH::BLACKHOLE, false, false, 0, false);
+    const Hal wormhole(tt::ARCH::WORMHOLE_B0, false, false, 0, false);
+    const Hal invalid(tt::ARCH::Invalid, false, false, 0, false);
+    for (uint8_t role = 0; role != TT_NATIVE_ROLE_COUNT; ++role) {
+        SCOPED_TRACE(role);
+        const auto bh = image(TT_NATIVE_ARCH_BLACKHOLE, role, TT_NATIVE_LOADING_CONTIGUOUS_XIP);
+        const auto wh = image(
+            TT_NATIVE_ARCH_WORMHOLE,
+            role,
+            role == TT_NATIVE_ROLE_NCRISC ? TT_NATIVE_LOADING_CONTIGUOUS : TT_NATIVE_LOADING_CONTIGUOUS_XIP);
+        EXPECT_THROW(native_detail::NativeImageAccess::validate_target(bh, wormhole), std::invalid_argument);
+        EXPECT_THROW(native_detail::NativeImageAccess::validate_target(wh, blackhole), std::invalid_argument);
+        EXPECT_THROW(native_detail::NativeImageAccess::validate_target(bh, invalid), std::invalid_argument);
+        EXPECT_THROW(native_detail::NativeImageAccess::validate_target(wh, invalid), std::invalid_argument);
+    }
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
 
 TEST_F(NativeKernel, RetainsImageAndRejectsSourceCompilationWithoutContext) {
     ASSERT_FALSE(MetalContext::instance_exists());

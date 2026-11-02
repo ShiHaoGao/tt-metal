@@ -40,6 +40,9 @@ enum tt_native_architecture {
 enum tt_native_loading {
     TT_NATIVE_LOADING_DISCRETE = 0,
     TT_NATIVE_LOADING_CONTIGUOUS_XIP = 1,
+    // Wormhole NCRISC loads a packed image at its linked addresses; it does
+    // not apply the execute-in-place text/data relocation used by XIP roles.
+    TT_NATIVE_LOADING_CONTIGUOUS = 2,
 };
 
 enum tt_native_profile_transport {

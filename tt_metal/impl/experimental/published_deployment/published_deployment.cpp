@@ -100,7 +100,8 @@ void require_export(const Symbols& symbols, const char* name, uint64_t value) {
         found->second.st_value != value)
         throw std::invalid_argument("firmware layout export differs from its actual segments");
 }
-FirmwareLayout validate_firmware_regions(const OwnedImage& image, const HalProcessorImageRegions& regions) {
+FirmwareLayout validate_firmware_regions(
+    const OwnedImage& image, const HalProcessorImageRegions& regions, tt::ARCH architecture) {
     uint64_t text_end = regions.firmware_text.base;
     uint64_t data_end = regions.local_data.base;
     for (const auto& segment : image.loads) {
@@ -119,26 +120,28 @@ FirmwareLayout validate_firmware_regions(const OwnedImage& image, const HalProce
         }
     }
     FirmwareLayout result{aligned_end(text_end + regions.firmware_kernel_pad), aligned_end(data_end)};
-    // main.ld owns these two mandatory ABI exports. Their values are derived
-    // independently from real segments and actual HAL limits before use.
-    require_export(image.symbols, "__fw_export_text_end", result.text_end);
-    require_export(image.symbols, "__fw_export_ldm_end", result.data_end);
+    // WH active Ethernet uses erisc-b0-app.ld with fixed, disjoint firmware
+    // and kernel regions. It has no main.ld firmware-end export ABI.
+    const bool fixed_ethernet = architecture == tt::ARCH::WORMHOLE_B0 &&
+        image.processor.core_type == HalProgrammableCoreType::ACTIVE_ETH &&
+        image.processor.processor_class == HalProcessorClassType::DM && image.processor.processor_type == 0;
+    if (!fixed_ethernet) {
+        require_export(image.symbols, "__fw_export_text_end", result.text_end);
+        require_export(image.symbols, "__fw_export_ldm_end", result.data_end);
+    }
     return result;
 }
-void validate_dispatch_regions(const OwnedImage& image, const OwnedImage& firmware,
-                               const HalProcessorImageRegions& regions) {
-    if (!firmware.firmware_layout || image.loads.empty() || image.loads.front().p_vaddr != firmware.firmware_layout->text_end)
-        throw std::invalid_argument("dispatch entry differs from actual firmware text handoff");
+void validate_dispatch_regions(const OwnedImage& image, const OwnedImage& firmware, const Hal& hal, bool erisc_iram) {
+    if (!firmware.firmware_layout)
+        throw std::invalid_argument("dispatch requires an admitted firmware layout");
     const auto layout = *firmware.firmware_layout;
-    const uint64_t text_limit = (regions.kernel_text_limit == HalKernelTextLimit::FromFirmwareBase
-        ? regions.firmware_text.base : layout.text_end) + regions.kernel_text_size;
-    if (layout.text_end > text_limit || layout.data_end > regions.local_data.base + regions.local_data.size)
-        throw std::invalid_argument("firmware leaves no valid dispatch image region");
+    const auto regions = hal.get_processor_kernel_regions(image.processor, layout.text_end, layout.data_end, erisc_iram);
+    if (!regions || image.loads.empty() || image.loads.front().p_vaddr != regions->text.base)
+        throw std::invalid_argument("dispatch entry differs from actual processor kernel region");
     for (const auto& segment : image.loads) {
         const bool executable = segment.p_flags & PF_X;
-        const uint64_t begin = executable ? layout.text_end : layout.data_end;
-        const uint64_t end = executable ? text_limit : regions.local_data.base + regions.local_data.size;
-        if (segment.p_vaddr < begin || uint64_t(segment.p_vaddr) + segment.p_memsz > end ||
+        const auto region = executable ? regions->text : regions->data;
+        if (!contains(region, segment.p_vaddr, segment.p_memsz) ||
             (executable && (segment.p_flags & PF_W)))
             throw std::invalid_argument("dispatch load exceeds actual firmware/processor image region");
     }
@@ -250,7 +253,7 @@ OwnedImage admit_image(const DeploymentConfiguration& config, const PublishedIma
     const auto& layout = processor_layout.layout;
     auto loading = ll_api::memory::Loading::DISCRETE;
     if (input.kind == PublishedImageKind::Firmware) {
-        image.firmware_layout = validate_firmware_regions(image, processor_layout.regions);
+        image.firmware_layout = validate_firmware_regions(image, processor_layout.regions, config.device().arch);
         if (header.e_entry != layout.fw_base_addr)
             throw std::invalid_argument("firmware entry differs from selected HAL processor");
         if (input.processor.core_type != HalProgrammableCoreType::TENSIX &&
@@ -303,15 +306,28 @@ PublishedDeployment PublishedDeployment::admit(const DeploymentConfiguration& co
         }
     }
     auto tensix = FirmwareBundle::from_images(native, "published Tensix firmware");
+    const auto expected_architecture = config.device().arch == tt::ARCH::BLACKHOLE
+        ? TT_NATIVE_ARCH_BLACKHOLE : TT_NATIVE_ARCH_WORMHOLE;
+    if (tensix.contract(TensixKernelRole::Brisc).architecture != expected_architecture)
+        throw std::invalid_argument("native firmware architecture differs from deployment configuration");
     const auto expected_profile = config.profiler_mode() == DeviceProfilerMode::Program
         ? TT_NATIVE_PROFILE_CLASSIC_DRAM_PROGRAM : TT_NATIVE_PROFILE_ABSENT;
     if (tensix.contract(TensixKernelRole::Brisc).profile != expected_profile)
         throw std::invalid_argument("firmware observation contract differs from deployment profile");
+    const auto& storage = deployment_detail::Access::configuration(config);
+    // Recreate exactly the already-admitted HAL. Kernel regions are a derived
+    // HAL projection, not a second archived configuration or a live-device query.
+    const bool dram_cores = std::ranges::any_of(storage.cores, [](const auto& core) {
+        return core.type == HalProgrammableCoreType::DRAM;
+    });
+    const Hal hal(storage.device.arch, storage.device.routing_fw_enabled, storage.build.two_erisc,
+        storage.device.profiler_dram_bank_size_per_risc_bytes, storage.build.dram_backed_cq,
+        false, dram_cores, storage.build.eth_ptp_trace);
     for (const auto& image : dispatch) {
         if (!image) throw std::invalid_argument("missing published dispatch image");
         const auto processor_index = firmware_index(config, image->processor);
         const auto& provider = *firmware[processor_index];
-        validate_dispatch_regions(*image, provider, deployment_detail::Access::configuration(config).layouts[processor_index].regions);
+        validate_dispatch_regions(*image, provider, hal, storage.build.erisc_iram);
         validate_absolute_symbols(*image, provider);
     }
     auto owner = std::make_shared<Impl>(config, std::move(tensix));

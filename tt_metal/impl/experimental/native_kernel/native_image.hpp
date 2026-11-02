@@ -30,6 +30,9 @@ class NativeImageAccess {
 public:
     static const ll_api::memory& memory(const KernelElfImage&);
     static const ll_api::memory& memory(const FirmwareBundle&, TensixKernelRole);
+    // Receive image architecture and role-specific loading against the actual
+    // HAL. This does not establish firmware boot or deployment admission.
+    static void validate_target(const KernelElfImage&, const Hal&);
     static void validate_compute(const NativeComputeConfig&);
     static void validate_niu_handoff(const FirmwareBundle&, const Hal&);
 };

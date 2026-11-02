@@ -8,6 +8,9 @@
 namespace tt::tt_metal::experimental::catalog {
 struct Input {
     std::filesystem::path sdk_root;
+    tt::ARCH architecture;
+    // One explicitly selected MMIO chip. This catalog does not discover or
+    // admit the N300 board's second chip or an Ethernet-serviced topology.
     ChipInfo chip;
     ChipId device_id;
     HostQueueBacking host;
@@ -18,4 +21,4 @@ struct Output {
     DispatchProgramInputs program;
 };
 Output make_input(const Input&, const Hal&, llrt::RunTimeOptions&);
-} // namespace tt::tt_metal::experimental::catalog
+}  // namespace tt::tt_metal::experimental::catalog

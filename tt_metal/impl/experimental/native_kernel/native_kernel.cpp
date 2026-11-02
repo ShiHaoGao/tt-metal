@@ -78,25 +78,24 @@ std::shared_ptr<const experimental::native_detail::LoadedFirmware> NativeElfKern
     TT_FATAL(extract_context_id(&device) == get_context_id(), "Native ELF belongs to another device context");
     TT_FATAL(MetalContext::instance_exists(get_context_id()), "Native ELF requires an existing device context");
     auto& context = MetalContext::instance(extract_context_id(&device));
-    TT_FATAL(device.arch() == tt::ARCH::BLACKHOLE, "Native ELF currently requires Blackhole");
+    TT_FATAL(device.arch() == context.hal().get_arch(), "Native ELF device architecture differs from its context HAL");
+    for (const auto& image : native_images().images) {
+        experimental::native_detail::NativeImageAccess::validate_target(image, context.hal());
+    }
     TT_FATAL(
         context.get_cluster().get_target_device_type() != tt::TargetDevice::Emule,
         "Native RISC-V ELF cannot execute through source-based emulation");
+    if (owner == tt::worker_stream_state::Owner::Program) {
+        const auto provider = context.worker_stream_state_provider(device.id());
+        TT_FATAL(provider && provider->version() == tt::worker_stream_state::kVersion,
+                 "Native ELF Program ownership requires a completed worker stream-state ABI {} provider",
+                 tt::worker_stream_state::kVersion);
+    }
     auto loaded = context.native_firmware(device.id());
     TT_FATAL(loaded && loaded->live(), "Native ELF requires a successful boot of retained firmware bytes");
     validate_stream_owner(owner);
     for (const auto& image : native_images().images) {
         TT_FATAL(image.firmware().matches(loaded->bundle()), "Native ELF linked firmware differs from actual boot");
-        const auto type = static_cast<uint32_t>(image.role());
-        const auto expected = context.hal()
-                                  .get_jit_build_config(
-                                      context.hal().get_programmable_core_type_index(HalProgrammableCoreType::TENSIX),
-                                      static_cast<uint32_t>(get_kernel_processor_class()),
-                                      type < 2 ? type : type - 2)
-                                  .memory_load;
-        TT_FATAL(
-            experimental::native_detail::NativeImageAccess::memory(image).get_loading() == expected,
-            "Native ELF loading mode differs from processor HAL");
     }
     std::lock_guard lock(deployment_mutex_);
     const auto previous = deployments_.find(device.id());

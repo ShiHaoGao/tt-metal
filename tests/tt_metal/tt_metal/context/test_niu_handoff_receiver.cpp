@@ -51,6 +51,7 @@ void Cluster::l1_barrier(ChipId chip) const {
 }
 
 namespace tt::tt_metal::detail {
+class NiuHandoffJournal;
 namespace {
 
 constexpr uint32_t sequence_offset = TT_NIU_HANDOFF_RECEIPT_OFFSET;
@@ -1728,6 +1729,271 @@ TEST(NiuHandoffInitialRequestTest, RejectsZeroHostIdentitiesAndAnyPreviousReques
         ASSERT_TRUE(observed.observation);
         EXPECT_FALSE(NiuHandoffReceiver::initial_execution(*observed.observation, 2, 3, true)) << field;
     }
+}
+
+// This fixture exercises request numbering and byte reception only. A direct
+// journal instance has no LoadedFirmware, original invocation, source End,
+// selector lease or clean authority. Production must admit those independently.
+Mailbox closed_mailbox(const NiuHandoffExpectedExecution& expected, uint32_t sequence) {
+    Mailbox mailbox;
+    mailbox.wire = {};
+    mailbox.wire.request = expected.request;
+    auto& receipt = mailbox.wire.receipt;
+    auto& header = receipt.header;
+    header.publish_sequence = sequence;
+    header.abi_version = TT_NIU_HANDOFF_VERSION;
+    header.challenge_lo = expected.request.challenge_lo;
+    header.challenge_hi = expected.request.challenge_hi;
+    header.boot_cookie_lo = expected.request.boot_cookie_lo;
+    header.boot_cookie_hi = expected.request.boot_cookie_hi;
+    header.invocation_id_lo = expected.request.invocation_id_lo;
+    header.invocation_id_hi = expected.request.invocation_id_hi;
+    header.group_generation = expected.request.group_generation;
+    header.completed_go_count = expected.request.final_go_count;
+    header.source_valid_noc_mask = expected.source_valid_noc_mask;
+    header.completed_processor_mask = expected.request.required_processor_mask;
+    header.status = TT_NIU_HANDOFF_TRAFFIC_CLOSED;
+    header.control_valid_noc_mask = 3;
+    header.completed_stage_count = expected.completed_stage_count;
+    receipt.consumed_go_sequence = expected.request.first_go_sequence + expected.request.final_go_count - 1;
+    receipt.control = {3, 15, 15, 1};
+    return mailbox;
+}
+
+template <class Journal, class Check>
+void check_handoff_journal(Check&& check) {
+    if constexpr (requires { sizeof(Journal); }) {
+        check.template operator()<Journal>();
+    } else {
+        ADD_FAILURE() << "SDK has no boot-owned retained Worker request journal";
+    }
+}
+
+TEST(NiuHandoffJournalTest, ConsecutiveCallsRequireOriginalCleanAndAdvanceActualOrdinal) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        Journal journal;
+        auto boot = initial_mailbox();
+        const auto initial = boot.read();
+        ASSERT_TRUE(initial.observation);
+        const auto first = journal.prepare_request(*initial.observation, 19, 23, true);
+        ASSERT_TRUE(first);
+        EXPECT_EQ(first->request.first_go_sequence, 1u);
+        auto closed = closed_mailbox(*first, 6);
+        const auto observed = closed.read();
+        ASSERT_TRUE(observed.observation);
+        EXPECT_FALSE(journal.prepare_request(*observed.observation, 19, 24, true));
+        ASSERT_TRUE(journal.record_clean(*observed.observation, *first, {0xffff, 0xffff}));
+        const auto second = journal.prepare_request(*observed.observation, 19, 24, false);
+        ASSERT_TRUE(second);
+        EXPECT_EQ(second->request.first_go_sequence, 2u);
+        EXPECT_EQ(second->request.final_go_count, 1u);
+        EXPECT_EQ(second->request.request_generation, 2u);
+        EXPECT_EQ(second->request.group_generation, 2u);
+        EXPECT_EQ(second->request.invocation_id_lo, 24u);
+        EXPECT_EQ(second->completed_stage_count, 1u);
+        EXPECT_EQ(second->source_valid_noc_mask, 0u);
+        EXPECT_TRUE(journal.matches_request(*second));
+        EXPECT_FALSE(journal.matches_request(*first));
+        closed = closed_mailbox(*second, 10);
+        const auto next_observed = closed.read();
+        ASSERT_TRUE(next_observed.observation);
+        ASSERT_TRUE(journal.record_clean(*next_observed.observation, *second, {0xffff, 0xffff}));
+        const auto third = journal.prepare_request(*next_observed.observation, 19, 25, true);
+        ASSERT_TRUE(third);
+        EXPECT_EQ(third->request.first_go_sequence, 3u);
+    });
+}
+
+TEST(NiuHandoffJournalTest, PreparedRequestCannotBeOverwrittenOrRelabeledFromReceiptEcho) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        Journal journal;
+        auto boot = initial_mailbox();
+        const auto initial = boot.read();
+        ASSERT_TRUE(initial.observation);
+        const auto first = journal.prepare_request(*initial.observation, 19, 23, true);
+        ASSERT_TRUE(first);
+        EXPECT_FALSE(journal.prepare_request(*initial.observation, 19, 24, true));
+        auto foreign = *first;
+        ++foreign.request.invocation_id_lo;
+        ++foreign.request.challenge_lo;
+        auto closed = closed_mailbox(foreign, 6);
+        const auto observed = closed.read();
+        ASSERT_TRUE(observed.observation);
+        EXPECT_FALSE(journal.record_clean(*observed.observation, foreign, {0xffff, 0xffff}));
+        EXPECT_FALSE(journal.record_clean(*observed.observation, *first, {0xffff, 0xffff}));
+        EXPECT_TRUE(journal.matches_request(*first));
+        EXPECT_FALSE(journal.prepare_request(*observed.observation, 19, 25, true));
+    });
+}
+
+TEST(NiuHandoffJournalTest, CleanRequiresExactOriginalRequestAndEveryRequestedSelector) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        for (unsigned field = 0; field != 8; ++field) {
+            Journal journal;
+            auto boot = initial_mailbox();
+            const auto initial = boot.read();
+            ASSERT_TRUE(initial.observation);
+            const auto first = journal.prepare_request(*initial.observation, 19, 23, true);
+            ASSERT_TRUE(first);
+            auto closed = closed_mailbox(*first, 6);
+            switch (field) {
+                case 0: closed.wire.receipt.selector_observed[0][0].outstanding = 1; break;
+                case 1: closed.wire.receipt.selector_observed[1][15].outgoing = 1; break;
+                case 2: ++closed.wire.request.request_generation; break;
+                case 3: ++closed.wire.receipt.consumed_go_sequence; break;
+                case 4: closed.wire.receipt.header.status = TT_NIU_HANDOFF_PENDING; break;
+                case 5:
+                    closed.wire.receipt.header.status = TT_NIU_HANDOFF_REJECTED;
+                    closed.wire.receipt.header.error = TT_NIU_HANDOFF_ERROR_SOURCE;
+                    break;
+                case 6: closed.wire.receipt.header.completed_stage_count = 0; break;
+                case 7: closed.wire.receipt.header.publish_sequence = 2; break;
+            }
+            const auto observed = closed.read();
+            ASSERT_TRUE(observed.observation);
+            EXPECT_FALSE(journal.record_clean(*observed.observation, *first, {0xffff, 0xffff})) << field;
+            EXPECT_FALSE(journal.prepare_request(*observed.observation, 19, 24, true)) << field;
+        }
+    });
+}
+
+TEST(NiuHandoffJournalTest, SuccessorRequiresSameBootAndUnchangedOriginalCleanPredecessor) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        for (unsigned field = 0; field != 5; ++field) {
+            Journal journal;
+            auto boot = initial_mailbox();
+            const auto initial = boot.read();
+            ASSERT_TRUE(initial.observation);
+            const auto first = journal.prepare_request(*initial.observation, 19, 23, true);
+            ASSERT_TRUE(first);
+            auto closed = closed_mailbox(*first, 6);
+            const auto accepted = closed.read();
+            ASSERT_TRUE(accepted.observation);
+            ASSERT_TRUE(journal.record_clean(*accepted.observation, *first, {0xffff, 0xffff}));
+            if (field == 1) {
+                ++closed.wire.receipt.header.publish_sequence;
+            }
+            if (field == 2) {
+                ++closed.wire.receipt.consumed_go_sequence;
+            }
+            if (field == 3) {
+                ++closed.wire.request.request_generation;
+            }
+            if (field == 4) {
+                ++closed.wire.receipt.control_observed[1][4];
+            }
+            const auto observed = closed.read();
+            if (observed.observation) {
+                EXPECT_FALSE(journal.prepare_request(*observed.observation, field == 0 ? 20 : 19, 24, true)) << field;
+            } else {
+                EXPECT_EQ(field, 1u);
+            }
+            EXPECT_FALSE(journal.prepare_request(*accepted.observation, 19, 23, true));
+            const auto next = journal.prepare_request(*accepted.observation, 19, 24, true);
+            ASSERT_TRUE(next);
+            EXPECT_EQ(next->request.first_go_sequence, 2u);
+        }
+    });
+}
+
+TEST(NiuHandoffJournalTest, DistinctWorkersAdvanceIndependentlyAndQuarantineNeverRevives) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        Journal a;
+        Journal b;
+        auto boot = initial_mailbox();
+        const auto initial = boot.read();
+        ASSERT_TRUE(initial.observation);
+        const auto first = a.prepare_request(*initial.observation, 19, 23, true);
+        const auto other = b.prepare_request(*initial.observation, 19, 24, false);
+        ASSERT_TRUE(first);
+        ASSERT_TRUE(other);
+        EXPECT_EQ(other->request.first_go_sequence, 1u);
+        auto closed = closed_mailbox(*first, 6);
+        const auto observed = closed.read();
+        ASSERT_TRUE(observed.observation);
+        ASSERT_TRUE(a.record_clean(*observed.observation, *first, {0xffff, 0xffff}));
+        a.quarantine();
+        EXPECT_FALSE(a.prepare_request(*observed.observation, 19, 25, true));
+        EXPECT_FALSE(a.prepare_request(*initial.observation, 19, 25, true));
+        EXPECT_FALSE(a.record_clean(*observed.observation, *first, {0xffff, 0xffff}));
+        EXPECT_TRUE(b.matches_request(*other));
+    });
+}
+
+TEST(NiuHandoffJournalTest, NeitherClosedEchoNorOrdinaryGoCanCreateAnOwnedInitialRequest) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        Journal journal;
+        Mailbox closed;
+        auto observed = closed.read();
+        ASSERT_TRUE(observed.observation);
+        EXPECT_FALSE(journal.prepare_request(*observed.observation, 19, 23, true));
+        EXPECT_FALSE(journal.record_clean(*observed.observation, closed.expected(), {0xffff, 0xffff}));
+        auto boot = initial_mailbox();
+        boot.wire.receipt.consumed_go_sequence = 1;
+        observed = boot.read();
+        ASSERT_TRUE(observed.observation);
+        EXPECT_FALSE(journal.prepare_request(*observed.observation, 19, 23, true));
+    });
+}
+
+TEST(NiuHandoffJournalTest, ExhaustedPublicationSequenceCannotAuthorizeAnotherGo) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        Journal journal;
+        auto boot = initial_mailbox();
+        const auto initial = boot.read();
+        ASSERT_TRUE(initial.observation);
+        const auto first = journal.prepare_request(*initial.observation, 19, 23, true);
+        ASSERT_TRUE(first);
+        auto closed = closed_mailbox(*first, UINT32_MAX - 1);
+        const auto observed = closed.read();
+        ASSERT_TRUE(observed.observation);
+        ASSERT_TRUE(journal.record_clean(*observed.observation, *first, {0xffff, 0xffff}));
+        EXPECT_FALSE(journal.prepare_request(*observed.observation, 19, 24, true));
+    });
+}
+
+TEST(NiuHandoffJournalTest, CleanUsesOnlyTheOriginalAllocationSelectorInventory) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        Journal journal;
+        auto boot = initial_mailbox();
+        const auto initial = boot.read();
+        ASSERT_TRUE(initial.observation);
+        const auto first = journal.prepare_request(*initial.observation, 19, 23, true);
+        ASSERT_TRUE(first);
+        auto closed = closed_mailbox(*first, 6);
+        closed.wire.receipt.selector_observed[0][7].outstanding = 255;
+        closed.wire.receipt.selector_observed[1][0].outgoing = 1;
+        const auto observed = closed.read();
+        ASSERT_TRUE(observed.observation);
+        EXPECT_FALSE(journal.record_clean(*observed.observation, *first, {0, 0x8000}));
+        EXPECT_FALSE(journal.record_clean(*observed.observation, *first, {1, 0}));
+        ASSERT_TRUE(journal.record_clean(*observed.observation, *first, {1, 0x8000}));
+        const auto second = journal.prepare_request(*observed.observation, 19, 24, true);
+        ASSERT_TRUE(second);
+        EXPECT_EQ(second->request.first_go_sequence, 2u);
+    });
+}
+
+TEST(NiuHandoffJournalTest, ChallengeFollowsActualIssueOrderRatherThanInvocationCreationOrder) {
+    check_handoff_journal<NiuHandoffJournal>([]<class Journal> {
+        Journal journal;
+        auto boot = initial_mailbox();
+        const auto initial = boot.read();
+        ASSERT_TRUE(initial.observation);
+        const auto first = journal.prepare_request(*initial.observation, 19, 41, true);
+        ASSERT_TRUE(first);
+        auto closed = closed_mailbox(*first, 6);
+        const auto observed = closed.read();
+        ASSERT_TRUE(observed.observation);
+        ASSERT_TRUE(journal.record_clean(*observed.observation, *first, {1, 1}));
+        // SDK Programs may be reserved before another Program runs. The new
+        // challenge belongs to the Worker's issue order, not creation order.
+        const auto second = journal.prepare_request(*observed.observation, 19, 17, true);
+        ASSERT_TRUE(second);
+        EXPECT_EQ(second->request.invocation_id_lo, 17u);
+        EXPECT_EQ(second->request.challenge_lo, 42u);
+        EXPECT_EQ(second->request.first_go_sequence, 2u);
+    });
 }
 
 TEST(NiuHandoffRequestTest, InvalidatesOldGenerationAndVerifiesBodyBeforePublishingNewGeneration) {

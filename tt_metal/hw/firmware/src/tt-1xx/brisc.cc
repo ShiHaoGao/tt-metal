@@ -51,7 +51,7 @@
 
 // clang-format on
 
-#if defined(ARCH_BLACKHOLE)
+#if defined(ARCH_BLACKHOLE) || defined(ARCH_WORMHOLE)
 __attribute__((used, section(".tt_worker_stream_state")))
 const tt::worker_stream_state::ImageRecord worker_stream_state_image{
     tt::worker_stream_state::kVersion,
@@ -529,9 +529,9 @@ inline worker_stream_state::Decision receive_worker_stream_state(
                                 config.min_remote_cb_start_index < NUM_CIRCULAR_BUFFERS ||
                                 config.cross_node_dfb_offset != REMOTE_DFB_OFFSET_NONE ||
                                 config.prefetcher_pipe_offset != REMOTE_DFB_OFFSET_NONE;
-#if !defined(ARCH_BLACKHOLE)
-    // This bounded implementation advertises Program ownership only on
-    // Blackhole. Ordinary SDK launches retain their existing owner elsewhere.
+#if !defined(ARCH_BLACKHOLE) && !defined(ARCH_WORMHOLE)
+    // Only the architectures with admitted firmware image records may
+    // preserve Program-owned counters across a launch.
     if (config.worker_stream_state_owner == static_cast<uint8_t>(worker_stream_state::Owner::Program))
         return worker_stream_state::Decision::RejectOwner;
 #endif

@@ -60,7 +60,8 @@ DeploymentConfiguration DeploymentConfiguration::from_sdk(
 DeploymentConfiguration deployment_detail::Access::admit_configuration(
     const DeviceConfiguration& config, const BuildConfiguration& build,
     const DispatchProgramPlan& program, const Hal& hal) {
-    if (config.arch != tt::ARCH::BLACKHOLE || hal.get_arch() != config.arch ||
+    if ((config.arch != tt::ARCH::BLACKHOLE &&
+         config.arch != tt::ARCH::WORMHOLE_B0) || hal.get_arch() != config.arch ||
         !config.num_dram_banks || !config.num_l1_banks || !config.num_hw_cqs ||
         config.max_cbs != hal.get_arch_num_circular_buffers() ||
         config.coordinate_virtualization_enabled != hal.is_coordinate_virtualization_enabled() ||

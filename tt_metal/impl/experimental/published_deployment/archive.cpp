@@ -31,7 +31,8 @@ constexpr size_t MaxSequenceElements = 4096;
 
 template<class T> bool valid_enum(uint64_t value) {
     const auto is = [value](auto... members) { return ((value == static_cast<uint64_t>(members)) || ...); };
-    if constexpr (std::is_same_v<T, tt::ARCH>) return is(tt::ARCH::BLACKHOLE);
+    if constexpr (std::is_same_v<T, tt::ARCH>)
+        return is(tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0);
     else if constexpr (std::is_same_v<T, DispatchCoreType>) return is(DispatchCoreType::WORKER, DispatchCoreType::ETH);
     else if constexpr (std::is_same_v<T, DispatchCoreAxis>) return is(DispatchCoreAxis::ROW, DispatchCoreAxis::COL);
     else if constexpr (std::is_same_v<T, tt::CoreType>) return is(tt::CoreType::WORKER, tt::CoreType::ETH);
@@ -46,7 +47,9 @@ template<class T> bool valid_enum(uint64_t value) {
         return is(HalKernelTextLimit::FromFirmwareBase, HalKernelTextLimit::AfterFirmware);
     else if constexpr (std::is_same_v<T, NOC>) return is(NOC_0, NOC_1);
     else if constexpr (std::is_same_v<T, PublishedImageKind>) return is(PublishedImageKind::Firmware, PublishedImageKind::Dispatch);
-    else if constexpr (std::is_same_v<T, DispatchProgramFamily>) return is(DispatchProgramFamily::BlackholeSingleMmioWorkerOneCq);
+    else if constexpr (std::is_same_v<T, DispatchProgramFamily>)
+        return is(DispatchProgramFamily::BlackholeSingleMmioWorkerOneCq,
+                  DispatchProgramFamily::WormholeSingleMmioWorkerOneCq);
     else if constexpr (std::is_same_v<T, DispatchWorkerType>) return is(PREFETCH_HD, DISPATCH_HD, DISPATCH_S);
     else static_assert(!std::is_same_v<T, T>, "archive enum requires an explicit legal value set");
 }

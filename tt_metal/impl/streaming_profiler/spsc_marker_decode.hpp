@@ -394,11 +394,11 @@ inline simde__m256i spsc_w0_mask() {
 // The lanes of a composed record that come from the constant half rather than the packet: the prog and coordinate
 // lanes always, plus each field the format lacks.
 template <PacketFormat F>
-constexpr int spsc_blend_s() {
+consteval int spsc_blend_s() {
     return 0xE0 | (F.has_ts_hi() ? 0 : 0x02) | (F.has_dur() ? 0 : 0x04) | (F.has_dur_hi() ? 0 : 0x08);
 }
 template <PacketFormat F>
-constexpr int spsc_blend_d() {
+consteval int spsc_blend_d() {
     return 0xFC | (F.has_dur_hi() ? 0 : 0x02);
 }
 

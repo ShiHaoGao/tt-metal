@@ -339,7 +339,7 @@ std::vector<HalProcessorIdentifier> dispatch_processors(const DispatchKernelConf
 void validate_published_dispatch_configuration(const DispatchKernelConfiguration& n) {
     if (!n.resolved || !n.resolved->command_queue_size || !n.resolved->worker_count ||
         !n.resolved->prefetch_q_entry_bits || n.resolved->galaxy_cluster) {
-        throw std::invalid_argument("published dispatch requires complete Blackhole nonfabric facts");
+        throw std::invalid_argument("published dispatch requires complete nonfabric facts");
     }
     const auto expected_processor =
         n.processor.core_type == HalProgrammableCoreType::TENSIX &&

@@ -31,6 +31,7 @@
 #include <tt-logger/tt-logger.hpp>
 
 #include <tt-metalium/distributed.hpp>
+#include <tt-metalium/experimental/context/metal_env.hpp>
 #include <tt-metalium/experimental/sockets/d2h_socket.hpp>
 #include <tt-metalium/experimental/sockets/mesh_socket.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
@@ -117,14 +118,25 @@ struct RealtimeProfilerEligibility {
 
 // Consolidated eligibility check; logs the disable reason. Evaluates against the device's owning context_id (not bare
 // instance()) so a mock device isn't falsely enabled via the silicon DEFAULT_CONTEXT_ID fallback (#38445/#39849).
-// Checks: not mock/emulated, MMIO-capable, IOMMU if 64-bit PCIe, fabric tensix datamover off, a tensix reserved and
-// in-grid, kernels not nullified, L1 bank fits the layout.
+// Checks: source deployment, not mock/emulated, MMIO-capable, IOMMU if 64-bit PCIe, fabric tensix datamover off,
+// a tensix reserved and in-grid, kernels not nullified, L1 bank fits the layout.
 RealtimeProfilerEligibility evaluate_realtime_profiler_eligibility(IDevice* device, ContextId context_id) {
     auto device_id = device->id();
     auto& metal = MetalContext::instance(context_id);
     const auto& hal = metal.hal();
     const auto& cluster = metal.get_cluster();
     auto& dispatch_core_manager = metal.get_dispatch_core_manager();
+
+    // This optional overlay creates source kernels. A published deployment has
+    // no JIT environment and does not publish these kernels; its resident
+    // Program profiler remains governed by the selected deployment contract.
+    if (metal.get_env().get_descriptor().published_deployment()) {
+        log_debug(
+            tt::LogMetal,
+            "Real-time profiler disabled on device {}: its source kernels are not part of the published deployment.",
+            device_id);
+        return {};
+    }
 
     // The two profilers have separate data paths (this one reads dispatch_s timestamps through a reserved tensix),
     // but running them together produced ~1800 "zone with end < start" real-time records per ResNet run; until that
@@ -1147,20 +1159,33 @@ void RealtimeProfilerManager::run_consumer(Consumer& consumer) {
     };
 
     while (true) {
-        // stop_consumer sets the stop mode then wakes, so waiting on a token sampled only inside wait() could miss that
-        // wake and hang
+        // Sample before testing the stop condition so its wake cannot be lost.
         const auto token = consumer.reader.wait_token();
-        std::span<tt::ProgramRealtimeRecord> batch = consumer.reader.read_batch(records);
-        const uint64_t dropped_total = consumer.reader.dropped();
-        const ConsumerStopMode stop_mode = consumer.stop_mode.load(std::memory_order_acquire);
-        if (stop_mode == ConsumerStopMode::StopWithoutDrain) {
+        std::span<tt::ProgramRealtimeRecord> batch;
+        uint64_t dropped_total;
+        bool prefix_complete = false;
+        {
+            std::lock_guard lock(consumer.read_mutex);
+            if (consumer.stop_mode == tt::RealtimeProfilerCallbackStopMode::Abort) {
+                break;
+            }
+            if (consumer.stop_prefix) {
+                batch = consumer.reader.read_batch(records, *consumer.stop_prefix);
+                prefix_complete = consumer.reader.reached(*consumer.stop_prefix);
+            } else {
+                batch = consumer.reader.read_batch(records);
+            }
+            dropped_total = consumer.reader.dropped();
+        }
+        // Deliver an already-read batch even if unregister raced with the read.
+        // Loss-only delivery retains prefix loss after every queued row was lapped.
+        if (!batch.empty() || dropped_total != reported_dropped) {
+            deliver_batch(batch, dropped_total);
+        }
+        if (prefix_complete) {
             break;
         }
-        if (!batch.empty()) {
-            deliver_batch(batch, dropped_total);
-        } else if (stop_mode == ConsumerStopMode::DrainThenStop) {
-            break;
-        } else {
+        if (batch.empty()) {
             TTZoneScopedDN(RT_PROFILER, "Wait");
             consumer.reader.wait(token);
         }
@@ -1168,8 +1193,16 @@ void RealtimeProfilerManager::run_consumer(Consumer& consumer) {
     consumer.dropped = consumer.reader.dropped();
 }
 
-void RealtimeProfilerManager::stop_consumer(Consumer& consumer, ConsumerStopMode stop_mode) {
-    consumer.stop_mode.store(stop_mode, std::memory_order_release);
+void RealtimeProfilerManager::stop_consumer(Consumer& consumer, tt::RealtimeProfilerCallbackStopMode stop_mode) {
+    {
+        // Serialize the snapshot with reads: every already-read batch is inside
+        // this boundary, and subsequent reads cannot enter a later publication.
+        std::lock_guard lock(consumer.read_mutex);
+        consumer.stop_mode = stop_mode;
+        if (stop_mode == tt::RealtimeProfilerCallbackStopMode::DrainPublishedPrefix) {
+            consumer.stop_prefix = consumer.reader.published_prefix();
+        }
+    }
     ring_->writer().wake_readers();
     if (consumer.thread.joinable()) {
         consumer.thread.join();
@@ -1179,17 +1212,24 @@ void RealtimeProfilerManager::stop_consumer(Consumer& consumer, ConsumerStopMode
 void RealtimeProfilerManager::on_callback_registered(
     tt::ProgramRealtimeProfilerCallbackHandle handle, const tt::ProgramRealtimeProfilerCallback& callback) {
     auto consumer = std::make_unique<Consumer>(ring_->make_reader(), callback, handle);
-    Consumer* raw = consumer.get();
     std::lock_guard<std::mutex> lock(consumers_mutex_);
     const auto caller = std::this_thread::get_id();
     const bool from_callback_thread =
         std::ranges::any_of(consumers_, [caller](const auto& kv) { return kv.second->thread.get_id() == caller; });
     TT_FATAL(!from_callback_thread, "A real-time profiler callback must not register callbacks");
-    consumers_.emplace(handle, std::move(consumer));
-    raw->thread = std::thread([this, raw]() { run_consumer(*raw); });
+    auto [position, inserted] = consumers_.emplace(handle, std::move(consumer));
+    TT_FATAL(inserted, "A real-time profiler callback handle must be unique");
+    Consumer* raw = position->second.get();
+    try {
+        raw->thread = std::thread([this, raw]() { run_consumer(*raw); });
+    } catch (...) {
+        consumers_.erase(position);
+        throw;
+    }
 }
 
-void RealtimeProfilerManager::on_callback_unregistered(tt::ProgramRealtimeProfilerCallbackHandle handle) {
+void RealtimeProfilerManager::on_callback_unregistered(
+    tt::ProgramRealtimeProfilerCallbackHandle handle, tt::RealtimeProfilerCallbackStopMode mode) {
     std::unique_ptr<Consumer> consumer;
     {
         std::lock_guard<std::mutex> lock(consumers_mutex_);
@@ -1204,7 +1244,7 @@ void RealtimeProfilerManager::on_callback_unregistered(tt::ProgramRealtimeProfil
         consumer = std::move(it->second);
         consumers_.erase(it);
     }
-    stop_consumer(*consumer, ConsumerStopMode::StopWithoutDrain);
+    stop_consumer(*consumer, mode);
     const uint64_t dropped = consumer->dropped;
     if (dropped > 0) {
         log_warning(tt::LogMetal, "[Real-time profiler] Callback {} dropped {} record(s)", handle, dropped);
@@ -1338,7 +1378,7 @@ void RealtimeProfilerManager::shutdown() {
     {
         std::lock_guard<std::mutex> lock(consumers_mutex_);
         for (auto& [handle, consumer] : consumers_) {
-            stop_consumer(*consumer, ConsumerStopMode::DrainThenStop);
+            stop_consumer(*consumer, tt::RealtimeProfilerCallbackStopMode::DrainPublishedPrefix);
         }
         consumers_.clear();
     }

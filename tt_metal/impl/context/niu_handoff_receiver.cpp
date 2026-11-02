@@ -691,6 +691,92 @@ bool NiuHandoffReceiver::closed_selector(
     return counters.outstanding == 0 && counters.outgoing == 0;
 }
 
+std::optional<NiuHandoffExpectedExecution> NiuHandoffJournal::prepare_request(
+    const NiuHandoffObservation& observation, uint64_t boot_cookie, uint64_t invocation_id, bool has_source) {
+    std::optional<NiuHandoffExpectedExecution> next;
+    if (state_ == State::Initial) {
+        next = NiuHandoffReceiver::initial_execution(observation, boot_cookie, invocation_id, has_source);
+        if (!next) {
+            return std::nullopt;
+        }
+    } else {
+        if (state_ != State::Clean || !expected_ || !predecessor_) {
+            return std::nullopt;
+        }
+        const auto& previous = expected_->request;
+        const uint64_t original_boot = uint64_t(previous.boot_cookie_lo) | (uint64_t(previous.boot_cookie_hi) << 32);
+        const uint64_t previous_challenge = uint64_t(previous.challenge_lo) | (uint64_t(previous.challenge_hi) << 32);
+        const uint64_t previous_invocation =
+            uint64_t(previous.invocation_id_lo) | (uint64_t(previous.invocation_id_hi) << 32);
+        // A new expected request comes only from this retained host journal.
+        // Receipt echo cannot invent a missing history, and an unobserved GO
+        // or control publication cannot replace the original clean baseline.
+        if (boot_cookie != original_boot || !invocation_id || invocation_id == previous_invocation ||
+            previous_challenge == UINT64_MAX ||
+            std::memcmp(&observation.wire(), &predecessor_->wire(), sizeof(tt_niu_handoff_region)) != 0 ||
+            previous.request_generation == UINT32_MAX || previous.group_generation == UINT32_MAX ||
+            previous.first_go_sequence > UINT32_MAX - previous.final_go_count ||
+            predecessor_->wire().receipt.header.publish_sequence > UINT32_MAX - 4) {
+            return std::nullopt;
+        }
+        next = *expected_;
+        auto& request = next->request;
+        ++request.request_generation;
+        ++request.group_generation;
+        const auto challenge = previous_challenge + 1;
+        request.challenge_lo = static_cast<uint32_t>(challenge);
+        request.challenge_hi = static_cast<uint32_t>(challenge >> 32);
+        request.invocation_id_lo = static_cast<uint32_t>(invocation_id);
+        request.invocation_id_hi = static_cast<uint32_t>(invocation_id >> 32);
+        request.first_go_sequence += previous.final_go_count;
+        // The current actual issue inventory is one non-reload GO per Worker.
+        // Multi-GO, reload and ordered groups retain their separate rejection.
+        request.final_go_count = next->completed_stage_count = 1;
+        next->source_valid_noc_mask = has_source ? all_nocs : 0;
+    }
+    expected_ = next;
+    predecessor_ = observation;
+    state_ = State::Prepared;
+    return next;
+}
+
+bool NiuHandoffJournal::matches_request(const NiuHandoffExpectedExecution& expected) const {
+    return state_ == State::Prepared && expected_ &&
+           std::memcmp(&expected_->request, &expected.request, sizeof(tt_niu_handoff_request)) == 0 &&
+           expected_->completed_stage_count == expected.completed_stage_count &&
+           expected_->source_valid_noc_mask == expected.source_valid_noc_mask;
+}
+
+bool NiuHandoffJournal::record_clean(
+    const NiuHandoffObservation& observation,
+    const NiuHandoffExpectedExecution& expected,
+    const SelectorMasks& selectors) {
+    if (!matches_request(expected) || !predecessor_ ||
+        observation.wire().receipt.header.publish_sequence <= predecessor_->wire().receipt.header.publish_sequence ||
+        NiuHandoffReceiver::check(observation, expected) != NiuHandoffCheck::Match) {
+        return false;
+    }
+    // The full wire selector namespace does not mean that this allocation
+    // leased every selector. Only its actual original inventory must be clean;
+    // a legitimate multicast tail may retain an unleased selector counter.
+    for (unsigned noc = 0; noc != TT_NIU_HANDOFF_NOC_COUNT; ++noc) {
+        if (!selectors[noc]) {
+            return false;
+        }
+        for (unsigned selector = 0; selector != TT_NIU_HANDOFF_SELECTOR_COUNT; ++selector) {
+            if ((selectors[noc] & (uint16_t{1} << selector)) &&
+                !NiuHandoffReceiver::closed_selector(observation, expected, noc, selector)) {
+                return false;
+            }
+        }
+    }
+    predecessor_ = observation;
+    state_ = State::Clean;
+    return true;
+}
+
+void NiuHandoffJournal::quarantine() noexcept { state_ = State::Quarantined; }
+
 NiuHandoffCheck NiuHandoffReceiver::check(
     const NiuHandoffObservation& observation, const NiuHandoffExpectedExecution& expected) {
     const auto& region = observation.wire();

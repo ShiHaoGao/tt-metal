@@ -6,10 +6,12 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <umd/device/types/arch.hpp>
 #include <umd/device/utils/semver.hpp>
 
 namespace tt::tt_metal::native_firmware_bundle {
 struct DeploymentInputFacts {
+    tt::ARCH architecture = tt::ARCH::Invalid;
     std::string profile;
     int32_t device_id;
     tt::umd::FirmwareBundleVersion firmware_bundle;
@@ -31,4 +33,4 @@ struct DeploymentInputFacts {
 };
 DeploymentInputFacts parse_deployment_input(std::string_view contents);
 void require_program_record(std::span<const std::byte> expected, std::span<const std::byte> actual);
-}
+}  // namespace tt::tt_metal::native_firmware_bundle

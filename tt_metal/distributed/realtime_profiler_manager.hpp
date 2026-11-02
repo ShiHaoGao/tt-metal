@@ -124,8 +124,6 @@ private:
 
     using RecordRing = BroadcastRing<tt::ProgramRealtimeRecord>;
 
-    enum class ConsumerStopMode : uint8_t { Running, StopWithoutDrain, DrainThenStop };
-
     struct Consumer {
         Consumer(
             RecordRing::Reader reader,
@@ -135,16 +133,19 @@ private:
         RecordRing::Reader reader;
         tt::ProgramRealtimeProfilerCallback callback;
         tt::ProgramRealtimeProfilerCallbackHandle handle;
-        std::atomic<ConsumerStopMode> stop_mode{ConsumerStopMode::Running};
+        std::mutex read_mutex;
+        std::optional<tt::RealtimeProfilerCallbackStopMode> stop_mode;
+        std::optional<RecordRing::Reader::PublishedPrefix> stop_prefix;
         uint64_t dropped = 0;
         std::thread thread;
     };
 
     void run_consumer(Consumer& consumer);
-    void stop_consumer(Consumer& consumer, ConsumerStopMode stop_mode);
+    void stop_consumer(Consumer& consumer, tt::RealtimeProfilerCallbackStopMode stop_mode);
     void on_callback_registered(
         tt::ProgramRealtimeProfilerCallbackHandle handle, const tt::ProgramRealtimeProfilerCallback& callback) override;
-    void on_callback_unregistered(tt::ProgramRealtimeProfilerCallbackHandle handle) override;
+    void on_callback_unregistered(
+        tt::ProgramRealtimeProfilerCallbackHandle handle, tt::RealtimeProfilerCallbackStopMode mode) override;
 
     // Receiver thread entry point: drain every device socket, advance the finish-sync handshake, and
     // publish decoded records to the ring for consumer threads to read.

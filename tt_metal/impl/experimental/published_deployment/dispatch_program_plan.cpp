@@ -29,43 +29,42 @@ template<class T> bool equal_record(const T& a, const T& b) {
 template<class T> std::vector<std::byte> bytes_of(const T& value) {
     static_assert(std::is_trivially_copyable_v<T>);
     static_assert(std::endian::native == std::endian::little);
-    std::vector<std::byte> bytes(sizeof(value)); std::memcpy(bytes.data(), &value, sizeof(value)); return bytes;
+    std::vector<std::byte> bytes(sizeof(value));
+    std::memcpy(bytes.data(), &value, sizeof(value));
+    return bytes;
+}
+const DispatchPlacedNode& node(const DispatchTopologyFacts& t, DispatchWorkerType role) {
+    auto at = std::ranges::find(t.nodes, role, &DispatchPlacedNode::role);
+    require(at != t.nodes.end(), Reject::Topology, "missing dispatch role");
+    return *at;
 }
 const DispatchPlacedNode& node(const DispatchProgramInputs& i, DispatchWorkerType role) {
-    auto at = std::ranges::find(i.topology.nodes, role, &DispatchPlacedNode::role);
-    require(at != i.topology.nodes.end(), Reject::Topology, "missing dispatch role"); return *at;
+    return node(i.topology, role);
+}
+DispatchProgramFamily family(tt::ARCH architecture) {
+    switch (architecture) {
+        case tt::ARCH::BLACKHOLE:
+            return DispatchProgramFamily::BlackholeSingleMmioWorkerOneCq;
+        case tt::ARCH::WORMHOLE_B0:
+            return DispatchProgramFamily::WormholeSingleMmioWorkerOneCq;
+        default:
+            fail(Reject::Architecture, "unsupported dispatch architecture");
+    }
 }
 void validate(const DispatchProgramInputs& i) {
-    const auto& t = i.topology;
-    require(t.arch == tt::ARCH::BLACKHOLE, Reject::Architecture, "dispatch family requires Blackhole");
-    require(t.mmio && !t.galaxy && !t.fabric && !t.mock && t.core_type == CoreType::WORKER &&
-        t.num_hw_cqs == 1 && t.subordinate_enabled && !t.distributed_dispatcher &&
-        t.deployment_devices == std::vector<ChipId>{t.device} && t.serviced_devices == std::vector<ChipId>{t.device} &&
-        t.nodes.size() == 3, Reject::Topology, "unsupported dispatch topology family");
-    require(!i.observation.device_print_enabled && !i.observation.watcher_enabled && !i.observation.watcher_noinline,
-        Reject::Observation, "unsupported dispatch instrumentation");
-    const auto& p = node(i, PREFETCH_HD); const auto& d = node(i, DISPATCH_HD); const auto& s = node(i, DISPATCH_S);
-    std::set<uint32_t> ids;
-    for (const auto& n : t.nodes) {
-        require(n.id != NoDispatchNode && ids.insert(n.id).second && n.device == t.device &&
-            n.servicing_device == t.device && n.cq == 0 && n.tunnel_index == -1,
-            Reject::Topology, "foreign, duplicate or tunneled dispatch node");
-    }
-    auto same_ids = [](auto a, auto b) { std::ranges::sort(a); std::ranges::sort(b); return a == b; };
-    require(p.upstream.empty() && same_ids(p.downstream, std::vector{s.id, d.id}) &&
-        d.upstream == std::vector{p.id} && d.downstream == std::vector{s.id} &&
-        s.upstream == std::vector{p.id} && s.downstream == std::vector{d.id},
-        Reject::Topology, "dispatch graph does not match the supported family");
-    require(equal_record(p.nocs, noc_selection_t{NOC_0, NOC_0, NOC_0}) &&
-        equal_record(d.nocs, noc_selection_t{NOC_0, NOC_1, NOC_0}) &&
-        equal_record(s.nocs, noc_selection_t{NOC_1, NOC_1, NOC_1}),
-        Reject::Placement, "dispatch NoC allocation differs from supported family");
-    require(equal_record(d.core, s.core) && equal_record(d.core, t.completion_writer) && p.core.logical != d.core.logical &&
-        p.core.virtual_core != d.core.virtual_core && t.unused_core.logical == CoreCoord{0, 0} &&
+    (void)dispatch_program_family(i.topology);
+    require(
+        !i.observation.device_print_enabled && !i.observation.watcher_enabled && !i.observation.watcher_noinline,
+        Reject::Observation,
+        "unsupported dispatch instrumentation");
+    require(
         i.workers.count && i.workers.virtual_eth_cores >= i.workers.physical_eth_cores,
-        Reject::Placement, "invalid dispatch placement or worker facts");
-    require(i.queue.inputs.num_hw_cqs == 1 && i.queue.plan.queues.size() == 1 &&
-        i.queue.plan.queues.front().id == 0, Reject::Queue, "dispatch queue count mismatch");
+        Reject::Placement,
+        "invalid dispatch worker facts");
+    require(
+        i.queue.inputs.num_hw_cqs == 1 && i.queue.plan.queues.size() == 1 && i.queue.plan.queues.front().id == 0,
+        Reject::Queue,
+        "dispatch queue count mismatch");
     try {
         require(equal_record(plan_system_memory_queues(i.queue.inputs), i.queue.plan), Reject::Queue,
             "dispatch queue differs from the owning queue plan");
@@ -102,6 +101,50 @@ relay_mux_client_config inactive_fabric() {
 }
 } // namespace
 
+DispatchProgramFamily dispatch_program_family(const DispatchTopologyFacts& t) {
+    const auto selected = family(t.arch);
+    require(
+        t.mmio && !t.galaxy && !t.fabric && !t.mock && t.core_type == CoreType::WORKER && t.num_hw_cqs == 1 &&
+            t.subordinate_enabled && !t.distributed_dispatcher &&
+            t.deployment_devices == std::vector<ChipId>{t.device} &&
+            t.serviced_devices == std::vector<ChipId>{t.device} && t.nodes.size() == 3,
+        Reject::Topology,
+        "unsupported dispatch topology family");
+    const auto& p = node(t, PREFETCH_HD);
+    const auto& d = node(t, DISPATCH_HD);
+    const auto& s = node(t, DISPATCH_S);
+    std::set<uint32_t> ids;
+    for (const auto& n : t.nodes) {
+        require(
+            n.id != NoDispatchNode && ids.insert(n.id).second && n.device == t.device &&
+                n.servicing_device == t.device && n.cq == 0 && n.tunnel_index == -1,
+            Reject::Topology,
+            "foreign, duplicate or tunneled dispatch node");
+    }
+    auto same_ids = [](auto a, auto b) {
+        std::ranges::sort(a);
+        std::ranges::sort(b);
+        return a == b;
+    };
+    require(
+        p.upstream.empty() && same_ids(p.downstream, std::vector{s.id, d.id}) && d.upstream == std::vector{p.id} &&
+            d.downstream == std::vector{s.id} && s.upstream == std::vector{p.id} && s.downstream == std::vector{d.id},
+        Reject::Topology,
+        "dispatch graph does not match the supported family");
+    require(
+        equal_record(p.nocs, noc_selection_t{NOC_0, NOC_0, NOC_0}) &&
+            equal_record(d.nocs, noc_selection_t{NOC_0, NOC_1, NOC_0}) &&
+            equal_record(s.nocs, noc_selection_t{NOC_1, NOC_1, NOC_1}),
+        Reject::Placement,
+        "dispatch NoC allocation differs from supported family");
+    require(
+        equal_record(d.core, s.core) && equal_record(d.core, t.completion_writer) && p.core.logical != d.core.logical &&
+            p.core.virtual_core != d.core.virtual_core && t.unused_core.logical == CoreCoord{0, 0},
+        Reject::Placement,
+        "invalid dispatch placement");
+    return selected;
+}
+
 struct DispatchProgramPlan::Storage {
     DispatchProgramInputs inputs;
     std::vector<DispatchKernelConfiguration> nodes;
@@ -113,9 +156,17 @@ struct DispatchProgramPlan::Storage {
     std::vector<std::byte> canonical;
 };
 DispatchProgramPlan::DispatchProgramPlan(std::shared_ptr<const Storage> storage) : storage_(std::move(storage)) {}
-DispatchProgramFamily DispatchProgramPlan::family() const { return DispatchProgramFamily::BlackholeSingleMmioWorkerOneCq; }
+DispatchProgramFamily DispatchProgramPlan::family() const {
+    return experimental::family(storage_->inputs.topology.arch);
+}
 const DispatchProgramInputs& DispatchProgramPlan::inputs() const { return storage_->inputs; }
 ChipId DispatchProgramPlan::device_id() const { return storage_->inputs.topology.device; }
+void DispatchProgramPlan::validate_target(tt::ARCH architecture, ChipId device) const {
+    require(
+        device == device_id() && architecture == storage_->inputs.topology.arch,
+        Reject::Placement,
+        "dispatch initialization device mismatch");
+}
 std::span<const DispatchKernelConfiguration> DispatchProgramPlan::dispatch_nodes() const { return storage_->nodes; }
 std::span<const DispatchPlan> DispatchProgramPlan::kernel_plans() const { return storage_->kernels; }
 std::span<const DispatchSemaphorePlan> DispatchProgramPlan::semaphores() const { return storage_->semaphores; }
@@ -306,7 +357,7 @@ DispatchProgramPlan plan_dispatch_program(const DispatchProgramInputs& input) {
         }
     }
     deployment_detail::RecordWriter record;
-    record.append(uint32_t{1}); record.append(DispatchProgramFamily::BlackholeSingleMmioWorkerOneCq);
+    record.append(uint32_t{1}); record.append(family(input.topology.arch));
     record.append(owner->inputs); record.append(owner->nodes); record.append(owner->semaphores);
     record.append(owner->arguments); record.append(owner->initialization); record.append(owner->registrations);
     owner->canonical = std::move(record.bytes);

@@ -570,6 +570,19 @@ bool NiuAdmission::quarantine_locked(const Guard& guard, const Token& token, std
         std::string ignored;
         binding.boot.ledger->quarantine(binding.token, ignored);
     }
+    for (const auto& niu : record->nius) {
+        const auto binding = record->bindings.find(niu.chip);
+        if (binding == record->bindings.end()) {
+            continue;
+        }
+        // A stale token can quarantine only its retained original boot, never
+        // a new boot that happens to reuse the same physical chip/Worker.
+        auto& workers = *binding->second.boot.handoffs;
+        const auto worker = workers.find(niu.physical_worker);
+        if (worker != workers.end()) {
+            worker->second.journal.quarantine();
+        }
+    }
     record->state = State::Quarantined;
     error.clear();
     return true;
@@ -697,6 +710,16 @@ bool NiuAdmission::validate_stopped_managed_locked(
            validate_bindings_locked(*record, detail::NiuLedger::State::Stopped, error);
 }
 
+bool NiuAdmission::validate_worker_clean_locked(
+    const Guard& guard, const WorkerHandoff& worker, std::string& error) const {
+    validate_guard(guard);
+    if (!worker.clean) {
+        return detail::reject(error, "Worker request journal has no original clean terminal");
+    }
+    return validate_clean_terminal_locked(
+        guard, *worker.clean, worker.clean->token_, worker.clean->boots_, worker.clean->epochs_, error);
+}
+
 void NiuAdmission::publish_boots_locked(const FirmwareSet& firmware, const LedgerSet& ledgers) {
     quarantine_abandoned_locked();
     if (firmware.size() != ledgers.size()) throw std::runtime_error("NIU boot ledger set is incomplete");
@@ -705,7 +728,7 @@ void NiuAdmission::publish_boots_locked(const FirmwareSet& firmware, const Ledge
         auto ledger = ledgers.find(chip);
         if (!boot || !boot->live() || ledger == ledgers.end() || !ledger->second || boots_.contains(chip))
             throw std::runtime_error("NIU publication requires fresh actual firmware boots");
-        pending_boots.emplace(chip, BootState{boot, ledger->second});
+        pending_boots.emplace(chip, BootState{boot, ledger->second, std::make_shared<WorkerHandoffs>()});
     }
 
     std::map<uint64_t, std::map<ChipId, Binding>> pending_bindings;
@@ -782,6 +805,11 @@ NiuAdmission::Retirement::~Retirement() { release(); }
 void NiuAdmission::Retirement::release() noexcept {
     // Resource destructors may acquire Device/allocator locks or reenter
     // admission. Reopen stays blocked until those destructors have finished.
+    // Both normal and batched retirement already retain the original detached
+    // executions. Release their payload owners here, including allocation
+    // pins, rather than waiting for invocation/observation handles to die.
+    if (single_execution) single_execution->release_payload_bindings();
+    for (const auto& execution : executions) execution->release_payload_bindings();
     single_programs.clear();
     programs.clear();
     single_workloads.clear();

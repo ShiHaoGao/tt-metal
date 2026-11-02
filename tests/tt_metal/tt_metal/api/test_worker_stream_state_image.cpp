@@ -286,11 +286,11 @@ TEST_F(WorkerImageCache, CPU_ConcurrentFailedPublisherReleasesWaitersAndAllowsRe
 
 namespace tt::tt_metal {
 namespace {
-class WorkerFirmwarePhase : public ::testing::Test {
+class WorkerFirmwarePhase : public ::testing::TestWithParam<tt::ARCH> {
 protected:
     void SetUp() override {
         slow_dispatch.emplace();
-        experimental::configure_mock_mode(tt::ARCH::BLACKHOLE, 1);
+        experimental::configure_mock_mode(GetParam(), 1);
         auto& context = MetalContext::instance(DEFAULT_CONTEXT_ID, DeviceProfilerMode::Disabled);
         context.initialize({}, 1, {}, 0, true);
         descriptor = std::make_shared<ContextDescriptor>(
@@ -312,7 +312,7 @@ protected:
     std::unique_ptr<RiscFirmwareInitializer> initializer;
 };
 
-TEST_F(WorkerFirmwarePhase, CPU_RebuildWithdrawsPriorCompletedPhaseBeforeLaunch) {
+TEST_P(WorkerFirmwarePhase, CPU_RebuildWithdrawsPriorCompletedPhaseBeforeLaunch) {
     // Real phase API with a mock platform: lifecycle completion is observable,
     // but no actual firmware was loaded and no boot provider may be minted.
     initializer->run_launch_phase({0});
@@ -326,7 +326,7 @@ TEST_F(WorkerFirmwarePhase, CPU_RebuildWithdrawsPriorCompletedPhaseBeforeLaunch)
     EXPECT_FALSE(initializer->worker_stream_state_provider(0));
 }
 
-TEST_F(WorkerFirmwarePhase, CPU_RealAsyncBuildFailureCannotRetainCompletedPhase) {
+TEST_P(WorkerFirmwarePhase, CPU_RealAsyncBuildFailureCannotRetainCompletedPhase) {
     initializer->run_launch_phase({0});
     ASSERT_TRUE(initializer->is_initialized());
     // This uses the real async build path and UMD mock chip lookup. Its missing
@@ -344,7 +344,7 @@ TEST_F(WorkerFirmwarePhase, CPU_RealAsyncBuildFailureCannotRetainCompletedPhase)
     EXPECT_FALSE(initializer->worker_stream_state_provider(missing));
 }
 
-TEST_F(WorkerFirmwarePhase, CPU_MockAndTeardownNeverAdvertiseBootReceipt) {
+TEST_P(WorkerFirmwarePhase, CPU_MockAndTeardownNeverAdvertiseBootReceipt) {
     initializer->run_launch_phase({0});
     ASSERT_TRUE(initializer->is_initialized());
     EXPECT_FALSE(initializer->worker_stream_state_provider(0));
@@ -353,5 +353,9 @@ TEST_F(WorkerFirmwarePhase, CPU_MockAndTeardownNeverAdvertiseBootReceipt) {
     EXPECT_FALSE(initializer->is_initialized());
     EXPECT_FALSE(initializer->worker_stream_state_provider(0));
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    SupportedArchitectures, WorkerFirmwarePhase,
+    ::testing::Values(tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0));
 }  // namespace
 }  // namespace tt::tt_metal

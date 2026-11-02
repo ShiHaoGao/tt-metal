@@ -10,7 +10,10 @@
 #include <stdexcept>
 
 namespace tt::tt_metal::experimental {
-enum class DispatchProgramFamily : uint8_t { BlackholeSingleMmioWorkerOneCq };
+enum class DispatchProgramFamily : uint8_t {
+    BlackholeSingleMmioWorkerOneCq,
+    WormholeSingleMmioWorkerOneCq
+};
 enum class DispatchProgramReject : uint8_t {
     Architecture, Topology, Placement, Observation, Queue, MemoryMap, Semaphore, Overflow
 };
@@ -54,8 +57,10 @@ struct DispatchTopologyFacts {
     bool distributed_dispatcher;
     std::vector<DispatchPlacedNode> nodes; // Actual static-configuration traversal order.
     DispatchCorePlacement completion_writer;
-    DispatchCorePlacement unused_core; // Existing SDK logical (0, 0) sentinel projection.
+    DispatchCorePlacement unused_core;  // Existing SDK logical (0, 0) sentinel projection.
 };
+// Shared family admission for offline planning and actual live topology capture.
+DispatchProgramFamily dispatch_program_family(const DispatchTopologyFacts&);
 struct DispatchWorkerFacts {
     uint32_t count;
     std::array<uint32_t, 2> multicast;
@@ -168,6 +173,8 @@ public:
     DispatchProgramFamily family() const;
     const DispatchProgramInputs& inputs() const;
     ChipId device_id() const;
+    // Validate the actual write target before applying this immutable plan.
+    void validate_target(tt::ARCH architecture, ChipId device) const;
     std::span<const DispatchKernelConfiguration> dispatch_nodes() const;
     std::span<const DispatchPlan> kernel_plans() const;
     std::span<const DispatchSemaphorePlan> semaphores() const;

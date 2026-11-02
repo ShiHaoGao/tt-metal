@@ -34,8 +34,8 @@ struct ProgramRealtimeRecord {
 };
 
 struct ProgramRealtimeRecordBatch {
-    std::span<const ProgramRealtimeRecord> records;  // Non-empty, oldest first; valid
-                                                     // until the callback returns.
+    std::span<const ProgramRealtimeRecord> records;  // Oldest first; valid until the callback returns.
+                                                     // May be empty when reporting dropped records.
     uint64_t dropped;                                // Records lost since this callback last ran; nonzero if the
                                                      // callback could not keep up with incoming profiler data.
 };
@@ -57,6 +57,7 @@ using ProgramRealtimeProfilerCallbackHandle = uint64_t;
  *
  * Return value: ProgramRealtimeProfilerCallbackHandle - handle that can be passed to
  *               UnregisterProgramRealtimeProfilerCallback to remove the callback.
+ * Registration is transactional: setup failure leaves no registered callback.
  */
 // clang-format on
 ProgramRealtimeProfilerCallbackHandle RegisterProgramRealtimeProfilerCallback(ProgramRealtimeProfilerCallback callback);
@@ -64,7 +65,13 @@ ProgramRealtimeProfilerCallbackHandle RegisterProgramRealtimeProfilerCallback(Pr
 /**
  * Unregister a previously registered callback by its handle.
  *
- * This call blocks until any in-flight invocation of that callback has completed.
+ * Captures each listener's fully published host-ring prefix, delivers queued
+ * records or reports their loss through that boundary, and joins the callback
+ * thread. Already-read batches are delivered before returning. Writers may
+ * continue publishing; this call does not wait for those later records.
+ *
+ * This is host callback drainage only. It neither establishes device completion
+ * nor guarantees delivery of records not yet published to the host ring.
  */
 void UnregisterProgramRealtimeProfilerCallback(ProgramRealtimeProfilerCallbackHandle handle);
 

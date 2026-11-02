@@ -54,13 +54,92 @@ void rejects(const DispatchProgramInputs& i, DispatchProgramReject reason) {
     try { (void)plan_dispatch_program(i); FAIL() << "accepted invalid input"; }
     catch (const DispatchProgramError& e) { EXPECT_EQ(e.reason(), reason) << e.what(); }
 }
+TEST(DispatchProgramPlan, LiveFamilyAdmissionUsesTheSameBlackholeAndWormholeTopology) {
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        auto i = inputs();
+        i.topology.arch = architecture;
+        const auto expected = architecture == tt::ARCH::BLACKHOLE
+                                  ? DispatchProgramFamily::BlackholeSingleMmioWorkerOneCq
+                                  : DispatchProgramFamily::WormholeSingleMmioWorkerOneCq;
+        try {
+            EXPECT_EQ(dispatch_program_family(i.topology), expected);
+        } catch (const DispatchProgramError& error) {
+            FAIL() << error.what();
+        }
+        EXPECT_EQ(plan_dispatch_program(i).family(), expected);
+    }
+}
+TEST(DispatchProgramPlan, LiveFamilyAdmissionRejectsUnknownArchitectureAndForeignShape) {
+    auto reject = [](const DispatchTopologyFacts& topology, DispatchProgramReject reason) {
+        try {
+            (void)dispatch_program_family(topology);
+            FAIL() << "accepted invalid live topology";
+        } catch (const DispatchProgramError& error) {
+            EXPECT_EQ(error.reason(), reason);
+        }
+    };
+    auto i = inputs();
+    i.topology.arch = tt::ARCH::Invalid;
+    reject(i.topology, DispatchProgramReject::Architecture);
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        i = inputs();
+        i.topology.arch = architecture;
+        i.topology.serviced_devices.push_back(8);
+        reject(i.topology, DispatchProgramReject::Topology);
+        i = inputs();
+        i.topology.arch = architecture;
+        i.topology.num_hw_cqs = 2;
+        reject(i.topology, DispatchProgramReject::Topology);
+        i = inputs();
+        i.topology.arch = architecture;
+        i.topology.nodes[0].device = 8;
+        reject(i.topology, DispatchProgramReject::Topology);
+        i = inputs();
+        i.topology.arch = architecture;
+        i.topology.nodes.pop_back();
+        reject(i.topology, DispatchProgramReject::Topology);
+        i = inputs();
+        i.topology.arch = architecture;
+        i.topology.core_type = CoreType::ETH;
+        reject(i.topology, DispatchProgramReject::Topology);
+    }
+}
+TEST(DispatchProgramPlan, InitializationRequiresTheActualPlanArchitectureAndDevice) {
+    for (const auto architecture : {tt::ARCH::BLACKHOLE, tt::ARCH::WORMHOLE_B0}) {
+        auto i = inputs();
+        i.topology.arch = architecture;
+        const auto plan = plan_dispatch_program(i);
+        try {
+            plan.validate_target(architecture, 7);
+        } catch (const DispatchProgramError& error) {
+            FAIL() << error.what();
+        }
+        for (const auto foreign :
+             {tt::ARCH::Invalid, architecture == tt::ARCH::BLACKHOLE ? tt::ARCH::WORMHOLE_B0 : tt::ARCH::BLACKHOLE}) {
+            try {
+                plan.validate_target(foreign, 7);
+                FAIL() << "accepted foreign initialization architecture";
+            } catch (const DispatchProgramError& error) {
+                EXPECT_EQ(error.reason(), DispatchProgramReject::Placement);
+            }
+        }
+        try {
+            plan.validate_target(architecture, 8);
+            FAIL() << "accepted foreign initialization device";
+        } catch (const DispatchProgramError& error) {
+            EXPECT_EQ(error.reason(), DispatchProgramReject::Placement);
+        }
+    }
+}
 TEST(DispatchProgramPlan, PreservesActualGraphPlacementAndEveryProcessor) {
     ASSERT_FALSE(MetalContext::instance_exists());
-    auto i = inputs(); auto p = plan_dispatch_program(i);
+    auto i = inputs();
+    auto p = plan_dispatch_program(i);
     ASSERT_EQ(p.dispatch_nodes().size(), 3u);
     ASSERT_EQ(p.kernel_plans().size(), 3u);
     for (const auto& n : p.dispatch_nodes()) {
-        EXPECT_EQ(n.device_id, 7u); EXPECT_EQ(n.resolved->worker_count, 120u);
+        EXPECT_EQ(n.device_id, 7u);
+        EXPECT_EQ(n.resolved->worker_count, 120u);
         EXPECT_NO_THROW(validate_published_dispatch_configuration(n));
     }
     const auto& subordinate = p.kernel_plans()[2];
@@ -68,6 +147,35 @@ TEST(DispatchProgramPlan, PreservesActualGraphPlacementAndEveryProcessor) {
     EXPECT_EQ(subordinate.kernels[1].processors.size(), 3u);
     EXPECT_EQ(subordinate.configuration.logical_core, CoreCoord(2, 1));
     EXPECT_EQ(p.core_registrations().size(), 2u);
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+TEST(DispatchProgramPlan, WormholeUsesItsOwnFamilyAndActualHalMemoryFacts) {
+    ASSERT_FALSE(MetalContext::instance_exists());
+    llrt::RunTimeOptions options{
+        llrt::RunTimeOptions::ExplicitBuildOptions{.root_dir = "/tmp"}};
+    options.set_enable_2_erisc_mode(false);
+    Hal hal{tt::ARCH::WORMHOLE_B0, true, false, 0, false, false, false, false};
+    DispatchMemMap memory{CoreType::WORKER, 1, hal, false, {false, 1}, options};
+    auto i = inputs();
+    i.topology.arch = tt::ARCH::WORMHOLE_B0;
+    i.hal = capture_dispatch_hal(hal);
+    i.memory = capture_dispatch_memory(memory, 0);
+    i.queue.inputs.cq_start =
+        memory.get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED);
+    i.queue.inputs.alignment = hal.get_alignment(HalMemType::HOST);
+    i.queue.plan = plan_system_memory_queues(i.queue.inputs);
+    const auto plan = plan_dispatch_program(i);
+    EXPECT_EQ(plan.family(), DispatchProgramFamily::WormholeSingleMmioWorkerOneCq);
+    EXPECT_EQ(plan.inputs().topology.arch, tt::ARCH::WORMHOLE_B0);
+    EXPECT_EQ(plan.inputs().hal.l1_size, hal.get_dev_size(
+        HalProgrammableCoreType::TENSIX, HalL1MemAddrType::BASE));
+    ASSERT_EQ(plan.dispatch_nodes().size(), 3u);
+    for (const auto& node : plan.dispatch_nodes())
+        EXPECT_NO_THROW(validate_published_dispatch_configuration(node));
+    EXPECT_FALSE(std::ranges::equal(
+        plan.canonical_record(), plan_dispatch_program(inputs()).canonical_record()));
+    i.topology.serviced_devices.push_back(8);
+    rejects(i, DispatchProgramReject::Topology);
     EXPECT_FALSE(MetalContext::instance_exists());
 }
 TEST(DispatchProgramPlan, AllocatesOneSharedCoreSemaphoreNamespaceAndPreservesTraversal) {
@@ -124,7 +232,7 @@ TEST(DispatchProgramPlan, OwnsInputAndIncludesInitRuntimeAndSemanticsInCanonical
     EXPECT_FALSE(std::ranges::equal(record, plan_dispatch_program(i).canonical_record()));
 }
 TEST(DispatchProgramPlan, RejectsUnsupportedFamiliesAndInvalidGraphs) {
-    auto i = inputs(); i.topology.arch = tt::ARCH::WORMHOLE_B0; rejects(i, DispatchProgramReject::Architecture);
+    auto i = inputs(); i.topology.arch = tt::ARCH::Invalid; rejects(i, DispatchProgramReject::Architecture);
     i = inputs(); i.topology.num_hw_cqs = 2; rejects(i, DispatchProgramReject::Topology);
     i = inputs(); i.topology.fabric = true; rejects(i, DispatchProgramReject::Topology);
     i = inputs(); i.topology.nodes.pop_back(); rejects(i, DispatchProgramReject::Topology);
@@ -182,7 +290,7 @@ TEST(DispatchProgramPlan, OfficialCatalogProducesExplicitOfflineCandidateWithout
     options.set_enable_2_erisc_mode(true);
     Hal hal{tt::ARCH::BLACKHOLE, false, true, 0, false, false, true, true};
     catalog::Input input{
-        TT_NATIVE_FIRMWARE_SDK_ROOT,
+        TT_NATIVE_FIRMWARE_SDK_ROOT, tt::ARCH::BLACKHOLE,
         {.noc_translation_enabled = true, .harvesting_masks = {.tensix_harvesting_mask = 1, .eth_harvesting_mask = 3, .pcie_harvesting_mask = 2}, .board_type = BoardType::P150},
         0, HostQueueBacking{0, DispatchSettings::MAX_HUGEPAGE_SIZE, false, false, std::nullopt}, {}};
     const auto output = catalog::make_input(input, hal, options);

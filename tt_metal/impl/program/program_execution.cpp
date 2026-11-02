@@ -48,6 +48,10 @@ ProgramExecution::PayloadBindings& ProgramExecution::PayloadBindings::operator=(
 ProgramExecution::PayloadBindings::~PayloadBindings() = default;
 ProgramExecution::PayloadBindings::PayloadBindings(std::unique_ptr<Storage> storage) : storage_(std::move(storage)) {}
 
+void ProgramExecution::release_payload_bindings() noexcept {
+    payload_bindings.reset();
+}
+
 namespace {
 struct PayloadCoverageKey {
     const ProgramImpl* program;
@@ -1568,21 +1572,33 @@ bool ProgramExecution::ManagedInvocation::retire_selectors() const {
             ResourceRetirementReception::Inventory::AllowEmpty) != ResourceRetirementReception::Status::Ready) {
         return false;
     }
-    for (const auto& selection : execution->managed->selections()) {
-        const auto observed = std::find_if(
-            execution->observed_handoffs.begin(), execution->observed_handoffs.end(), [&](const auto& observation) {
-                return observation.chip == selection.niu.chip &&
-                       observation.physical_worker == selection.niu.physical_worker;
-            });
-        if (observed == execution->observed_handoffs.end()) return false;
-        for (size_t selector = 0; selector != niu_selector_count; ++selector) {
-            if (selection.selectors.test(selector) &&
-                !NiuHandoffReceiver::closed_selector(
-                    observed->mailbox, execution->handoff_snapshot->expected.at(selection.niu.chip).at(
-                                           selection.niu.physical_worker),
-                    static_cast<uint8_t>(selection.niu.noc), static_cast<uint8_t>(selector)))
-                return false;
+    struct WorkerClean {
+        NiuAdmission::WorkerHandoff* owner;
+        NiuHandoffJournal journal;
+    };
+    std::vector<WorkerClean> clean_workers;
+    clean_workers.reserve(execution->observed_handoffs.size());
+    for (const auto& observed : execution->observed_handoffs) {
+        auto& workers = *admission->boots_.at(observed.chip).handoffs;
+        const auto worker = workers.find(observed.physical_worker);
+        if (worker == workers.end()) {
+            return false;
         }
+        NiuHandoffJournal::SelectorMasks selectors{};
+        for (const auto& selection : execution->managed->selections()) {
+            if (selection.niu.chip == observed.chip && selection.niu.physical_worker == observed.physical_worker) {
+                selectors[static_cast<unsigned>(selection.niu.noc)] |=
+                    static_cast<uint16_t>(selection.selectors.to_ulong());
+            }
+        }
+        auto journal = worker->second.journal;
+        if (!journal.record_clean(
+                observed.mailbox,
+                execution->handoff_snapshot->expected.at(observed.chip).at(observed.physical_worker),
+                selectors)) {
+            return false;
+        }
+        clean_workers.push_back({&worker->second, std::move(journal)});
     }
     // Freeze the original native-owner identities before selector retirement
     // changes either ledger. No allocation follows a successful clean commit.
@@ -1593,6 +1609,13 @@ bool ProgramExecution::ManagedInvocation::retire_selectors() const {
         guard, *execution->token, execution->boots, execution->handoff_snapshot->epochs, error);
     TT_FATAL(terminal->clean,
              "Managed selector clean reception lost its original stopped admission: {}", error);
+    // All journal validation and allocation preceded the actual clean commit.
+    // Only this private terminal lets a later live invocation reuse a Worker;
+    // the raw byte observation above never grants successor issue authority.
+    for (auto& worker : clean_workers) {
+        worker.owner->journal = std::move(worker.journal);
+        worker.owner->clean = terminal->clean;
+    }
     for (auto& group : execution->groups) group.state = GroupState::Clean;
     execution->native_backing_terminal = std::move(terminal);
     // Selector clean only mints the private native-retirement predecessor.
@@ -1719,6 +1742,23 @@ void ProgramExecution::validate_request_locked(
     const std::set<NiuKey> actual(record->nius.begin(), record->nius.end());
     TT_FATAL(actual.size() == record->nius.size() && actual == expected,
              "Managed handoff request changed its exact physical NIUs");
+    if (!snapshot.expected.empty()) {
+        for (const auto& [chip, workers] : footprint) {
+            const auto expected = snapshot.expected.find(chip);
+            TT_FATAL(
+                expected != snapshot.expected.end() && expected->second.size() == workers.size(),
+                "Managed handoff request lost its complete Worker journal");
+            const auto& journals = *admission.boots_.at(chip).handoffs;
+            for (const auto& worker : workers) {
+                const auto journal = journals.find(worker);
+                const auto request = expected->second.find(worker);
+                TT_FATAL(
+                    journal != journals.end() && request != expected->second.end() &&
+                        journal->second.journal.matches_request(request->second),
+                    "Managed handoff request lost its original retained Worker journal");
+            }
+        }
+    }
 }
 
 void ProgramExecution::prepare_handoff() {
@@ -1764,22 +1804,50 @@ void ProgramExecution::prepare_handoff() {
              "Managed handoff request resolved another context owner");
     const auto& cluster = context.get_cluster();
     const auto& hal = context.hal();
+    std::vector<HandoffObservation> predecessors;
     for (const auto& [chip, workers] : frozen->footprint) {
-        const auto& boot = frozen->boots.at(chip);
         for (const auto& worker : workers) {
             auto result = NiuHandoffReceiver::read(cluster, hal, chip, worker);
-            TT_FATAL(result.status == NiuHandoffReadStatus::Observed && result.observation,
-                     "Managed handoff request has no stable initial mailbox");
-            const auto sources = payload.find(chip);
-            auto expected = NiuHandoffReceiver::initial_execution(
-                *result.observation, boot->boot_cookie(), invocation_identity,
-                sources != payload.end() && sources->second.contains(worker));
-            TT_FATAL(expected, "Managed handoff requires an owned initial GO journal; prior control/GO is unsupported");
-            frozen->expected[chip].emplace(worker, *expected);
+            TT_FATAL(
+                result.status == NiuHandoffReadStatus::Observed && result.observation,
+                "Managed handoff request has no stable predecessor mailbox");
+            predecessors.push_back({chip, worker, std::move(*result.observation)});
         }
     }
     {
         auto guard = admission->lock();
+        validate_request_locked(*admission, guard, *frozen);
+        for (const auto& predecessor : predecessors) {
+            const auto chip = predecessor.chip;
+            const auto& worker = predecessor.physical_worker;
+            const auto& boot = frozen->boots.at(chip);
+            auto& journals = *admission->boots_.at(chip).handoffs;
+            const auto previous = journals.find(worker);
+            NiuHandoffJournal initial;
+            NiuHandoffJournal* journal = &initial;
+            if (previous != journals.end()) {
+                std::string error;
+                TT_FATAL(
+                    admission->validate_worker_clean_locked(guard, previous->second, error),
+                    "Managed handoff successor lost its original live clean terminal: {}",
+                    error);
+                journal = &previous->second.journal;
+            }
+            const auto sources = payload.find(chip);
+            auto expected = journal->prepare_request(
+                predecessor.mailbox,
+                boot->boot_cookie(),
+                invocation_identity,
+                sources != payload.end() && sources->second.contains(worker));
+            TT_FATAL(
+                expected,
+                "Managed handoff requires its actual boot initial state or retained clean Worker journal; "
+                "unreceived control/GO is unsupported");
+            if (previous == journals.end()) {
+                journals.emplace(worker, NiuAdmission::WorkerHandoff{std::move(initial), nullptr});
+            }
+            frozen->expected[chip].emplace(worker, *expected);
+        }
         validate_request_locked(*admission, guard, *frozen);
     }
     for (const auto& [chip, workers] : frozen->expected)
@@ -1836,7 +1904,10 @@ void ProgramExecution::validate_handoff_locked(
         TT_FATAL(journal != snapshot.expected.end() && journal->second.size() == workers.size(),
                  "Managed handoff observation lost its complete request journal");
         for (const auto& worker : workers)
-            TT_FATAL(journal->second.contains(worker), "Managed handoff observation lost a physical Worker request");
+            TT_FATAL(
+                journal->second.contains(worker) && admission.boots_.at(chip).handoffs->contains(worker) &&
+                    admission.boots_.at(chip).handoffs->at(worker).journal.matches_request(journal->second.at(worker)),
+                "Managed handoff observation lost its original physical Worker request journal");
     }
     const std::set<NiuKey> actual(record->nius.begin(), record->nius.end());
     TT_FATAL(

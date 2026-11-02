@@ -6,6 +6,7 @@
 #include "impl/program/program_impl.hpp"
 #include "impl/device/device_impl.hpp"
 #include <tt-metalium/program.hpp>
+#include <tt-metalium/host_api.hpp>
 #include <tt-metalium/experimental/mock_device/mock_device.hpp>
 #include "impl/context/metal_env_accessor.hpp"
 #include "impl/context/metal_env_impl.hpp"
@@ -103,6 +104,39 @@ TEST_F(PublishedDispatchKernelTest, FactoryRejectsForeignSelectionAndConflictsBe
             std::span(&nodes[0].processor, 1)), std::exception);
         EXPECT_EQ(program.impl().num_kernels(), 1u);
         EXPECT_THROW(program.impl().validate_worker_stream_state_client(MetalContext::instance(id), 0), std::exception);
+        EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
+    }
+    experimental::disable_mock_mode();
+    EXPECT_FALSE(MetalContext::instance_exists());
+}
+TEST_F(PublishedDispatchKernelTest, CompilationRejectsSourceInOwningPublishedContextBeforeJit) {
+    auto c = configuration();
+    test::PublicationInput input(c, hal);
+    auto deployment = PublishedDeployment::admit(c, input.input);
+    experimental::configure_mock_mode(tt::ARCH::BLACKHOLE, 1);
+    {
+        MetalEnvDescriptor descriptor(experimental::get_mock_cluster_desc().value());
+        descriptor.set_published_deployment(std::move(deployment));
+        MetalEnv env(std::move(descriptor));
+        const auto id = ContextId{MetalEnvAccessor(env).impl().ensure_context_registered(env)};
+        auto& context = MetalContext::instance(id);
+        context.initialize(DispatchCoreConfig{}, 1, {}, 0, true);
+        Program program(std::make_shared<detail::ProgramImpl>(id));
+        const auto handle = CreateKernelFromString(
+            program, "void kernel_main() {}", CoreCoord{0, 0}, DataMovementConfig{});
+        const auto kernel_name = program.impl().get_kernel(handle)->name();
+        tt::tt_metal::Device unbooted(&env, &context, 0, 1, 0, 0, {}, true);
+        // No device build environment exists in publication mode. Reject the
+        // source request before attempting JIT or preparing external images.
+        try {
+            program.impl().compile(&unbooted, true);
+            FAIL() << "A published deployment must not compile source kernels";
+        } catch (const std::runtime_error& error) {
+            const std::string diagnostic(error.what());
+            EXPECT_NE(diagnostic.find("published deployment"), std::string::npos);
+            EXPECT_NE(diagnostic.find(kernel_name), std::string::npos);
+        }
+        EXPECT_FALSE(unbooted.is_initialized());
         EXPECT_FALSE(MetalContext::instance_exists(DEFAULT_CONTEXT_ID));
     }
     experimental::disable_mock_mode();

@@ -71,8 +71,6 @@ DispatchProgramInputs capture_dispatch_program(
     t.mock = cluster.is_mock_or_emulated(); t.core_type = context.get_dispatch_core_manager().get_dispatch_core_type();
     t.num_hw_cqs = device.num_hw_cqs(); t.subordinate_enabled = query.dispatch_s_enabled();
     t.distributed_dispatcher = query.distributed_dispatcher();
-    if (t.arch != tt::ARCH::BLACKHOLE || t.core_type != CoreType::WORKER || t.mock || t.num_hw_cqs != 1 || t.fabric || !t.mmio)
-        throw DispatchProgramError(DispatchProgramReject::Topology, "unsupported live dispatch family");
     std::set<ChipId> devices;
     for (const auto& n : graph) devices.insert(n.device_id);
     t.deployment_devices.assign(devices.begin(), devices.end());
@@ -94,6 +92,7 @@ DispatchProgramInputs capture_dispatch_program(
         t.nodes.push_back(std::move(value));
     }
     t.completion_writer = project(completion_writer); t.unused_core = project(tt_cxy_pair(device.id(), 0, 0));
+    (void)dispatch_program_family(t);
     const auto grid = device.compute_with_storage_grid_size();
     if (!grid.x || !grid.y) throw DispatchProgramError(DispatchProgramReject::Placement, "empty actual worker grid");
     CoreRange workers(device.virtual_core_from_logical_core({0, 0}, CoreType::WORKER),
@@ -111,8 +110,7 @@ DispatchProgramInputs capture_dispatch_program(
     return input;
 }
 void initialize_dispatch_program(tt::tt_metal::Device& device, const DispatchProgramPlan& plan) {
-    if (device.id() != plan.device_id() || device.arch() != tt::ARCH::BLACKHOLE)
-        throw DispatchProgramError(DispatchProgramReject::Placement, "dispatch initialization device mismatch");
+    plan.validate_target(device.arch(), device.id());
     for (const auto& write : plan.initialization()) {
         detail::WriteToDeviceL1(&device, write.logical, write.address,
             std::span(reinterpret_cast<const uint8_t*>(write.bytes.data()), write.bytes.size()), CoreType::WORKER);

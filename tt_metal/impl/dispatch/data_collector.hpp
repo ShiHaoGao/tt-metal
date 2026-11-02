@@ -101,11 +101,6 @@ public:
 private:
     static constexpr size_t kRuntimeIdSlots = 1u << 16;
 
-    struct RealtimeCallbackRegistration {
-        tt::ProgramRealtimeProfilerCallbackHandle handle;
-        tt::ProgramRealtimeProfilerCallback callback;
-    };
-
     struct KernelData {
         int watcher_kernel_id;
         HalProcessorClassType processor_class;
@@ -127,10 +122,7 @@ private:
     std::array<std::atomic<const std::vector<std::string_view>*>, kRuntimeIdSlots> runtime_id_to_kernel_sources_{};
     std::map<std::pair<tt::ChipId, uint64_t>, tt::ProgramSubDeviceInfo> runtime_id_to_sub_device;
     mutable std::mutex runtime_id_to_sub_device_mutex_;
-    mutable std::mutex program_realtime_profiler_callbacks_mutex_;
-    std::vector<RealtimeCallbackRegistration> program_realtime_profiler_callbacks_;
-    std::vector<tt::RealtimeProfilerCallbackListener*> realtime_callback_listeners_;
-    tt::ProgramRealtimeProfilerCallbackHandle next_callback_handle_{0};
+    RealtimeProfilerCallbackRegistry realtime_callbacks_;
 
     mutable std::mutex realtime_profiler_active_chips_mutex_;
     std::unordered_set<uint32_t> realtime_profiler_active_chips_;

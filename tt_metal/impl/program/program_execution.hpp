@@ -501,6 +501,10 @@ private:
     void validate_request_locked(
         NiuAdmission& admission, const NiuAdmission::Guard& guard, const HandoffSnapshot& snapshot) const;
     void validate_payload_issue_locked() const;
+    // Called only by the existing retirement owner after it has detached this
+    // execution under admission, and before publishing resources_retired.
+    // Storage is complete only in program_execution.cpp.
+    void release_payload_bindings() noexcept;
     void prepare_handoff();
     std::vector<ManagedInvocation::CompletionBinding> completion_bindings() const;
     class Submission final {

@@ -47,12 +47,13 @@ protected:
         if (!scratch.empty()) std::filesystem::remove_all(scratch);
     }
 
-    void withBlackhole(
+    void withArchitecture(
         llrt::RunTimeOptions& options,
+        tt::ARCH architecture,
         const std::function<void(const JitDeviceConfig&)>& action) {
         bool visited = false;
         enumerate_offline_compile_device_configs(options, [&](const JitDeviceConfig& authored) {
-            if (visited || authored.arch != tt::ARCH::BLACKHOLE) return;
+            if (visited || authored.arch != architecture) return;
             visited = true;
             // The ordinary precompile enumerator intentionally disables profiling.
             // Recreate its HAL with the same topology and the requested profiler
@@ -65,7 +66,7 @@ protected:
             config.profiler_dram_bank_size_per_risc_bytes = profiler_bytes;
             action(config);
         });
-        ASSERT_TRUE(visited) << "offline configuration catalog has no Blackhole target";
+        ASSERT_TRUE(visited) << "offline configuration catalog has no requested target";
     }
 
     void checkImage(const std::string& path, worker_stream_state::FirmwareRole role) {
@@ -78,6 +79,10 @@ protected:
         worker_stream_state::ImageRecord record{};
         std::memcpy(&record, bytes.data(), sizeof(record));
         EXPECT_TRUE(worker_stream_state::acceptsImage(record, role));
+        const auto other_role = role == worker_stream_state::FirmwareRole::Brisc
+                                    ? worker_stream_state::FirmwareRole::Trisc0
+                                    : worker_stream_state::FirmwareRole::Brisc;
+        EXPECT_FALSE(worker_stream_state::acceptsImage(record, other_role));
         // The section is host metadata and must never overlap a loaded segment.
         for (const auto& segment : elf.GetSegments()) {
             const uint64_t end = uint64_t(segment.address) + segment.membytes;
@@ -86,6 +91,7 @@ protected:
         // Also exercise the actual loader's retained-record decoder.
         const ll_api::memory selected(path, ll_api::memory::Loading::DISCRETE);
         EXPECT_TRUE(worker_stream_state::acceptsImage(selected.worker_stream_state_image(), role));
+        EXPECT_FALSE(worker_stream_state::acceptsImage(selected.worker_stream_state_image(), other_role));
     }
 
     void checkProfileDataBuffer(const std::string& path, const Hal& hal) {
@@ -124,7 +130,7 @@ protected:
         FAIL() << "profile firmware lacks resident profiler_data_buffer";
     }
 
-    void checkNativeImage(const std::string& path, uint8_t role, DeviceProfilerMode mode) {
+    void checkNativeImage(const std::string& path, uint8_t role, DeviceProfilerMode mode, tt::ARCH architecture) {
         SCOPED_TRACE(path);
         ll_api::ElfFile elf;
         elf.ReadImage(path);
@@ -137,7 +143,10 @@ protected:
         EXPECT_EQ(record.version, TT_NATIVE_IMAGE_ABI_VERSION);
         EXPECT_EQ(record.kind, TT_NATIVE_IMAGE_FIRMWARE);
         EXPECT_EQ(record.role, role);
-        EXPECT_EQ(record.architecture, TT_NATIVE_ARCH_BLACKHOLE);
+        const auto expected_architecture = architecture == tt::ARCH::BLACKHOLE
+                                               ? TT_NATIVE_ARCH_BLACKHOLE
+                                               : TT_NATIVE_ARCH_WORMHOLE;
+        EXPECT_EQ(record.architecture, expected_architecture);
         EXPECT_EQ(record.loading, TT_NATIVE_LOADING_DISCRETE);
         EXPECT_EQ(record.profile, mode == DeviceProfilerMode::Program
             ? TT_NATIVE_PROFILE_CLASSIC_DRAM_PROGRAM : TT_NATIVE_PROFILE_ABSENT);
@@ -151,11 +160,11 @@ protected:
         }
     }
 
-    void buildImages(DeviceProfilerMode mode) {
+    void buildImages(DeviceProfilerMode mode, tt::ARCH architecture) {
         llrt::RunTimeOptions options(mode);
         EXPECT_EQ(options.get_profiler_enabled(), mode == DeviceProfilerMode::Program);
         options.set_disable_precompiled_fw(true);
-        withBlackhole(options, [&](const JitDeviceConfig& config) {
+        withArchitecture(options, architecture, [&](const JitDeviceConfig& config) {
             BuildEnvManager manager(*config.hal);
             manager.add_build_env(0, config, options);
             const auto& before = manager.get_device_build_env(0);
@@ -175,7 +184,7 @@ protected:
                 const auto path = manager.get_firmware_binary_path(
                     0, core, static_cast<uint32_t>(role < 2 ? HalProcessorClassType::DM : HalProcessorClassType::COMPUTE),
                     role < 2 ? role : role - 2);
-                checkNativeImage(path, role, mode);
+                checkNativeImage(path, role, mode, architecture);
                 if (mode == DeviceProfilerMode::Program) checkProfileDataBuffer(path, *config.hal);
             }
         });
@@ -187,7 +196,7 @@ protected:
 
 TEST_F(WorkerFirmwareBuild, ImplicitAbiUsesCanonicalJitAndPrecompiledIdentity) {
     llrt::RunTimeOptions options(DeviceProfilerMode::Disabled);
-    withBlackhole(options, [&](const JitDeviceConfig& config) {
+    withArchitecture(options, tt::ARCH::BLACKHOLE, [&](const JitDeviceConfig& config) {
         JitBuildEnv implicit_abi;
         JitBuildEnv explicit_abi;
         constexpr uint64_t topology_key = 17;
@@ -210,7 +219,7 @@ TEST_F(WorkerFirmwareBuild, ImplicitAbiUsesCanonicalJitAndPrecompiledIdentity) {
 
 TEST_F(WorkerFirmwareBuild, CallerCannotOverrideCanonicalWorkerAbi) {
     llrt::RunTimeOptions options(DeviceProfilerMode::Disabled);
-    withBlackhole(options, [&](const JitDeviceConfig& config) {
+    withArchitecture(options, tt::ARCH::BLACKHOLE, [&](const JitDeviceConfig& config) {
         for (const auto& value : {std::string("0"), std::to_string(unsigned(worker_stream_state::kVersion) + 1)}) {
             SCOPED_TRACE(value);
             JitBuildEnv environment;
@@ -232,11 +241,19 @@ TEST_F(WorkerFirmwareBuild, ExplicitProfileModeDoesNotReadAmbientDeployment) {
 }
 
 TEST_F(WorkerFirmwareBuild, OfflineDisabledImagesCarryLoaderRecords) {
-    buildImages(DeviceProfilerMode::Disabled);
+    buildImages(DeviceProfilerMode::Disabled, tt::ARCH::BLACKHOLE);
 }
 
 TEST_F(WorkerFirmwareBuild, OfflineProgramProfilerImagesCarryLoaderRecords) {
-    buildImages(DeviceProfilerMode::Program);
+    buildImages(DeviceProfilerMode::Program, tt::ARCH::BLACKHOLE);
+}
+
+TEST_F(WorkerFirmwareBuild, OfflineWormholeDisabledImagesCarryLoaderRecords) {
+    buildImages(DeviceProfilerMode::Disabled, tt::ARCH::WORMHOLE_B0);
+}
+
+TEST_F(WorkerFirmwareBuild, OfflineWormholeProgramProfilerImagesCarryLoaderRecords) {
+    buildImages(DeviceProfilerMode::Program, tt::ARCH::WORMHOLE_B0);
 }
 
 }  // namespace
